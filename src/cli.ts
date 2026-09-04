@@ -6,19 +6,23 @@ import {
   validateCheckpoint,
   validateWorktree,
 } from "./git-worktree.js";
+import { runHerdrSmoke } from "./herdr.js";
 import { createRun, FlowError, inspectRun, selectRun } from "./workflow-run.js";
 
 const arguments_ = process.argv.slice(2);
 const [argument] = arguments_;
 const structuredRequest =
-  (argument === "status" ||
+  ((argument === "status" ||
     argument === "history" ||
     (argument === "worktree" &&
       (arguments_[1] === "prepare" ||
         arguments_[1] === "validate" ||
         arguments_[1] === "cleanup")) ||
     (argument === "checkpoint" && arguments_[1] === "validate")) &&
-  arguments_.includes("--json");
+    arguments_.includes("--json")) ||
+  (argument === "herdr" &&
+    arguments_[1] === "smoke" &&
+    arguments_.includes("--json"));
 
 function parseOptions(
   tokens: string[],
@@ -274,6 +278,56 @@ try {
       console.log(`Revision: ${accepted.snapshot.revision}`);
       console.log(`Phase: ${accepted.snapshot.phase}`);
     }
+  } else if (
+    argument === "herdr" &&
+    arguments_[1] === "smoke" &&
+    arguments_.includes("--help")
+  ) {
+    console.log(
+      "Usage: flow herdr smoke --agent codex [--json] [--output <file>] [--keep-pane]",
+    );
+    console.log(
+      "Launches a Codex agent in a fresh Herdr sibling pane; requires a genuine managed caller.",
+    );
+  } else if (argument === "herdr" && arguments_[1] === "smoke") {
+    const { flags, values } = parseOptions(
+      arguments_.slice(2),
+      ["--agent", "--output"],
+      ["--json", "--keep-pane"],
+    );
+    const agent = values.get("--agent");
+    if (agent !== "codex") {
+      throw new FlowError(
+        "Usage: flow herdr smoke --agent codex [--json] [--output <file>] [--keep-pane]",
+        2,
+      );
+    }
+    const outputFile = values.get("--output");
+    const report = await runHerdrSmoke({
+      agent,
+      ...(outputFile === undefined ? {} : { outputFile }),
+      ...(flags.has("--keep-pane") ? { keepPane: true } : {}),
+    });
+    if (flags.has("--json")) {
+      console.log(JSON.stringify(report));
+    } else {
+      console.log(`Herdr smoke: ${report.ok ? "passed" : "failed"}`);
+      console.log(`Version: ${report.version ?? "unknown"}`);
+      console.log(`Working directory: ${report.requestedCwd}`);
+      console.log(`Agent: ${report.owned.agentName}`);
+      console.log(`Pane: ${report.owned.paneId ?? "not created"}`);
+      if (report.lifecycle?.transport)
+        console.log(`Lifecycle: ${report.lifecycle.transport}`);
+      console.log(
+        `Challenge nonce: ${report.challenge.outputContainsNonce ? "matched" : "missing"}`,
+      );
+      console.log(
+        `Challenge cwd: ${report.challenge.outputContainsCwd ? "matched" : "missing"}`,
+      );
+      console.log(`Cleanup: ${report.cleanup.status}`);
+      if (report.error) console.log(`Error: ${report.error.message}`);
+    }
+    if (!report.ok) process.exitCode = 1;
   } else {
     const label = arguments_.length === 1 ? "argument" : "arguments";
     console.error(`Unsupported ${label}: ${arguments_.join(" ")}`);
