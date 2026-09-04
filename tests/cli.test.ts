@@ -1,5 +1,12 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -225,8 +232,73 @@ test.each([
   });
 });
 
-test("flow requires every explicit create option", async () => {
+test("flow allows repository and run ID to be inferred", async () => {
   const repository = await createTargetRepository();
+
+  await expect(
+    run(
+      executable,
+      ["run", "create", "--repo", repository, "--spec", "specs/feature.md"],
+      { cwd: repository },
+    ),
+  ).resolves.toMatchObject({ stdout: expect.stringContaining("Created run") });
+});
+
+test("flow generates a sortable cryptographically random run ID", async () => {
+  const repository = await createTargetRepository();
+
+  const { stderr, stdout } = await run(
+    executable,
+    ["run", "create", "--spec", "specs/feature.md"],
+    { cwd: repository },
+  );
+
+  expect(stderr).toBe("");
+  expect(stdout).toMatch(/^Created run run_\d{8}T\d{6}Z_[0-9a-f]{12}\n$/);
+  const runId = stdout.trim().slice("Created run ".length);
+  expect(
+    (await readdir(join(repository, ".orchestrator", "runs"))).sort(),
+  ).toEqual([runId]);
+});
+
+test("flow retries an explicit run creation safely", async () => {
+  const repository = await createTargetRepository();
+  const runId = "run_20260904T120000Z_012345abcdef";
+  await createExplicitRun(repository, runId);
+  const runDirectory = join(repository, ".orchestrator", "runs", runId);
+  const before = await Promise.all([
+    readFile(join(runDirectory, "state.json"), "utf8"),
+    readFile(join(runDirectory, "history.jsonl"), "utf8"),
+  ]);
+
+  const { stderr, stdout } = await run(executable, [
+    "run",
+    "create",
+    "--repo",
+    repository,
+    "--spec",
+    "specs/feature.md",
+    "--run",
+    runId,
+  ]);
+
+  expect(stderr).toBe("");
+  expect(stdout).toContain(`Created run ${runId}`);
+  expect(
+    await Promise.all([
+      readFile(join(runDirectory, "state.json"), "utf8"),
+      readFile(join(runDirectory, "history.jsonl"), "utf8"),
+    ]),
+  ).toEqual(before);
+});
+
+test("flow refuses a retry for a different specification without changing the run", async () => {
+  const repository = await createTargetRepository();
+  await writeFile(join(repository, "specs", "other.md"), "# Other\n");
+  const runId = "run_20260904T120000Z_012345abcdef";
+  await createExplicitRun(repository, runId);
+  const runDirectory = join(repository, ".orchestrator", "runs", runId);
+  const before = await readFile(join(runDirectory, "state.json"), "utf8");
 
   await expect(
     run(executable, [
@@ -235,9 +307,89 @@ test("flow requires every explicit create option", async () => {
       "--repo",
       repository,
       "--spec",
-      "specs/feature.md",
+      "specs/other.md",
+      "--run",
+      runId,
     ]),
-  ).rejects.toMatchObject({ code: 2, stdout: "" });
+  ).rejects.toMatchObject({ code: 3, stdout: "" });
+
+  expect(await readFile(join(runDirectory, "state.json"), "utf8")).toBe(before);
+});
+
+test("flow uses the sole nonterminal run for implicit status and history", async () => {
+  const repository = await createTargetRepository();
+  const runId = "run_20260904T120000Z_012345abcdef";
+  await createExplicitRun(repository, runId);
+
+  const status = await run(executable, ["status", "--repo", repository]);
+  expect(status.stdout).toContain(`Run: ${runId}\n`);
+
+  const history = await run(executable, [
+    "history",
+    "--repo",
+    repository,
+    "--json",
+  ]);
+  expect(JSON.parse(history.stdout)).toHaveLength(1);
+});
+
+test("flow falls back to the sole terminal run for implicit status", async () => {
+  const repository = await createTargetRepository();
+  const runId = "run_20260904T120000Z_012345abcdef";
+  await createExplicitRun(repository, runId);
+  const statePath = join(
+    repository,
+    ".orchestrator",
+    "runs",
+    runId,
+    "state.json",
+  );
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.phase = "completed";
+  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`);
+
+  const { stdout } = await run(executable, ["status", "--repo", repository]);
+  expect(stdout).toContain(`Run: ${runId}\n`);
+  expect(stdout).toContain("Phase: completed\n");
+});
+
+test("flow refuses ambiguous implicit selection and reports candidate IDs", async () => {
+  const repository = await createTargetRepository();
+  const runIds = [
+    "run_20260904T120000Z_012345abcdef",
+    "run_20260904T120001Z_012345abcdee",
+  ];
+  for (const runId of runIds) await createExplicitRun(repository, runId);
+
+  await expect(
+    run(executable, ["status", "--repo", repository]),
+  ).rejects.toMatchObject({
+    code: 3,
+    stdout: "",
+    stderr: expect.stringContaining(runIds[0]!),
+  });
+
+  await expect(
+    run(executable, ["status", "--repo", repository, "--json"]),
+  ).rejects.toMatchObject({
+    code: 3,
+    stdout: "",
+    stderr: expect.stringMatching(
+      new RegExp(`"code":"[A-Z_]+".*${runIds[0]!}.*${runIds[1]!}`),
+    ),
+  });
+});
+
+test("flow reports no run candidates with structured guidance", async () => {
+  const repository = await createTargetRepository();
+
+  await expect(
+    run(executable, ["history", "--repo", repository, "--json"]),
+  ).rejects.toMatchObject({
+    code: 3,
+    stdout: "",
+    stderr: expect.stringMatching(/"code":"[A-Z_]+".*"message":".*run/i),
+  });
 });
 
 test("flow displays explicit run status in human and structured forms", async () => {

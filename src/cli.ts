@@ -1,9 +1,12 @@
 import packageMetadata from "../package.json" with { type: "json" };
 
-import { createRun, FlowError, inspectRun } from "./workflow-run.js";
+import { createRun, FlowError, inspectRun, selectRun } from "./workflow-run.js";
 
 const arguments_ = process.argv.slice(2);
 const [argument] = arguments_;
+const structuredRequest =
+  (argument === "status" || argument === "history") &&
+  arguments_.includes("--json");
 
 function parseOptions(
   tokens: string[],
@@ -51,14 +54,18 @@ try {
     const repository = values.get("--repo");
     const specification = values.get("--spec");
     const runId = values.get("--run");
-    if (!repository || !specification || !runId) {
+    if (!specification) {
       throw new FlowError(
-        "Usage: flow run create --repo <path> --spec <file> --run <id>",
+        "Usage: flow run create [--repo <path>] --spec <file> [--run <id>]",
         2,
       );
     }
-    await createRun({ repository, specification, runId });
-    console.log(`Created run ${runId}`);
+    const createdRunId = await createRun({
+      specification,
+      ...(repository === undefined ? {} : { repository }),
+      ...(runId === undefined ? {} : { runId }),
+    });
+    console.log(`Created run ${createdRunId}`);
   } else if (argument === "status") {
     const { flags, values } = parseOptions(
       arguments_.slice(1),
@@ -67,15 +74,10 @@ try {
     );
     const repository = values.get("--repo");
     const runId = values.get("--run");
-    if (!repository || !runId) {
-      throw new FlowError(
-        "Usage: flow status --repo <path> --run <id> [--json]",
-        2,
-      );
-    }
+    const selected = await selectRun(repository, runId);
     const { operationalHistory, snapshot } = await inspectRun(
-      repository,
-      runId,
+      selected.repository,
+      selected.runId,
     );
     const lastEvent = operationalHistory.at(-1);
     const operationalHistoryMetadata = {
@@ -106,13 +108,11 @@ try {
     );
     const repository = values.get("--repo");
     const runId = values.get("--run");
-    if (!repository || !runId) {
-      throw new FlowError(
-        "Usage: flow history --repo <path> --run <id> [--json]",
-        2,
-      );
-    }
-    const { operationalHistory } = await inspectRun(repository, runId);
+    const selected = await selectRun(repository, runId);
+    const { operationalHistory } = await inspectRun(
+      selected.repository,
+      selected.runId,
+    );
     if (flags.has("--json")) {
       console.log(JSON.stringify(operationalHistory));
     } else {
@@ -129,7 +129,11 @@ try {
   }
 } catch (error) {
   if (error instanceof FlowError) {
-    console.error(error.message);
+    console.error(
+      structuredRequest
+        ? JSON.stringify(error.toStructuredError())
+        : error.message,
+    );
     process.exitCode = error.exitCode;
   } else {
     throw error;
