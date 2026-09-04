@@ -24,6 +24,7 @@ import {
 import { gitStateSchema, type StateSnapshot } from "./schema.js";
 
 const git = promisify(execFile);
+const terminalPhases = new Set(["failed", "cancelled", "completed"]);
 
 export interface PrepareWorktreeOptions {
   repository?: string;
@@ -49,6 +50,22 @@ export interface PreparedWorktree {
   snapshot: StateSnapshot;
   run: ReadRunResult;
   warnings?: string[];
+}
+
+export interface CleanupWorktreeOptions {
+  repository?: string;
+  runId: string;
+  dependencies?: CleanupWorktreeDependencies;
+}
+
+export interface CleanupWorktreeDependencies extends RunDependencies {
+  /** Test seam for forcing deterministic Git failures after validation. */
+  gitRunner?: GitCommandRunner;
+}
+
+export interface CleanedWorktree {
+  snapshot: StateSnapshot;
+  run: ReadRunResult;
 }
 
 export interface ValidateWorktreeOptions {
@@ -1133,6 +1150,188 @@ function intentConflict(
   );
 }
 
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function cleanupRefusal(
+  message: string,
+  details?: Record<string, unknown>,
+): FlowError {
+  return new FlowError(message, 4, "WORKTREE_CLEANUP_REFUSED", details);
+}
+
+async function inspectCleanupGitState(
+  target: TargetRepository,
+  gitState: NonNullable<StateSnapshot["git"]>,
+): Promise<{
+  expectedPath: string;
+  registration: WorktreeRegistration | undefined;
+  pathExists: boolean;
+}> {
+  const expectedPath = resolve(gitState.featureWorktree);
+  await assertNoSymlinkComponents(expectedPath);
+  const registrations = await listWorktrees(target.path);
+  const registration = registrations.find(
+    (entry) => entry.path === expectedPath,
+  );
+  return {
+    expectedPath,
+    registration,
+    pathExists: await pathExists(expectedPath),
+  };
+}
+
+async function assertCleanupBaseline(
+  target: TargetRepository,
+  gitState: NonNullable<StateSnapshot["git"]>,
+  expectedPath: string,
+  registration: WorktreeRegistration,
+): Promise<void> {
+  if (registration.branch !== gitState.featureBranch)
+    throw cleanupRefusal(
+      "Registered Feature worktree does not match the persisted branch",
+      {
+        expectedBranch: gitState.featureBranch,
+        actualBranch: registration.branch,
+      },
+    );
+
+  const targetCommonDirectory = await canonicalGitPath(
+    target.path,
+    await runGit(target.path, ["rev-parse", "--git-common-dir"]),
+  );
+  const worktreeCommonDirectory = await canonicalGitPath(
+    expectedPath,
+    await runGit(expectedPath, ["rev-parse", "--git-common-dir"]),
+  );
+  if (targetCommonDirectory !== worktreeCommonDirectory)
+    throw cleanupRefusal(
+      "Feature worktree belongs to a different Git repository",
+      {
+        expectedCommonDirectory: targetCommonDirectory,
+        actualCommonDirectory: worktreeCommonDirectory,
+      },
+    );
+
+  let branch: string;
+  try {
+    branch = await runGit(expectedPath, [
+      "symbolic-ref",
+      "--quiet",
+      "--short",
+      "HEAD",
+    ]);
+  } catch {
+    throw cleanupRefusal("Feature worktree HEAD is detached");
+  }
+  if (branch !== gitState.featureBranch)
+    throw cleanupRefusal("Feature worktree is on the wrong Feature branch", {
+      expectedBranch: gitState.featureBranch,
+      actualBranch: branch,
+    });
+
+  const branchHead = await resolveCommit(
+    target.path,
+    `refs/heads/${gitState.featureBranch}`,
+    target.objectFormat,
+  ).catch((error: unknown) => {
+    if (error instanceof FlowError && error.exitCode === 3)
+      throw new FlowError(
+        `Feature branch was not found: ${gitState.featureBranch}`,
+        3,
+        "FEATURE_BRANCH_NOT_FOUND",
+      );
+    throw error;
+  });
+  const worktreeHead = await resolveCommit(
+    expectedPath,
+    "HEAD",
+    target.objectFormat,
+  );
+  if (branchHead !== gitState.validatedHead)
+    throw cleanupRefusal(
+      "Feature branch does not match the persisted validated HEAD",
+      { expectedHead: gitState.validatedHead, actualHead: branchHead },
+    );
+  if (worktreeHead !== gitState.validatedHead)
+    throw cleanupRefusal(
+      "Feature worktree HEAD does not match the persisted validated HEAD",
+      { expectedHead: gitState.validatedHead, actualHead: worktreeHead },
+    );
+
+  const status = await runGit(expectedPath, [
+    "status",
+    "--porcelain=v1",
+    "--untracked-files=all",
+    "--ignored=matching",
+  ]);
+  if (status.length > 0) {
+    const lines = status.split(/\r?\n/);
+    const ignored = lines.filter((line) => line.startsWith("!! "));
+    const untracked = lines.filter((line) => line.startsWith("?? "));
+    const tracked = lines.filter(
+      (line) => !line.startsWith("?? ") && !line.startsWith("!! "),
+    );
+    throw new FlowError(
+      ignored.length > 0
+        ? "Feature worktree contains ignored files"
+        : untracked.length > 0
+          ? "Feature worktree contains non-ignored untracked files"
+          : "Feature worktree contains tracked changes",
+      4,
+      ignored.length > 0
+        ? "IGNORED_WORKTREE"
+        : untracked.length > 0
+          ? "UNTRACKED_WORKTREE"
+          : "DIRTY_WORKTREE",
+      { status: lines, tracked, untracked, ignored },
+    );
+  }
+}
+
+async function assertRemovedGitState(
+  target: TargetRepository,
+  gitState: NonNullable<StateSnapshot["git"]>,
+  expectedPath: string,
+  registration: WorktreeRegistration | undefined,
+  pathIsPresent: boolean,
+): Promise<void> {
+  if (registration || pathIsPresent)
+    throw cleanupRefusal(
+      "Interrupted cleanup left an ambiguous Feature worktree resource",
+      {
+        expectedPath,
+        registration: registration?.path,
+        pathExists: pathIsPresent,
+      },
+    );
+  const branchHead = await resolveCommit(
+    target.path,
+    `refs/heads/${gitState.featureBranch}`,
+    target.objectFormat,
+  ).catch((error: unknown) => {
+    if (error instanceof FlowError && error.exitCode === 3)
+      throw new FlowError(
+        `Feature branch was not found: ${gitState.featureBranch}`,
+        3,
+        "FEATURE_BRANCH_NOT_FOUND",
+      );
+    throw error;
+  });
+  if (branchHead !== gitState.validatedHead)
+    throw cleanupRefusal(
+      "Preserved Feature branch no longer matches the validated HEAD",
+      { expectedHead: gitState.validatedHead, actualHead: branchHead },
+    );
+}
+
 async function branchExists(
   repository: string,
   branch: string,
@@ -1521,6 +1720,162 @@ export async function prepareWorktree(
         run: completed,
         ...(warnings === undefined ? {} : { warnings }),
       };
+    } finally {
+      await releaseRunLock(runLock);
+    }
+  } finally {
+    await releaseGitOperationLock(gitLock);
+  }
+}
+
+/** Remove a terminal Feature worktree without deleting its branch or commits. */
+export async function cleanupWorktree(
+  options: CleanupWorktreeOptions,
+  dependencies: CleanupWorktreeDependencies = options.dependencies ?? {},
+): Promise<CleanedWorktree> {
+  const target = await resolveTargetRepository(options.repository);
+  const gitLock = await acquireGitOperationLock(target.path, dependencies);
+  try {
+    const runLock = await acquireRunLock(
+      target.path,
+      options.runId,
+      dependencies,
+    );
+    try {
+      const current = await inspectRun(target.path, options.runId);
+      if (!terminalPhases.has(current.snapshot.phase))
+        throw cleanupRefusal(
+          `Workflow run ${options.runId} is not terminal; Feature worktree cleanup is not allowed during ${current.snapshot.phase}`,
+          { phase: current.snapshot.phase },
+        );
+      const persisted = gitStateSchema.safeParse(current.snapshot.git);
+      if (!persisted.success)
+        throw cleanupRefusal(
+          `Workflow run ${options.runId} has no valid Feature worktree state`,
+          { runId: options.runId },
+        );
+      const gitState = persisted.data;
+
+      if (gitState.worktreeStatus === "removed") {
+        if (current.audit.synchronized)
+          return { snapshot: current.snapshot, run: current };
+        const inspected = await inspectCleanupGitState(target, gitState);
+        await assertRemovedGitState(
+          target,
+          gitState,
+          inspected.expectedPath,
+          inspected.registration,
+          inspected.pathExists,
+        );
+        const recovered = await mutateRun(
+          {
+            repository: target.path,
+            runId: options.runId,
+            event: "checkpoint",
+            historyEventType: "git.worktree.removed",
+            data: {
+              featureBranch: gitState.featureBranch,
+              featureWorktree: gitState.featureWorktree,
+              worktreeStatus: "removed",
+            },
+            historyOnly: true,
+            lock: runLock,
+          },
+          dependencies,
+        );
+        return { snapshot: recovered.snapshot, run: recovered };
+      }
+
+      if (!current.audit.synchronized)
+        throw new FlowError(
+          `Workflow run ${options.runId} has an unresolved history audit gap`,
+          4,
+          "AUDIT_GAP",
+          { runId: options.runId, warning: current.audit.warning },
+        );
+      if (gitState.worktreeStatus !== "ready" || !gitState.validatedHead)
+        throw cleanupRefusal(
+          `Workflow run ${options.runId} does not have a validated Feature worktree`,
+          { worktreeStatus: gitState.worktreeStatus },
+        );
+
+      const inspected = await inspectCleanupGitState(target, gitState);
+      if (!inspected.pathExists && !inspected.registration) {
+        await assertRemovedGitState(
+          target,
+          gitState,
+          inspected.expectedPath,
+          inspected.registration,
+          inspected.pathExists,
+        );
+      } else {
+        if (!inspected.pathExists || !inspected.registration)
+          throw cleanupRefusal(
+            "Interrupted cleanup left only part of the Feature worktree resource",
+            {
+              expectedPath: inspected.expectedPath,
+              registration: inspected.registration?.path,
+              pathExists: inspected.pathExists,
+            },
+          );
+        let entry;
+        try {
+          entry = await lstat(inspected.expectedPath);
+        } catch (error) {
+          throw cleanupRefusal("Feature worktree path could not be inspected", {
+            path: inspected.expectedPath,
+            error: errorMessage(error),
+          });
+        }
+        if (!entry.isDirectory())
+          throw cleanupRefusal(
+            `Feature worktree path is not a directory: ${inspected.expectedPath}`,
+          );
+        if ((await realpath(inspected.expectedPath)) !== inspected.expectedPath)
+          throw cleanupRefusal(
+            `Feature worktree path is not canonical: ${inspected.expectedPath}`,
+          );
+        await assertCleanupBaseline(
+          target,
+          gitState,
+          inspected.expectedPath,
+          inspected.registration,
+        );
+        await (dependencies.gitRunner ?? runGit)(
+          target.path,
+          ["worktree", "remove", "--", inspected.expectedPath],
+          "WORKTREE_REMOVAL_FAILED",
+        );
+        const afterRemoval = await inspectCleanupGitState(target, gitState);
+        await assertRemovedGitState(
+          target,
+          gitState,
+          afterRemoval.expectedPath,
+          afterRemoval.registration,
+          afterRemoval.pathExists,
+        );
+      }
+
+      const completed = await mutateRun(
+        {
+          repository: target.path,
+          runId: options.runId,
+          event: "checkpoint",
+          historyEventType: "git.worktree.removed",
+          data: {
+            featureBranch: gitState.featureBranch,
+            featureWorktree: gitState.featureWorktree,
+            worktreeStatus: "removed",
+          },
+          preserveLifecycle: true,
+          lock: runLock,
+          updateSnapshot: (snapshot) => ({
+            git: { ...snapshot.git!, worktreeStatus: "removed" },
+          }),
+        },
+        dependencies,
+      );
+      return { snapshot: completed.snapshot, run: completed };
     } finally {
       await releaseRunLock(runLock);
     }

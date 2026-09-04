@@ -97,6 +97,10 @@ export interface MutateRunOptions {
   data?: Record<string, unknown>;
   historyEventType?: string;
   updateSnapshot?: (snapshot: StateSnapshot) => Record<string, unknown>;
+  /** Internal seam for state-only Git lifecycle updates. */
+  preserveLifecycle?: boolean;
+  /** Internal seam for publishing a known missing history record. */
+  historyOnly?: boolean;
   /** Internal seam for callers that already hold the run lock. */
   lock?: RunLock;
 }
@@ -905,7 +909,7 @@ export async function mutateRun(
     (await acquireRunLock(repository, options.runId, dependencies));
   try {
     const current = await readRunAt(repository, options.runId);
-    if (!current.audit.synchronized) {
+    if (!current.audit.synchronized && !options.historyOnly) {
       throw new FlowError(
         `Workflow run ${options.runId} has an unresolved history audit gap`,
         4,
@@ -914,14 +918,56 @@ export async function mutateRun(
       );
     }
 
-    const lifecycle = transition(
-      withLifecycleState(current.snapshot),
-      options.event,
-    );
     const eventType = normalizeRunTransition(options.event);
     const priorEvent = current.operationalHistory.at(-1);
     if (!priorEvent)
       throw corruption(options.runId, "history is empty during mutation");
+    if (options.historyOnly) {
+      if (
+        current.audit.synchronized ||
+        current.snapshot.revision !== priorEvent.stateRevision + 1
+      )
+        throw corruption(
+          options.runId,
+          "history-only publication did not find the expected audit gap",
+        );
+      const nextEvent = runEventSchema.parse({
+        schemaVersion: 1,
+        eventId: `event_${randomUUID()}`,
+        runId: options.runId,
+        sequence: priorEvent.sequence + 1,
+        stateRevision: current.snapshot.revision,
+        timestamp: current.snapshot.updatedAt,
+        type: options.historyEventType ?? runTransitionEventType(eventType),
+        data: {
+          ...((typeof options.event === "string"
+            ? undefined
+            : options.event.data) ??
+            options.data ??
+            {}),
+          ...(options.data ?? {}),
+          transition: eventType,
+        },
+      });
+      const historyPath = join(
+        repository,
+        runtimeDirectoryName,
+        runsDirectoryName,
+        options.runId,
+        "history.jsonl",
+      );
+      await dependencies.beforeHistoryPublication?.();
+      const historyContents = await readFile(historyPath, "utf8");
+      await writeSynchronizedFile(
+        historyPath,
+        `${historyContents.endsWith("\n") ? historyContents : `${historyContents}\n`}${JSON.stringify(nextEvent)}\n`,
+      );
+      await dependencies.afterHistoryPublication?.();
+      return readRunAt(repository, options.runId);
+    }
+    const lifecycle = options.preserveLifecycle
+      ? withLifecycleState(current.snapshot)
+      : transition(withLifecycleState(current.snapshot), options.event);
     const timestamp = maxPersistedTimestamp(
       (dependencies.clock ?? (() => new Date()))().toISOString(),
       current.snapshot.updatedAt,

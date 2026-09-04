@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import {
+  lstat,
   mkdir,
   mkdtemp,
   readdir,
@@ -16,11 +17,12 @@ import { promisify } from "node:util";
 
 import { afterEach, expect, test } from "vitest";
 
-import { prepareWorktree } from "../src/git-worktree.js";
+import { cleanupWorktree, prepareWorktree } from "../src/git-worktree.js";
 import {
   acquireRunLock,
   FlowError,
   inspectRun,
+  mutateRun,
   releaseRunLock,
 } from "../src/workflow-run.js";
 
@@ -950,6 +952,281 @@ test("flow rejects stale and dirty checkpoint candidates without mutation", asyn
   expect(afterDirty.operationalHistory).toEqual(before.operationalHistory);
 });
 
+test("flow refuses cleanup for an active run", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260904T120000Z_303030303030";
+  await createExplicitRun(repository, runId);
+  const prepared = await prepareFeatureWorktree(repository, runId);
+
+  await expect(
+    run(executable, [
+      "worktree",
+      "cleanup",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--json",
+    ]),
+  ).rejects.toMatchObject({
+    code: 4,
+    stdout: "",
+    stderr: expect.stringContaining("WORKTREE_CLEANUP_REFUSED"),
+  });
+  expect(await pathExists(prepared.featureWorktree)).toBe(true);
+});
+
+test.each([
+  [
+    "tracked changes",
+    "DIRTY_WORKTREE",
+    async (path: string) => {
+      await writeFile(join(path, "specs", "feature.md"), "changed\n");
+    },
+  ],
+  [
+    "non-ignored untracked files",
+    "UNTRACKED_WORKTREE",
+    async (path: string) => {
+      await writeFile(join(path, "untracked.txt"), "untracked\n");
+    },
+  ],
+  [
+    "ignored files",
+    "IGNORED_WORKTREE",
+    async (path: string) => {
+      await writeFile(join(path, "ignored.txt"), "ignored\n");
+    },
+  ],
+] as const)("flow refuses cleanup for %s", async (_label, code, mutate) => {
+  const repository = await createCommittedTargetRepository();
+  if (_label === "ignored files") {
+    await writeFile(join(repository, ".gitignore"), "ignored.txt\n");
+    await run("git", ["-C", repository, "add", ".gitignore"]);
+    await run("git", ["-C", repository, "commit", "--quiet", "-m", "ignore"]);
+  }
+  const runId = "run_20260904T120000Z_313131313131";
+  await createExplicitRun(repository, runId);
+  const prepared = await prepareTerminalWorktree(repository, runId);
+  const before = await inspectRun(repository, runId);
+  await mutate(prepared.featureWorktree);
+
+  await expect(
+    run(executable, [
+      "worktree",
+      "cleanup",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--json",
+    ]),
+  ).rejects.toMatchObject({
+    code: 4,
+    stdout: "",
+    stderr: expect.stringContaining(code),
+  });
+  const after = await inspectRun(repository, runId);
+  expect(after.snapshot).toEqual(before.snapshot);
+  expect(after.operationalHistory).toEqual(before.operationalHistory);
+  expect(await pathExists(prepared.featureWorktree)).toBe(true);
+});
+
+test("flow removes a terminal Feature worktree, preserves its branch, and is idempotent", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260904T120000Z_323232323232";
+  await createExplicitRun(repository, runId);
+  const prepared = await prepareTerminalWorktree(repository, runId);
+  const terminal = await inspectRun(repository, runId);
+  const branchHead = await gitOutput(repository, [
+    "rev-parse",
+    `refs/heads/${prepared.featureBranch}`,
+  ]);
+
+  const first = await run(executable, [
+    "worktree",
+    "cleanup",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+    "--json",
+  ]);
+  const result = JSON.parse(first.stdout);
+  expect(result).toMatchObject({
+    runId,
+    phase: "completed",
+    revision: terminal.snapshot.revision + 1,
+    git: {
+      runBase: prepared.runBase,
+      featureBranch: prepared.featureBranch,
+      featureWorktree: prepared.featureWorktree,
+      worktreeStatus: "removed",
+      validatedHead: branchHead,
+    },
+  });
+  expect(await pathExists(prepared.featureWorktree)).toBe(false);
+  expect(
+    await gitOutput(repository, [
+      "show-ref",
+      "--verify",
+      `refs/heads/${prepared.featureBranch}`,
+    ]),
+  ).toContain(branchHead);
+  expect(
+    await gitOutput(repository, ["worktree", "list", "--porcelain"]),
+  ).not.toContain(prepared.featureWorktree);
+
+  const historyBeforeRetry = await readFile(
+    join(repository, ".orchestrator", "runs", runId, "history.jsonl"),
+    "utf8",
+  );
+  const stateBeforeRetry = await readFile(
+    join(repository, ".orchestrator", "runs", runId, "state.json"),
+    "utf8",
+  );
+  await expect(
+    run(executable, [
+      "worktree",
+      "cleanup",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--json",
+    ]),
+  ).resolves.toMatchObject({ stdout: first.stdout });
+  expect(
+    await readFile(
+      join(repository, ".orchestrator", "runs", runId, "history.jsonl"),
+      "utf8",
+    ),
+  ).toBe(historyBeforeRetry);
+  expect(
+    await readFile(
+      join(repository, ".orchestrator", "runs", runId, "state.json"),
+      "utf8",
+    ),
+  ).toBe(stateBeforeRetry);
+  const history = JSON.parse(
+    await run(executable, [
+      "history",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--json",
+    ]).then(({ stdout }) => stdout),
+  ) as Array<{ type: string }>;
+  expect(history.at(-1)?.type).toBe("git.worktree.removed");
+});
+
+test("flow exactly retries cleanup after Git removal before state publication", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260904T120000Z_333333333333";
+  await createExplicitRun(repository, runId);
+  const prepared = await prepareTerminalWorktree(repository, runId);
+  let interrupted = true;
+  await expect(
+    cleanupWorktree(
+      { repository, runId },
+      {
+        beforeSnapshotPublication: () => {
+          if (interrupted) {
+            interrupted = false;
+            throw new Error("interrupt before cleanup state");
+          }
+        },
+      },
+    ),
+  ).rejects.toThrow("interrupt before cleanup state");
+  expect(await pathExists(prepared.featureWorktree)).toBe(false);
+  expect(
+    (await inspectRun(repository, runId)).snapshot.git?.worktreeStatus,
+  ).toBe("ready");
+
+  const retry = await run(executable, [
+    "worktree",
+    "cleanup",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+    "--json",
+  ]);
+  expect(JSON.parse(retry.stdout).git.worktreeStatus).toBe("removed");
+});
+
+test("flow exactly retries cleanup after state publication before history", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260904T120000Z_343434343434";
+  await createExplicitRun(repository, runId);
+  const prepared = await prepareTerminalWorktree(repository, runId);
+  let interrupted = true;
+  await expect(
+    cleanupWorktree(
+      { repository, runId },
+      {
+        afterSnapshotPublication: () => {
+          if (interrupted) {
+            interrupted = false;
+            throw new Error("interrupt before cleanup history");
+          }
+        },
+      },
+    ),
+  ).rejects.toThrow("interrupt before cleanup history");
+  expect(await pathExists(prepared.featureWorktree)).toBe(false);
+  expect((await inspectRun(repository, runId)).audit.synchronized).toBe(false);
+
+  const retry = await run(executable, [
+    "worktree",
+    "cleanup",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+    "--json",
+  ]);
+  expect(JSON.parse(retry.stdout).git.worktreeStatus).toBe("removed");
+  expect((await inspectRun(repository, runId)).audit.synchronized).toBe(true);
+});
+
+test("flow refuses an interrupted cleanup retry when the preserved branch changed", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260904T120000Z_353535353535";
+  await createExplicitRun(repository, runId);
+  const prepared = await prepareTerminalWorktree(repository, runId);
+  await expect(
+    cleanupWorktree(
+      { repository, runId },
+      {
+        beforeSnapshotPublication: () => Promise.reject(new Error("interrupt")),
+      },
+    ),
+  ).rejects.toThrow("interrupt");
+  await run("git", ["-C", repository, "branch", "-D", prepared.featureBranch]);
+
+  await expect(
+    run(executable, [
+      "worktree",
+      "cleanup",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--json",
+    ]),
+  ).rejects.toMatchObject({
+    code: 3,
+    stdout: "",
+    stderr: expect.stringContaining("FEATURE_BRANCH_NOT_FOUND"),
+  });
+  expect(
+    (await inspectRun(repository, runId)).snapshot.git?.worktreeStatus,
+  ).toBe("ready");
+});
+
 test.each([
   [
     "missing Feature worktree",
@@ -1487,6 +1764,61 @@ async function createExplicitRun(
     "--run",
     runId,
   ]);
+}
+
+async function prepareFeatureWorktree(
+  repository: string,
+  runId: string,
+): Promise<{
+  featureBranch: string;
+  featureWorktree: string;
+  runBase: string;
+  revision: number;
+}> {
+  const { stdout } = await run(executable, [
+    "worktree",
+    "prepare",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+    "--json",
+  ]);
+  const result = JSON.parse(stdout) as {
+    revision: number;
+    git: {
+      featureBranch: string;
+      featureWorktree: string;
+      runBase: string;
+    };
+  };
+  return { revision: result.revision, ...result.git };
+}
+
+async function prepareTerminalWorktree(
+  repository: string,
+  runId: string,
+): Promise<{
+  featureBranch: string;
+  featureWorktree: string;
+  runBase: string;
+  revision: number;
+}> {
+  const prepared = await prepareFeatureWorktree(repository, runId);
+  await mutateRun({ repository, runId, event: "review" });
+  await mutateRun({ repository, runId, event: "check" });
+  await mutateRun({ repository, runId, event: "complete" });
+  return prepared;
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 async function createCommittedTargetRepository(): Promise<string> {

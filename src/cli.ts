@@ -1,6 +1,7 @@
 import packageMetadata from "../package.json" with { type: "json" };
 
 import {
+  cleanupWorktree,
   prepareWorktree,
   validateCheckpoint,
   validateWorktree,
@@ -13,7 +14,9 @@ const structuredRequest =
   (argument === "status" ||
     argument === "history" ||
     (argument === "worktree" &&
-      (arguments_[1] === "prepare" || arguments_[1] === "validate")) ||
+      (arguments_[1] === "prepare" ||
+        arguments_[1] === "validate" ||
+        arguments_[1] === "cleanup")) ||
     (argument === "checkpoint" && arguments_[1] === "validate")) &&
   arguments_.includes("--json");
 
@@ -221,6 +224,22 @@ try {
       for (const [name, check] of Object.entries(report.checks))
         console.log(`${name}: ${check.valid ? "valid" : "invalid"}`);
       console.log(`Result: ${report.valid ? "valid" : "invalid"}`);
+    }
+  } else if (argument === "worktree" && arguments_[1] === "cleanup") {
+    const { flags, values } = parseOptions(
+      arguments_.slice(2),
+      ["--repo", "--run"],
+      ["--json"],
+    );
+    const selected = await selectRun(values.get("--repo"), values.get("--run"));
+    const cleaned = await cleanupWorktree(selected);
+    if (flags.has("--json")) console.log(JSON.stringify(cleaned.snapshot));
+    else {
+      console.log(`Run: ${cleaned.snapshot.runId}`);
+      console.log(`Feature branch: ${cleaned.snapshot.git?.featureBranch}`);
+      console.log(`Feature worktree: ${cleaned.snapshot.git?.featureWorktree}`);
+      console.log(`Worktree: ${cleaned.snapshot.git?.worktreeStatus}`);
+      console.log(`Phase: ${cleaned.snapshot.phase}`);
     }
   } else if (argument === "checkpoint" && arguments_[1] === "validate") {
     const { flags, values } = parseOptions(
