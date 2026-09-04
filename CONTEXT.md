@@ -43,3 +43,19 @@ _Avoid_: Copied specification, ticket graph
 **Blocked run**:
 A recoverable Workflow run that cannot safely proceed without a resolved condition and retains the phase from which it was blocked.
 _Avoid_: Failed run, cancelled run
+
+**Run base**:
+The immutable Git commit from which a Workflow run's delegated implementation begins.
+_Avoid_: Starting branch, mutable base
+
+**Feature branch**:
+The Git branch owned by one Workflow run and shared by its sequential delegated work.
+_Avoid_: Task branch, primary branch
+
+**Feature worktree**:
+The isolated Git worktree containing a Workflow run's Feature branch, where delegated implementation occurs.
+_Avoid_: Target repository, primary checkout, task worktree
+
+**Git checkpoint**:
+An accepted commit that proves a validated point of progress on a Workflow run's Feature branch.
+_Avoid_: Worker completion, uncommitted changes
