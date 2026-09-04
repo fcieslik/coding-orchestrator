@@ -7,11 +7,13 @@ import { promisify } from "node:util";
 import { afterEach, expect, test } from "vitest";
 
 import {
+  acquireGitOperationLock,
   acquireRunLock,
   createRun,
   inspectRun,
   mutateRun,
   releaseRunLock,
+  releaseGitOperationLock,
 } from "../src/workflow-run.js";
 
 const run = promisify(execFile);
@@ -284,4 +286,28 @@ test("a concurrent subprocess holding the lock is refused immediately", async ()
   } finally {
     await new Promise<void>((resolve) => holder.once("close", () => resolve()));
   }
+});
+
+test("repository Git-operation locks serialize owners and preserve stale locks", async () => {
+  const repository = await mkdtemp(join(tmpdir(), "flow-git-lock-"));
+  temporaryDirectories.push(repository);
+  await run("git", ["init", "--quiet", repository]);
+  await createTestRun(repository, "888888888888");
+
+  const first = await acquireGitOperationLock(repository, {
+    clock: () => new Date("2026-09-04T12:03:00.000Z"),
+    hostname: () => "git-owner",
+    randomBytes: () => Buffer.alloc(16, 8),
+  });
+  await expect(acquireGitOperationLock(repository)).rejects.toMatchObject({
+    code: "LOCK_CONTENTION",
+    exitCode: 5,
+    details: { owner: { hostname: "git-owner" } },
+  });
+  await expect(
+    releaseGitOperationLock({ ...first, ownerToken: "wrong-token" }),
+  ).rejects.toMatchObject({ code: "LOCK_RELEASE_FAILED" });
+  await releaseGitOperationLock(first);
+  const second = await acquireGitOperationLock(repository);
+  await releaseGitOperationLock(second);
 });

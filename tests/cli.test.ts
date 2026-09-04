@@ -16,6 +16,9 @@ import { promisify } from "node:util";
 
 import { afterEach, expect, test } from "vitest";
 
+import { prepareWorktree } from "../src/git-worktree.js";
+import { FlowError, inspectRun } from "../src/workflow-run.js";
+
 const run = promisify(execFile);
 const executable = fileURLToPath(new URL("../scripts/flow", import.meta.url));
 const outsideInstallationRoot = fileURLToPath(new URL(".", import.meta.url));
@@ -698,6 +701,91 @@ test("flow prepares and inspects a default Feature worktree", async () => {
     featureWorktree: result.git.featureWorktree,
     worktreeStatus: "planned",
   });
+});
+
+test("flow retries an interrupted preparation from persisted intent", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260904T120000Z_898989898989";
+  await createExplicitRun(repository, runId);
+  let failOnce = true;
+  await expect(
+    prepareWorktree(
+      { repository, runId },
+      {
+        afterHistoryPublication: () => {
+          if (failOnce) {
+            failOnce = false;
+            throw new Error("interrupt after intent");
+          }
+        },
+      },
+    ),
+  ).rejects.toThrow("interrupt after intent");
+
+  const interrupted = await inspectRun(repository, runId);
+  expect(interrupted.snapshot).toMatchObject({
+    phase: "preparing",
+    git: { worktreeStatus: "planned" },
+  });
+  expect(interrupted.operationalHistory).toHaveLength(2);
+
+  const retried = await run(executable, [
+    "worktree",
+    "prepare",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+    "--json",
+  ]);
+  expect(JSON.parse(retried.stdout)).toMatchObject({
+    runId,
+    phase: "implementing",
+    git: { worktreeStatus: "ready" },
+  });
+  const history = JSON.parse(
+    await run(executable, [
+      "history",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--json",
+    ]).then(({ stdout }) => stdout),
+  ) as Array<{ type: string }>;
+  expect(history.map((event) => event.type)).toEqual([
+    "run.created",
+    "git.preparation.started",
+    "git.worktree.prepared",
+  ]);
+});
+
+test("failed Git execution preserves the synchronized preparation intent", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260904T120000Z_909090909090";
+  await createExplicitRun(repository, runId);
+
+  await expect(
+    prepareWorktree(
+      { repository, runId },
+      {
+        gitRunner: async () => {
+          throw new FlowError(
+            "injected worktree failure",
+            3,
+            "WORKTREE_CREATION_FAILED",
+          );
+        },
+      },
+    ),
+  ).rejects.toMatchObject({ code: "WORKTREE_CREATION_FAILED", exitCode: 3 });
+
+  const interrupted = await inspectRun(repository, runId);
+  expect(interrupted.snapshot).toMatchObject({
+    phase: "preparing",
+    git: { worktreeStatus: "planned" },
+  });
+  expect(interrupted.operationalHistory).toHaveLength(2);
 });
 
 test("flow persists explicit base, branch, and caller-relative worktree inputs", async () => {

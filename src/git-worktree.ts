@@ -11,9 +11,14 @@ import {
 import { promisify } from "node:util";
 
 import {
+  acquireGitOperationLock,
+  acquireRunLock,
   FlowError,
   inspectRun,
   mutateRun,
+  releaseGitOperationLock,
+  releaseRunLock,
+  type RunDependencies,
   type ReadRunResult,
 } from "./workflow-run.js";
 import { gitStateSchema, type StateSnapshot } from "./schema.js";
@@ -26,6 +31,18 @@ export interface PrepareWorktreeOptions {
   base?: string;
   branch?: string;
   worktree?: string;
+  dependencies?: PrepareWorktreeDependencies;
+}
+
+export type GitCommandRunner = (
+  repository: string,
+  args: string[],
+  missingCode?: string,
+) => Promise<string>;
+
+export interface PrepareWorktreeDependencies extends RunDependencies {
+  /** Test seam for forcing deterministic Git failures after intent publication. */
+  gitRunner?: GitCommandRunner;
 }
 
 export interface PreparedWorktree {
@@ -432,177 +449,411 @@ async function targetWarnings(
       ];
 }
 
-export async function prepareWorktree(
+function intentConflict(
+  field: string,
+  expected: string,
+  actual: string,
+): FlowError {
+  return new FlowError(
+    `${field} conflicts with persisted Git intent (expected ${expected}, received ${actual})`,
+    2,
+    "GIT_INTENT_CONFLICT",
+    { field, expected, actual },
+  );
+}
+
+async function branchExists(
+  repository: string,
+  branch: string,
+): Promise<boolean> {
+  try {
+    await runGit(repository, [
+      "show-ref",
+      "--verify",
+      "--quiet",
+      `refs/heads/${branch}`,
+    ]);
+    return true;
+  } catch (error) {
+    if (error instanceof FlowError && error.code === "GIT_RESOURCE_NOT_FOUND")
+      return false;
+    throw error;
+  }
+}
+
+async function validateBranchName(
+  repository: string,
+  branch: string,
+): Promise<void> {
+  if (
+    branch.startsWith("-") ||
+    !(await runGit(repository, ["check-ref-format", "--branch", branch])
+      .then(() => true)
+      .catch(() => false))
+  ) {
+    throw new FlowError(
+      `Invalid Feature branch: ${branch}`,
+      2,
+      "INVALID_FEATURE_BRANCH",
+    );
+  }
+}
+
+async function pathComponentsAreSafe(path: string): Promise<void> {
+  const absolute = resolve(path);
+  let current = absolute;
+  const components: string[] = [];
+  while (current !== dirname(current)) {
+    components.unshift(current);
+    current = dirname(current);
+  }
+  components.unshift(current);
+  for (const component of components) {
+    try {
+      if ((await lstat(component)).isSymbolicLink())
+        throw new FlowError(
+          `Feature worktree path traverses a symbolic link: ${component}`,
+          4,
+          "WORKTREE_PATH_INVALID",
+        );
+    } catch (error) {
+      if (error instanceof FlowError) throw error;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+  }
+}
+
+async function inspectPlannedResources(
+  repository: string,
+  target: TargetRepository,
+  state: StateSnapshot,
+): Promise<"ready" | "missing"> {
+  const gitState = gitStateSchema.parse(state.git);
+  const registrations = await listWorktrees(repository);
+  const expectedPath = resolve(gitState.featureWorktree);
+  const expected = registrations.find(
+    (registration) => registration.path === expectedPath,
+  );
+  const branchRegistration = registrations.find(
+    (registration) => registration.branch === gitState.featureBranch,
+  );
+
+  if (expected) {
+    if (expected.branch !== gitState.featureBranch) {
+      throw invariant(
+        "A registered Feature worktree uses a different branch than the persisted plan",
+        {
+          expectedBranch: gitState.featureBranch,
+          actualBranch: expected.branch,
+        },
+      );
+    }
+    await validatePreparedWorktree(repository, state);
+    return "ready";
+  }
+  if (branchRegistration) {
+    throw new FlowError(
+      `Feature branch is already checked out: ${gitState.featureBranch}`,
+      3,
+      "FEATURE_BRANCH_CHECKED_OUT",
+      {
+        featureBranch: gitState.featureBranch,
+        worktree: branchRegistration.path,
+      },
+    );
+  }
+
+  await pathComponentsAreSafe(expectedPath);
+  try {
+    await lstat(expectedPath);
+    throw new FlowError(
+      `Feature worktree destination already exists: ${expectedPath}`,
+      3,
+      "WORKTREE_ALREADY_EXISTS",
+    );
+  } catch (error) {
+    if (error instanceof FlowError) throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  if (await branchExists(repository, gitState.featureBranch)) {
+    const head = await resolveCommit(
+      repository,
+      gitState.featureBranch,
+      target.objectFormat,
+    );
+    if (head !== gitState.runBase) {
+      throw invariant(
+        "Persisted Feature branch does not point to the planned Run base",
+        { expectedHead: gitState.runBase, actualHead: head },
+      );
+    }
+  }
+  return "missing";
+}
+
+async function createPlannedResources(
+  repository: string,
+  target: TargetRepository,
+  state: StateSnapshot,
+  gitRunner: GitCommandRunner = runGit,
+): Promise<void> {
+  const gitState = gitStateSchema.parse(state.git);
+  const expectedPath = resolve(gitState.featureWorktree);
+  await mkdir(dirname(expectedPath), { recursive: true });
+  const exists = await branchExists(repository, gitState.featureBranch);
+  await gitRunner(
+    repository,
+    exists
+      ? ["worktree", "add", "--quiet", expectedPath, gitState.featureBranch]
+      : [
+          "worktree",
+          "add",
+          "--quiet",
+          "-b",
+          gitState.featureBranch,
+          expectedPath,
+          gitState.runBase,
+        ],
+    "WORKTREE_CREATION_FAILED",
+  );
+}
+
+async function resolvePersistedIntent(
+  repository: string,
+  target: TargetRepository,
+  current: ReadRunResult,
   options: PrepareWorktreeOptions,
-): Promise<PreparedWorktree> {
-  const target = await resolveTargetRepository(options.repository);
-  const canonicalRepository = target.path;
-  const current = await inspectRun(canonicalRepository, options.runId);
-  if (current.snapshot.git?.worktreeStatus === "ready") {
-    if (options.base && options.base !== current.snapshot.git.runBase)
-      throw new FlowError(
-        "Run base conflicts with persisted Git intent",
-        2,
-        "GIT_INTENT_CONFLICT",
-      );
-    if (options.branch && options.branch !== current.snapshot.git.featureBranch)
-      throw new FlowError(
-        "Feature branch conflicts with persisted Git intent",
-        2,
-        "GIT_INTENT_CONFLICT",
-      );
+): Promise<{
+  runBase: string;
+  featureBranch: string;
+  featureWorktree: string;
+}> {
+  const persisted = gitStateSchema.safeParse(current.snapshot.git);
+  if (persisted.success) {
     if (
-      options.worktree &&
-      resolve(options.worktree) !== current.snapshot.git.featureWorktree
+      current.snapshot.phase !== "preparing" ||
+      persisted.data.worktreeStatus !== "planned"
     )
-      throw new FlowError(
-        "Feature worktree conflicts with persisted Git intent",
-        2,
-        "GIT_INTENT_CONFLICT",
+      throw invariant(
+        "Persisted planned Git intent has an incompatible Run phase",
       );
-    await validatePreparedWorktree(canonicalRepository, current.snapshot);
-    const warnings = await targetWarnings(canonicalRepository);
+    const gitState = persisted.data;
+    if (options.base !== undefined) {
+      const resolved = await resolveCommit(
+        repository,
+        options.base,
+        target.objectFormat,
+      );
+      if (resolved !== gitState.runBase)
+        throw intentConflict("Run base", gitState.runBase, resolved);
+    }
+    if (
+      options.branch !== undefined &&
+      options.branch !== gitState.featureBranch
+    )
+      throw intentConflict(
+        "Feature branch",
+        gitState.featureBranch,
+        options.branch,
+      );
+    if (options.worktree !== undefined) {
+      const resolved = resolve(options.worktree);
+      if (resolved !== gitState.featureWorktree)
+        throw intentConflict(
+          "Feature worktree",
+          gitState.featureWorktree,
+          resolved,
+        );
+    }
     return {
-      snapshot: current.snapshot,
-      run: current,
-      ...(warnings === undefined ? {} : { warnings }),
+      runBase: gitState.runBase,
+      featureBranch: gitState.featureBranch,
+      featureWorktree: gitState.featureWorktree,
     };
   }
-  if (current.snapshot.phase !== "created") {
+  if (current.snapshot.git !== undefined)
+    throw invariant("Persisted Git intent is invalid");
+  if (current.snapshot.phase !== "created")
     throw new FlowError(
       "Workflow run is not ready for worktree preparation",
       4,
       "INVALID_PREPARATION_STATE",
     );
-  }
   const runBase = await resolveCommit(
-    canonicalRepository,
+    repository,
     options.base ?? "HEAD",
     target.objectFormat,
   );
   const featureBranch = options.branch ?? `orchestrator/${options.runId}`;
   const featureWorktree = resolve(
-    options.worktree ??
-      (await defaultWorktreePath(canonicalRepository, options.runId)),
+    options.worktree ?? (await defaultWorktreePath(repository, options.runId)),
   );
-  if (
-    featureBranch.startsWith("-") ||
-    !(await runGit(canonicalRepository, [
-      "check-ref-format",
-      "--branch",
-      featureBranch,
-    ])
-      .then(() => true)
-      .catch(() => false))
-  ) {
-    throw new FlowError(
-      `Invalid Feature branch: ${featureBranch}`,
-      2,
-      "INVALID_FEATURE_BRANCH",
-    );
-  }
-  const registrations = await listWorktrees(canonicalRepository);
-  await assertDestinationSafe(
-    canonicalRepository,
-    featureWorktree,
-    registrations,
-  );
+  await validateBranchName(repository, featureBranch);
+  const registrations = await listWorktrees(repository);
+  await assertDestinationSafe(repository, featureWorktree, registrations);
   const checkedOut = registrations.find(
     (registration) => registration.branch === featureBranch,
   );
-  if (checkedOut) {
+  if (checkedOut)
     throw new FlowError(
       `Feature branch is already checked out: ${featureBranch}`,
       3,
       "FEATURE_BRANCH_CHECKED_OUT",
       { featureBranch, worktree: checkedOut.path },
     );
-  }
-  try {
-    await runGit(canonicalRepository, [
-      "show-ref",
-      "--verify",
-      "--quiet",
-      `refs/heads/${featureBranch}`,
-    ]);
+  if (await branchExists(repository, featureBranch))
     throw new FlowError(
       `Feature branch already exists: ${featureBranch}`,
       3,
       "FEATURE_BRANCH_ALREADY_EXISTS",
     );
-  } catch (error) {
-    if (
-      !(error instanceof FlowError) ||
-      error.code !== "GIT_RESOURCE_NOT_FOUND"
-    )
-      throw error;
-  }
+  return { runBase, featureBranch, featureWorktree };
+}
 
-  const planned = await mutateRun({
-    repository: canonicalRepository,
-    runId: options.runId,
-    event: "prepare",
-    historyEventType: "git.preparation.started",
-    data: {
-      runBase,
-      featureBranch,
-      featureWorktree,
-      worktreeStatus: "planned",
-    },
-    updateSnapshot: (snapshot) => ({
-      git: {
-        ...(snapshot.git ?? {}),
-        schemaVersion: 1,
-        runBase,
-        featureBranch,
-        featureWorktree,
-        worktreeStatus: "planned",
-      },
-    }),
-  });
-  await mkdir(dirname(featureWorktree), { recursive: true });
-  await runGit(
+export async function prepareWorktree(
+  options: PrepareWorktreeOptions,
+  dependencies: PrepareWorktreeDependencies = options.dependencies ?? {},
+): Promise<PreparedWorktree> {
+  const target = await resolveTargetRepository(options.repository);
+  const canonicalRepository = target.path;
+  const gitLock = await acquireGitOperationLock(
     canonicalRepository,
-    [
-      "worktree",
-      "add",
-      "--quiet",
-      "-b",
-      featureBranch,
-      featureWorktree,
-      runBase,
-    ],
-    "WORKTREE_CREATION_FAILED",
+    dependencies,
   );
-  await validatePreparedWorktree(canonicalRepository, planned.snapshot);
-  const completed = await mutateRun({
-    repository: canonicalRepository,
-    runId: options.runId,
-    event: "implement",
-    historyEventType: "git.worktree.prepared",
-    data: {
-      runBase,
-      featureBranch,
-      featureWorktree,
-      worktreeStatus: "ready",
-      validatedHead: runBase,
-    },
-    updateSnapshot: (snapshot) => ({
-      git: {
-        ...(snapshot.git ?? {}),
-        schemaVersion: 1,
-        runBase,
-        featureBranch,
-        featureWorktree,
-        worktreeStatus: "ready",
-        validatedHead: runBase,
-      },
-    }),
-  });
-  const warnings = await targetWarnings(canonicalRepository);
-  return {
-    snapshot: completed.snapshot,
-    run: completed,
-    ...(warnings === undefined ? {} : { warnings }),
-  };
+  try {
+    const runLock = await acquireRunLock(
+      canonicalRepository,
+      options.runId,
+      dependencies,
+    );
+    try {
+      let current = await inspectRun(canonicalRepository, options.runId);
+      if (!current.audit.synchronized)
+        throw new FlowError(
+          `Workflow run ${options.runId} has an unresolved history audit gap`,
+          4,
+          "AUDIT_GAP",
+          { runId: options.runId, warning: current.audit.warning },
+        );
+      const persisted = gitStateSchema.safeParse(current.snapshot.git);
+      if (persisted.success && persisted.data.worktreeStatus === "ready") {
+        if (options.base !== undefined) {
+          const resolved = await resolveCommit(
+            canonicalRepository,
+            options.base,
+            target.objectFormat,
+          );
+          if (resolved !== persisted.data.runBase)
+            throw intentConflict("Run base", persisted.data.runBase, resolved);
+        }
+        if (
+          options.branch !== undefined &&
+          options.branch !== persisted.data.featureBranch
+        )
+          throw intentConflict(
+            "Feature branch",
+            persisted.data.featureBranch,
+            options.branch,
+          );
+        if (
+          options.worktree !== undefined &&
+          resolve(options.worktree) !== persisted.data.featureWorktree
+        )
+          throw intentConflict(
+            "Feature worktree",
+            persisted.data.featureWorktree,
+            resolve(options.worktree),
+          );
+        await validatePreparedWorktree(canonicalRepository, current.snapshot);
+        const warnings = await targetWarnings(canonicalRepository);
+        return {
+          snapshot: current.snapshot,
+          run: current,
+          ...(warnings === undefined ? {} : { warnings }),
+        };
+      }
+
+      const intent = await resolvePersistedIntent(
+        canonicalRepository,
+        target,
+        current,
+        options,
+      );
+      if (!persisted.success) {
+        current = await mutateRun(
+          {
+            repository: canonicalRepository,
+            runId: options.runId,
+            event: "prepare",
+            historyEventType: "git.preparation.started",
+            data: {
+              ...intent,
+              worktreeStatus: "planned",
+            },
+            lock: runLock,
+            updateSnapshot: (snapshot) => ({
+              git: {
+                ...(snapshot.git ?? {}),
+                schemaVersion: 1,
+                ...intent,
+                worktreeStatus: "planned",
+              },
+            }),
+          },
+          dependencies,
+        );
+      }
+
+      const state = current.snapshot;
+      const resourceStatus = await inspectPlannedResources(
+        canonicalRepository,
+        target,
+        state,
+      );
+      if (resourceStatus === "missing")
+        await createPlannedResources(
+          canonicalRepository,
+          target,
+          state,
+          dependencies.gitRunner,
+        );
+      await validatePreparedWorktree(canonicalRepository, state);
+      const completed = await mutateRun(
+        {
+          repository: canonicalRepository,
+          runId: options.runId,
+          event: "implement",
+          historyEventType: "git.worktree.prepared",
+          data: {
+            ...intent,
+            worktreeStatus: "ready",
+            validatedHead: intent.runBase,
+          },
+          lock: runLock,
+          updateSnapshot: (snapshot) => ({
+            git: {
+              ...(snapshot.git ?? {}),
+              schemaVersion: 1,
+              ...intent,
+              worktreeStatus: "ready",
+              validatedHead: intent.runBase,
+            },
+          }),
+        },
+        dependencies,
+      );
+      const warnings = await targetWarnings(canonicalRepository);
+      return {
+        snapshot: completed.snapshot,
+        run: completed,
+        ...(warnings === undefined ? {} : { warnings }),
+      };
+    } finally {
+      await releaseRunLock(runLock);
+    }
+  } finally {
+    await releaseGitOperationLock(gitLock);
+  }
 }

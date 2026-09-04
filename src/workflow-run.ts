@@ -97,6 +97,8 @@ export interface MutateRunOptions {
   data?: Record<string, unknown>;
   historyEventType?: string;
   updateSnapshot?: (snapshot: StateSnapshot) => Record<string, unknown>;
+  /** Internal seam for callers that already hold the run lock. */
+  lock?: RunLock;
 }
 
 export interface RunLockOwner {
@@ -110,6 +112,8 @@ export interface RunLock {
   ownerToken: string;
   owner: RunLockOwner;
 }
+
+export type GitOperationLock = RunLock;
 
 export interface RunAudit {
   synchronized: boolean;
@@ -510,6 +514,82 @@ export async function acquireRunLock(
   }
 }
 
+/** Acquire the repository-wide Git-operation lock without waiting. */
+export async function acquireGitOperationLock(
+  repository: string,
+  dependencies: RunDependencies = {},
+): Promise<GitOperationLock> {
+  const targetRepository = await realpath(repository).catch(
+    (error: unknown) => {
+      if (isNodeError(error, "ENOENT"))
+        throw new FlowError(
+          `Target repository was not found: ${repository}`,
+          3,
+          "INVALID_REPOSITORY",
+        );
+      throw error;
+    },
+  );
+  const runtimeDirectory = join(targetRepository, runtimeDirectoryName);
+  await assertNoSymlink(runtimeDirectory);
+  try {
+    const directory = await lstat(runtimeDirectory);
+    if (!directory.isDirectory()) throw new Error("runtime is not a directory");
+  } catch (error) {
+    if (isNodeError(error, "ENOENT"))
+      throw new FlowError(
+        `Workflow runtime was not found: ${runtimeDirectory}`,
+        3,
+        "REPOSITORY_OR_RUN_NOT_FOUND",
+      );
+    if (error instanceof FlowError) throw error;
+    throw new FlowError(
+      `Workflow runtime is invalid: ${runtimeDirectory}`,
+      4,
+      "UNSAFE_RUNTIME_PATH",
+    );
+  }
+  const lockPath = join(runtimeDirectory, "git-operation.lock");
+  await assertNoSymlink(lockPath);
+  const owner: RunLockOwner = {
+    pid: process.pid,
+    hostname: (dependencies.hostname ?? getHostname)(),
+    acquiredAt: (dependencies.clock ?? (() => new Date()))().toISOString(),
+  };
+  const ownerToken = (dependencies.randomBytes ?? randomBytes)(16).toString(
+    "hex",
+  );
+  const contents = JSON.stringify({ ...owner, ownerToken }) + "\n";
+  let handle;
+  try {
+    handle = await open(lockPath, "wx", 0o600);
+    await handle.writeFile(contents, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    return { path: lockPath, ownerToken, owner };
+  } catch (error) {
+    if (handle) await handle.close().catch(() => undefined);
+    if (isNodeError(error, "EEXIST")) {
+      const existingOwner = await readLockOwner(lockPath);
+      throw new FlowError(
+        "Repository Git operations are locked",
+        5,
+        "LOCK_CONTENTION",
+        { repository: targetRepository, owner: existingOwner },
+      );
+    }
+    throw error;
+  }
+}
+
+/** Release the repository Git-operation lock only for its owner token. */
+export async function releaseGitOperationLock(
+  lock: GitOperationLock,
+): Promise<void> {
+  await releaseRunLock(lock);
+}
+
 /** Release a lock only when the persisted owner token still belongs to the caller. */
 export async function releaseRunLock(lock: RunLock): Promise<void> {
   const persisted = await readFile(lock.path, "utf8").catch(
@@ -820,7 +900,9 @@ export async function mutateRun(
       "INVALID_RUN_ID",
     );
   const repository = await resolveRepository(options.repository);
-  const lock = await acquireRunLock(repository, options.runId, dependencies);
+  const acquiredLock =
+    options.lock ??
+    (await acquireRunLock(repository, options.runId, dependencies));
   try {
     const current = await readRunAt(repository, options.runId);
     if (!current.audit.synchronized) {
@@ -904,7 +986,7 @@ export async function mutateRun(
     await dependencies.afterHistoryPublication?.();
     return readRunAt(repository, options.runId);
   } finally {
-    await releaseRunLock(lock);
+    if (options.lock === undefined) await releaseRunLock(acquiredLock);
   }
 }
 
