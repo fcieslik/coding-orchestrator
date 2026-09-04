@@ -11,6 +11,7 @@ export interface RunLifecycleState {
 export type RunTransitionType =
   | "prepare"
   | "implement"
+  | "checkpoint"
   | "review"
   | "review.fail"
   | "check"
@@ -109,6 +110,7 @@ const historyEventTypes: Record<RunTransitionType, string> = {
   fail: "run.failed",
   "fix.complete": "run.fix.completed",
   implement: "run.implementation.started",
+  checkpoint: "run.checkpoint.accepted",
   prepare: "run.preparation.started",
   review: "run.review.started",
   "review.fail": "run.review.failed",
@@ -146,6 +148,7 @@ export function runTransitionEventType(event: RunTransitionInput): string {
 const runTransitionTypes = new Set<RunTransitionType>([
   "prepare",
   "implement",
+  "checkpoint",
   "review",
   "review.fail",
   "check",
@@ -218,6 +221,8 @@ export function transition(
       return state.phase === "preparing"
         ? withoutContinuation({ phase: "implementing" })
         : invalid(state, attemptedEvent);
+    case "checkpoint":
+      return { ...state };
     case "review":
       return state.phase === "implementing"
         ? withoutContinuation({ phase: "reviewing" })

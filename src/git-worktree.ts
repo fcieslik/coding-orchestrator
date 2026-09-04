@@ -56,6 +56,20 @@ export interface ValidateWorktreeOptions {
   runId: string;
 }
 
+export interface ValidateCheckpointOptions {
+  repository?: string;
+  runId: string;
+  commit: string;
+  dependencies?: RunDependencies;
+}
+
+export interface AcceptedCheckpoint {
+  snapshot: StateSnapshot;
+  run: ReadRunResult;
+  previousValidatedHead: string;
+  acceptedCommit: string;
+}
+
 export interface WorktreeValidationCheck {
   valid: boolean;
   expected?: unknown;
@@ -817,6 +831,293 @@ async function targetWarnings(
     : [
         "Target repository has uncommitted changes; they are excluded from the Run base.",
       ];
+}
+
+async function isAncestor(
+  repository: string,
+  older: string,
+  newer: string,
+): Promise<boolean> {
+  try {
+    await runGit(repository, ["merge-base", "--is-ancestor", older, newer]);
+    return true;
+  } catch (error) {
+    if (error instanceof FlowError && error.code === "GIT_RESOURCE_NOT_FOUND")
+      return false;
+    throw error;
+  }
+}
+
+function checkpointFailure(
+  message: string,
+  code: string,
+  exitCode = 4,
+  details?: Record<string, unknown>,
+): FlowError {
+  return new FlowError(message, exitCode, code, details);
+}
+
+/** Validate and accept one explicit commit as the next Git checkpoint. */
+export async function validateCheckpoint(
+  options: ValidateCheckpointOptions,
+  dependencies: RunDependencies = options.dependencies ?? {},
+): Promise<AcceptedCheckpoint> {
+  const target = await resolveTargetRepository(options.repository);
+  const runLock = await acquireRunLock(
+    target.path,
+    options.runId,
+    dependencies,
+  );
+  try {
+    const current = await inspectRun(target.path, options.runId);
+    if (!current.audit.synchronized)
+      throw new FlowError(
+        `Workflow run ${options.runId} has an unresolved history audit gap`,
+        4,
+        "AUDIT_GAP",
+        { runId: options.runId, warning: current.audit.warning },
+      );
+    const persisted = gitStateSchema.safeParse(current.snapshot.git);
+    if (!persisted.success || persisted.data.worktreeStatus !== "ready")
+      throw checkpointFailure(
+        `Workflow run ${options.runId} does not have a ready Feature worktree`,
+        "WORKTREE_NOT_READY",
+      );
+    if (!persisted.data.validatedHead)
+      throw checkpointFailure(
+        `Workflow run ${options.runId} has no validated Feature worktree HEAD`,
+        "WORKTREE_NOT_READY",
+      );
+    const gitState = persisted.data;
+    const previousValidatedHead = gitState.validatedHead;
+    if (!previousValidatedHead)
+      throw checkpointFailure(
+        `Workflow run ${options.runId} has no validated Feature worktree HEAD`,
+        "WORKTREE_NOT_READY",
+      );
+
+    let candidate: string;
+    try {
+      candidate = await resolveCommit(
+        target.path,
+        options.commit,
+        target.objectFormat,
+      );
+    } catch (error) {
+      if (error instanceof FlowError && error.exitCode === 3)
+        throw checkpointFailure(
+          `Checkpoint commit was not found locally or is not a commit: ${options.commit}`,
+          "CHECKPOINT_NOT_FOUND",
+          3,
+          { commit: options.commit },
+        );
+      throw error;
+    }
+
+    const expectedPath = resolve(gitState.featureWorktree);
+    try {
+      await assertNoSymlinkComponents(expectedPath);
+      const entry = await lstat(expectedPath);
+      if (!entry.isDirectory())
+        throw checkpointFailure(
+          `Feature worktree path is not a directory: ${expectedPath}`,
+          "WORKTREE_PATH_INVALID",
+        );
+      if ((await realpath(expectedPath)) !== expectedPath)
+        throw checkpointFailure(
+          `Feature worktree path is not canonical: ${expectedPath}`,
+          "WORKTREE_PATH_INVALID",
+        );
+    } catch (error) {
+      if (error instanceof FlowError) throw error;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT")
+        throw checkpointFailure(
+          `Feature worktree was not found: ${expectedPath}`,
+          "FEATURE_WORKTREE_NOT_FOUND",
+          3,
+        );
+      throw error;
+    }
+
+    const registrations = await listWorktrees(target.path);
+    const registration = registrations.find(
+      (entry) => entry.path === expectedPath,
+    );
+    if (!registration)
+      throw checkpointFailure(
+        `Feature worktree registration was not found: ${expectedPath}`,
+        "WORKTREE_REGISTRATION_NOT_FOUND",
+        3,
+      );
+    if (registration.branch !== gitState.featureBranch)
+      throw checkpointFailure(
+        "Feature worktree registration does not match the persisted branch",
+        "GIT_INVARIANT_VIOLATION",
+        4,
+        {
+          expectedBranch: gitState.featureBranch,
+          actualBranch: registration.branch,
+        },
+      );
+
+    const targetCommonDirectory = await canonicalGitPath(
+      target.path,
+      await runGit(target.path, ["rev-parse", "--git-common-dir"]),
+    );
+    const worktreeCommonDirectory = await canonicalGitPath(
+      expectedPath,
+      await runGit(expectedPath, ["rev-parse", "--git-common-dir"]),
+    );
+    if (targetCommonDirectory !== worktreeCommonDirectory)
+      throw checkpointFailure(
+        "Feature worktree belongs to a different Git repository",
+        "GIT_INVARIANT_VIOLATION",
+        4,
+        {
+          expectedCommonDirectory: targetCommonDirectory,
+          actualCommonDirectory: worktreeCommonDirectory,
+        },
+      );
+
+    let branch: string;
+    try {
+      branch = await runGit(expectedPath, [
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "HEAD",
+      ]);
+    } catch {
+      throw checkpointFailure(
+        "Feature worktree HEAD is detached",
+        "GIT_INVARIANT_VIOLATION",
+      );
+    }
+    if (branch !== gitState.featureBranch)
+      throw checkpointFailure(
+        "Feature worktree is on the wrong Feature branch",
+        "GIT_INVARIANT_VIOLATION",
+        4,
+        { expectedBranch: gitState.featureBranch, actualBranch: branch },
+      );
+
+    let branchHead: string;
+    try {
+      branchHead = await resolveCommit(
+        target.path,
+        `refs/heads/${gitState.featureBranch}`,
+        target.objectFormat,
+      );
+    } catch (error) {
+      if (error instanceof FlowError && error.exitCode === 3)
+        throw checkpointFailure(
+          `Feature branch was not found: ${gitState.featureBranch}`,
+          "FEATURE_BRANCH_NOT_FOUND",
+          3,
+        );
+      throw error;
+    }
+    const worktreeHead = await resolveCommit(
+      expectedPath,
+      "HEAD",
+      target.objectFormat,
+    );
+
+    if (branchHead !== candidate) {
+      if (await isAncestor(target.path, candidate, branchHead))
+        throw checkpointFailure(
+          "Checkpoint commit is stale; the Feature branch is already ahead",
+          "CHECKPOINT_STALE",
+          4,
+          { candidate, currentHead: branchHead },
+        );
+      if (await isAncestor(target.path, branchHead, candidate))
+        throw checkpointFailure(
+          "Checkpoint commit is ahead of the current Feature branch",
+          "CHECKPOINT_AHEAD",
+          4,
+          { candidate, currentHead: branchHead },
+        );
+      throw checkpointFailure(
+        "Checkpoint commit diverges from the current Feature branch",
+        "CHECKPOINT_DIVERGED",
+        4,
+        { candidate, currentHead: branchHead },
+      );
+    }
+    if (worktreeHead !== candidate)
+      throw checkpointFailure(
+        "Feature worktree HEAD does not match the reported checkpoint",
+        "GIT_INVARIANT_VIOLATION",
+        4,
+        { candidate, worktreeHead },
+      );
+
+    const status = await runGit(expectedPath, [
+      "status",
+      "--porcelain=v1",
+      "--untracked-files=all",
+    ]);
+    if (status.length > 0) {
+      const lines = status.split(/\r?\n/);
+      const untracked = lines.filter((line) => line.startsWith("?? "));
+      throw checkpointFailure(
+        "Feature worktree is not clean",
+        untracked.length > 0 && untracked.length === lines.length
+          ? "UNTRACKED_WORKTREE"
+          : "DIRTY_WORKTREE",
+        4,
+        {
+          status: lines,
+          tracked: lines.filter((line) => !line.startsWith("?? ")),
+          untracked,
+        },
+      );
+    }
+
+    if (candidate === previousValidatedHead)
+      throw checkpointFailure(
+        "Checkpoint commit is equal to the previously accepted checkpoint",
+        "CHECKPOINT_STALE",
+        4,
+        { candidate, previousValidatedHead },
+      );
+    if (!(await isAncestor(target.path, previousValidatedHead, candidate)))
+      throw checkpointFailure(
+        "Checkpoint commit does not descend from the previously accepted checkpoint",
+        "CHECKPOINT_DIVERGED",
+        4,
+        { candidate, previousValidatedHead },
+      );
+
+    const accepted = await mutateRun(
+      {
+        repository: target.path,
+        runId: options.runId,
+        event: "checkpoint",
+        historyEventType: "git.checkpoint.accepted",
+        data: {
+          commit: candidate,
+          previousValidatedHead,
+          acceptedCommit: candidate,
+          validatedHead: candidate,
+        },
+        lock: runLock,
+        updateSnapshot: (snapshot) => ({
+          git: { ...snapshot.git!, validatedHead: candidate },
+        }),
+      },
+      dependencies,
+    );
+    return {
+      snapshot: accepted.snapshot,
+      run: accepted,
+      previousValidatedHead,
+      acceptedCommit: candidate,
+    };
+  } finally {
+    await releaseRunLock(runLock);
+  }
 }
 
 function intentConflict(

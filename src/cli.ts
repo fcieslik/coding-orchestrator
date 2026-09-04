@@ -1,6 +1,10 @@
 import packageMetadata from "../package.json" with { type: "json" };
 
-import { prepareWorktree, validateWorktree } from "./git-worktree.js";
+import {
+  prepareWorktree,
+  validateCheckpoint,
+  validateWorktree,
+} from "./git-worktree.js";
 import { createRun, FlowError, inspectRun, selectRun } from "./workflow-run.js";
 
 const arguments_ = process.argv.slice(2);
@@ -9,7 +13,8 @@ const structuredRequest =
   (argument === "status" ||
     argument === "history" ||
     (argument === "worktree" &&
-      (arguments_[1] === "prepare" || arguments_[1] === "validate"))) &&
+      (arguments_[1] === "prepare" || arguments_[1] === "validate")) ||
+    (argument === "checkpoint" && arguments_[1] === "validate")) &&
   arguments_.includes("--json");
 
 function parseOptions(
@@ -216,6 +221,39 @@ try {
       for (const [name, check] of Object.entries(report.checks))
         console.log(`${name}: ${check.valid ? "valid" : "invalid"}`);
       console.log(`Result: ${report.valid ? "valid" : "invalid"}`);
+    }
+  } else if (argument === "checkpoint" && arguments_[1] === "validate") {
+    const { flags, values } = parseOptions(
+      arguments_.slice(2),
+      ["--repo", "--run", "--commit"],
+      ["--json"],
+    );
+    const commit = values.get("--commit");
+    if (!commit)
+      throw new FlowError(
+        "Usage: flow checkpoint validate --commit <commit> [--repo <path>] [--run <id>]",
+        2,
+      );
+    const selected = await selectRun(values.get("--repo"), values.get("--run"));
+    const accepted = await validateCheckpoint({
+      repository: selected.repository,
+      runId: selected.runId,
+      commit,
+    });
+    if (flags.has("--json"))
+      console.log(
+        JSON.stringify({
+          ...accepted.snapshot,
+          previousValidatedHead: accepted.previousValidatedHead,
+          acceptedCommit: accepted.acceptedCommit,
+        }),
+      );
+    else {
+      console.log(`Run: ${accepted.snapshot.runId}`);
+      console.log(`Previous validated HEAD: ${accepted.previousValidatedHead}`);
+      console.log(`Accepted Git checkpoint: ${accepted.acceptedCommit}`);
+      console.log(`Revision: ${accepted.snapshot.revision}`);
+      console.log(`Phase: ${accepted.snapshot.phase}`);
     }
   } else {
     const label = arguments_.length === 1 ? "argument" : "arguments";

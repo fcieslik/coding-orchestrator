@@ -820,6 +820,136 @@ test("flow validates a healthy Feature worktree baseline in human and JSON outpu
   expect(human.stdout).toContain("Result: valid");
 });
 
+test("flow accepts a new Git checkpoint and exposes its audit event", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260904T120000Z_232323232323";
+  await createExplicitRun(repository, runId);
+  const prepared = JSON.parse(
+    (
+      await run(executable, [
+        "worktree",
+        "prepare",
+        "--repo",
+        repository,
+        "--run",
+        runId,
+        "--json",
+      ])
+    ).stdout,
+  ) as { git: { featureWorktree: string }; revision: number };
+  const feature = prepared.git.featureWorktree;
+  await writeFile(join(feature, "checkpoint.txt"), "checkpoint\n");
+  await run("git", ["-C", feature, "add", "checkpoint.txt"]);
+  await run("git", ["-C", feature, "commit", "--quiet", "-m", "checkpoint"]);
+  const commit = (
+    await run("git", ["-C", feature, "rev-parse", "HEAD"])
+  ).stdout.trim();
+
+  const accepted = await run(executable, [
+    "checkpoint",
+    "validate",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+    "--commit",
+    commit,
+    "--json",
+  ]);
+  expect(JSON.parse(accepted.stdout)).toMatchObject({
+    runId,
+    revision: prepared.revision + 1,
+    phase: "implementing",
+    git: { validatedHead: commit },
+    previousValidatedHead: expect.any(String),
+    acceptedCommit: commit,
+  });
+  const history = JSON.parse(
+    (
+      await run(executable, [
+        "history",
+        "--repo",
+        repository,
+        "--run",
+        runId,
+        "--json",
+      ])
+    ).stdout,
+  ) as Array<{ type: string; stateRevision: number }>;
+  expect(history.at(-1)).toMatchObject({
+    type: "git.checkpoint.accepted",
+    stateRevision: prepared.revision + 1,
+  });
+});
+
+test("flow rejects stale and dirty checkpoint candidates without mutation", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260904T120000Z_242424242424";
+  await createExplicitRun(repository, runId);
+  const prepared = JSON.parse(
+    (
+      await run(executable, [
+        "worktree",
+        "prepare",
+        "--repo",
+        repository,
+        "--run",
+        runId,
+        "--json",
+      ])
+    ).stdout,
+  ) as { git: { featureWorktree: string; runBase: string }; revision: number };
+  const feature = prepared.git.featureWorktree;
+  await writeFile(join(feature, "next.txt"), "next\n");
+  await run("git", ["-C", feature, "add", "next.txt"]);
+  await run("git", ["-C", feature, "commit", "--quiet", "-m", "next"]);
+  const current = (
+    await run("git", ["-C", feature, "rev-parse", "HEAD"])
+  ).stdout.trim();
+  const before = await inspectRun(repository, runId);
+
+  await expect(
+    run(executable, [
+      "checkpoint",
+      "validate",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--commit",
+      prepared.git.runBase,
+      "--json",
+    ]),
+  ).rejects.toMatchObject({
+    code: 4,
+    stderr: expect.stringContaining("CHECKPOINT_STALE"),
+  });
+  const afterStale = await inspectRun(repository, runId);
+  expect(afterStale.snapshot).toEqual(before.snapshot);
+  expect(afterStale.operationalHistory).toEqual(before.operationalHistory);
+
+  await writeFile(join(feature, "dirty.txt"), "dirty\n");
+  await expect(
+    run(executable, [
+      "checkpoint",
+      "validate",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--commit",
+      current,
+      "--json",
+    ]),
+  ).rejects.toMatchObject({
+    code: 4,
+    stderr: expect.stringContaining("UNTRACKED_WORKTREE"),
+  });
+  const afterDirty = await inspectRun(repository, runId);
+  expect(afterDirty.snapshot).toEqual(before.snapshot);
+  expect(afterDirty.operationalHistory).toEqual(before.operationalHistory);
+});
+
 test.each([
   [
     "missing Feature worktree",
