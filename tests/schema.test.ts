@@ -76,6 +76,34 @@ test("runtime schemas reject impossible run ID timestamps", () => {
   ).toThrow();
 });
 
+test("runtime schema validates additive Git worktree state", () => {
+  const snapshot = stateSnapshotSchema.parse({
+    schemaVersion: 1,
+    runId: "run_20260904T120000Z_012345abcdef",
+    revision: 2,
+    phase: "preparing",
+    specification: "specs/feature.md",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    git: {
+      schemaVersion: 1,
+      runBase: "0123456789012345678901234567890123456789",
+      featureBranch: "orchestrator/run_20260904T120000Z_012345abcdef",
+      featureWorktree:
+        "/tmp/project-worktrees/run_20260904T120000Z_012345abcdef",
+      worktreeStatus: "planned",
+      futureGitField: true,
+    },
+  });
+  expect(snapshot.git?.futureGitField).toBe(true);
+  expect(() =>
+    stateSnapshotSchema.parse({
+      ...snapshot,
+      git: { ...snapshot.git, worktreeStatus: "unknown" },
+    }),
+  ).toThrow();
+});
+
 test("committed JSON Schemas match their deterministic runtime sources", async () => {
   const generated = generateJsonSchemas();
 

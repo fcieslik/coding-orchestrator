@@ -1,11 +1,14 @@
 import packageMetadata from "../package.json" with { type: "json" };
 
+import { prepareWorktree } from "./git-worktree.js";
 import { createRun, FlowError, inspectRun, selectRun } from "./workflow-run.js";
 
 const arguments_ = process.argv.slice(2);
 const [argument] = arguments_;
 const structuredRequest =
-  (argument === "status" || argument === "history") &&
+  (argument === "status" ||
+    argument === "history" ||
+    (argument === "worktree" && arguments_[1] === "prepare")) &&
   arguments_.includes("--json");
 
 function parseOptions(
@@ -98,6 +101,14 @@ try {
       console.log(`Revision: ${snapshot.revision}`);
       console.log(`Created: ${snapshot.createdAt}`);
       console.log(`Updated: ${snapshot.updatedAt}`);
+      if (snapshot.git) {
+        console.log(`Run base: ${snapshot.git.runBase}`);
+        console.log(`Feature branch: ${snapshot.git.featureBranch}`);
+        console.log(`Feature worktree: ${snapshot.git.featureWorktree}`);
+        console.log(`Worktree: ${snapshot.git.worktreeStatus}`);
+        if (snapshot.git.validatedHead)
+          console.log(`Validated HEAD: ${snapshot.git.validatedHead}`);
+      }
       console.log(
         `History: ${operationalHistoryMetadata.synchronized ? "synchronized" : `interrupted audit (${audit.warning})`}`,
       );
@@ -128,6 +139,63 @@ try {
           `${event.timestamp}  ${event.sequence}  ${event.type}  revision ${event.stateRevision}`,
         );
       }
+    }
+  } else if (argument === "worktree" && arguments_[1] === "prepare") {
+    const { flags, values } = parseOptions(
+      arguments_.slice(2),
+      [
+        "--repo",
+        "--run",
+        "--base",
+        "--base-revision",
+        "--base-ref",
+        "--branch",
+        "--feature-branch",
+        "--worktree",
+        "--path",
+        "--feature-worktree",
+      ],
+      ["--json"],
+    );
+    const repository = values.get("--repo");
+    const requestedRunId = values.get("--run");
+    const selected = await selectRun(repository, requestedRunId);
+    const base =
+      values.get("--base") ??
+      values.get("--base-revision") ??
+      values.get("--base-ref");
+    const branch = values.get("--branch") ?? values.get("--feature-branch");
+    const worktree =
+      values.get("--worktree") ??
+      values.get("--path") ??
+      values.get("--feature-worktree");
+    const prepared = await prepareWorktree({
+      repository: selected.repository,
+      runId: selected.runId,
+      ...(base === undefined ? {} : { base }),
+      ...(branch === undefined ? {} : { branch }),
+      ...(worktree === undefined ? {} : { worktree }),
+    });
+    const gitState = prepared.snapshot.git;
+    if (!gitState) throw new Error("Prepared run did not contain Git state");
+    if (flags.has("--json")) {
+      console.log(
+        JSON.stringify({
+          ...prepared.snapshot,
+          ...(prepared.warnings === undefined
+            ? {}
+            : { warnings: prepared.warnings }),
+        }),
+      );
+    } else {
+      console.log(`Run: ${prepared.snapshot.runId}`);
+      console.log(`Run base: ${gitState.runBase}`);
+      console.log(`Feature branch: ${gitState.featureBranch}`);
+      console.log(`Feature worktree: ${gitState.featureWorktree}`);
+      console.log(`Phase: ${prepared.snapshot.phase}`);
+      console.log(`Worktree: ${gitState.worktreeStatus}`);
+      for (const warning of prepared.warnings ?? [])
+        console.log(`Warning: ${warning}`);
     }
   } else {
     const label = arguments_.length === 1 ? "argument" : "arguments";

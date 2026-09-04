@@ -607,6 +607,98 @@ test("flow displays explicit run history in human and structured forms", async (
   expect(JSON.parse(structured.stdout)).toEqual([persistedEvent]);
 });
 
+test("flow prepares and inspects a default Feature worktree", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260904T120000Z_012345abcdef";
+  await createExplicitRun(repository, runId);
+
+  const prepared = await run(executable, [
+    "worktree",
+    "prepare",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+    "--json",
+  ]);
+  const result = JSON.parse(prepared.stdout);
+  expect(result).toMatchObject({
+    runId,
+    phase: "implementing",
+    git: {
+      worktreeStatus: "ready",
+      featureBranch: `orchestrator/${runId}`,
+    },
+  });
+  expect(result.git.runBase).toMatch(/^[0-9a-f]{40,64}$/);
+  expect(result.git.validatedHead).toBe(result.git.runBase);
+  expect(result.git.featureWorktree).toMatch(
+    new RegExp(`${runId.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}$`),
+  );
+  expect(result.warnings).toEqual([
+    expect.stringContaining("excluded from the Run base"),
+  ]);
+  await expect(
+    run("git", ["-C", repository, "symbolic-ref", "--short", "HEAD"]),
+  ).resolves.toMatchObject({ stdout: "master\n" });
+  await expect(
+    run("git", ["-C", result.git.featureWorktree, "status", "--porcelain"]),
+  ).resolves.toMatchObject({ stdout: "" });
+
+  const status = await run(executable, [
+    "status",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+    "--json",
+  ]);
+  expect(JSON.parse(status.stdout)).toMatchObject({
+    runId,
+    phase: "implementing",
+    git: result.git,
+  });
+  const humanStatus = await run(executable, [
+    "status",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+  ]);
+  expect(humanStatus.stdout).toContain(`Run base: ${result.git.runBase}\n`);
+  expect(humanStatus.stdout).toContain(
+    `Feature branch: ${result.git.featureBranch}\n`,
+  );
+  expect(humanStatus.stdout).toContain(
+    `Feature worktree: ${result.git.featureWorktree}\n`,
+  );
+  const history = await run(executable, [
+    "history",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+    "--json",
+  ]);
+  const events = JSON.parse(history.stdout) as Array<{
+    type: string;
+    stateRevision: number;
+    data: Record<string, unknown>;
+  }>;
+  expect(events.map((event) => event.type)).toEqual([
+    "run.created",
+    "git.preparation.started",
+    "git.worktree.prepared",
+  ]);
+  expect(events.map((event) => event.stateRevision)).toEqual([1, 2, 3]);
+  expect(events[1]?.data).toMatchObject({
+    runBase: result.git.runBase,
+    featureBranch: result.git.featureBranch,
+    featureWorktree: result.git.featureWorktree,
+    worktreeStatus: "planned",
+  });
+});
+
 async function createExplicitRun(
   repository: string,
   runId: string,
@@ -621,6 +713,21 @@ async function createExplicitRun(
     "--run",
     runId,
   ]);
+}
+
+async function createCommittedTargetRepository(): Promise<string> {
+  const repository = await createTargetRepository();
+  await run("git", [
+    "-C",
+    repository,
+    "config",
+    "user.email",
+    "test@example.com",
+  ]);
+  await run("git", ["-C", repository, "config", "user.name", "Test User"]);
+  await run("git", ["-C", repository, "add", "."]);
+  await run("git", ["-C", repository, "commit", "--quiet", "-m", "initial"]);
+  return repository;
 }
 
 async function temporaryDirectory(): Promise<string> {

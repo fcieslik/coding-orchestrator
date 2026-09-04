@@ -95,6 +95,8 @@ export interface MutateRunOptions {
   runId: string;
   event: RunTransitionInput;
   data?: Record<string, unknown>;
+  historyEventType?: string;
+  updateSnapshot?: (snapshot: StateSnapshot) => Record<string, unknown>;
 }
 
 export interface RunLockOwner {
@@ -843,12 +845,18 @@ export async function mutateRun(
       current.snapshot.updatedAt,
       priorEvent.timestamp,
     );
-    const nextSnapshot = snapshotForLifecycle(
+    let nextSnapshot = snapshotForLifecycle(
       current.snapshot,
       lifecycle,
       current.snapshot.revision + 1,
       timestamp,
     );
+    if (options.updateSnapshot) {
+      nextSnapshot = stateSnapshotSchema.parse({
+        ...nextSnapshot,
+        ...options.updateSnapshot(nextSnapshot),
+      });
+    }
     const nextEvent = runEventSchema.parse({
       schemaVersion: 1,
       eventId: `event_${randomUUID()}`,
@@ -856,7 +864,7 @@ export async function mutateRun(
       sequence: priorEvent.sequence + 1,
       stateRevision: nextSnapshot.revision,
       timestamp,
-      type: runTransitionEventType(eventType),
+      type: options.historyEventType ?? runTransitionEventType(eventType),
       data: {
         ...((typeof options.event === "string"
           ? undefined

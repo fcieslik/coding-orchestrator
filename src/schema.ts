@@ -51,6 +51,19 @@ export type RunPhase = z.infer<typeof runPhaseSchema>;
 
 const utcTimestampSchema = z.iso.datetime({ precision: 3 });
 
+const objectIdSchema = z.string().regex(/^[0-9a-f]{40,64}$/);
+
+export const gitWorktreeStatusSchema = z.enum(["planned", "ready", "removed"]);
+
+export const gitStateSchema = z.looseObject({
+  schemaVersion: z.literal(1),
+  runBase: objectIdSchema,
+  featureBranch: z.string().min(1),
+  featureWorktree: z.string().min(1),
+  worktreeStatus: gitWorktreeStatusSchema,
+  validatedHead: objectIdSchema.optional(),
+});
+
 export const stateSnapshotSchema = z.looseObject({
   schemaVersion: z.literal(1),
   runId: runIdSchema,
@@ -61,6 +74,7 @@ export const stateSnapshotSchema = z.looseObject({
   fixReturnPhase: z.enum(["reviewing", "checking"]).optional(),
   createdAt: utcTimestampSchema,
   updatedAt: utcTimestampSchema,
+  git: gitStateSchema.optional(),
 });
 
 export const runEventSchema = z.looseObject({
