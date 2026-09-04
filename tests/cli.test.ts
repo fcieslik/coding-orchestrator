@@ -4,6 +4,7 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  realpath,
   rm,
   symlink,
   writeFile,
@@ -699,6 +700,252 @@ test("flow prepares and inspects a default Feature worktree", async () => {
   });
 });
 
+test("flow persists explicit base, branch, and caller-relative worktree inputs", async () => {
+  const repository = await createCommittedTargetRepository();
+  const caller = await temporaryDirectory();
+  const runId = "run_20260904T120000Z_012345abcdef";
+  await createExplicitRun(repository, runId);
+  const base = await gitOutput(repository, ["rev-parse", "HEAD"]);
+
+  const { stdout } = await run(
+    executable,
+    [
+      "worktree",
+      "prepare",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--base",
+      "HEAD",
+      "--branch",
+      "feature/custom",
+      "--worktree",
+      "relative-feature-worktree",
+      "--json",
+    ],
+    { cwd: caller },
+  );
+
+  const canonicalCaller = await realpath(caller);
+  expect(JSON.parse(stdout)).toMatchObject({
+    git: {
+      runBase: base,
+      featureBranch: "feature/custom",
+      featureWorktree: join(canonicalCaller, "relative-feature-worktree"),
+    },
+  });
+});
+
+test("flow supports SHA-256 Target repositories without truncating commits", async () => {
+  const repository = await temporaryDirectory();
+  await run("git", ["init", "--quiet", "--object-format=sha256", repository]);
+  await run("git", [
+    "-C",
+    repository,
+    "config",
+    "user.email",
+    "test@example.com",
+  ]);
+  await run("git", ["-C", repository, "config", "user.name", "Test User"]);
+  await mkdir(join(repository, "specs"));
+  await writeFile(join(repository, "specs", "feature.md"), "# Feature\n");
+  await run("git", ["-C", repository, "add", "."]);
+  await run("git", ["-C", repository, "commit", "--quiet", "-m", "initial"]);
+  const runId = "run_20260904T120000Z_012345abcdef";
+  await createExplicitRun(repository, runId);
+
+  const { stdout } = await run(executable, [
+    "worktree",
+    "prepare",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+    "--json",
+  ]);
+  const result = JSON.parse(stdout);
+  expect(result.git.runBase).toMatch(/^[0-9a-f]{64}$/);
+  expect(result.git.validatedHead).toBe(result.git.runBase);
+});
+
+test("flow refuses an unborn Target repository before preparing", async () => {
+  const repository = await createTargetRepository();
+  const runId = "run_20260904T120000Z_012345abcdef";
+  await createExplicitRun(repository, runId);
+
+  await expect(
+    run(executable, [
+      "worktree",
+      "prepare",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+    ]),
+  ).rejects.toMatchObject({
+    code: 4,
+    stdout: "",
+    stderr: expect.stringContaining("unborn"),
+  });
+});
+
+test("flow refuses a Target repository checked out as a submodule", async () => {
+  const superproject = await createCommittedTargetRepository();
+  const child = await createCommittedTargetRepository();
+  await run("git", [
+    "-C",
+    superproject,
+    "-c",
+    "protocol.file.allow=always",
+    "submodule",
+    "add",
+    "--quiet",
+    child,
+    "vendor/child",
+  ]);
+  await run("git", ["-C", superproject, "add", "."]);
+  await run("git", [
+    "-C",
+    superproject,
+    "commit",
+    "--quiet",
+    "-m",
+    "submodule",
+  ]);
+  const runId = "run_20260904T120000Z_012345abcdef";
+  await createExplicitRun(join(superproject, "vendor", "child"), runId);
+
+  await expect(
+    run(executable, [
+      "worktree",
+      "prepare",
+      "--repo",
+      join(superproject, "vendor", "child"),
+      "--run",
+      runId,
+    ]),
+  ).rejects.toMatchObject({
+    code: 4,
+    stdout: "",
+    stderr: expect.stringContaining("submodule"),
+  });
+});
+
+test("flow refuses branch and worktree collisions before persisting preparation", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260904T120000Z_012345abcdef";
+  await createExplicitRun(repository, runId);
+  await run("git", ["-C", repository, "branch", "existing"]);
+  const statePath = join(
+    repository,
+    ".orchestrator",
+    "runs",
+    runId,
+    "state.json",
+  );
+  const before = await readFile(statePath, "utf8");
+
+  await expect(
+    run(executable, [
+      "worktree",
+      "prepare",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--branch",
+      "existing",
+    ]),
+  ).rejects.toMatchObject({ code: 3, stdout: "" });
+  expect(await readFile(statePath, "utf8")).toBe(before);
+
+  const registeredPath = await temporaryDirectory();
+  await run("git", [
+    "-C",
+    repository,
+    "worktree",
+    "add",
+    "--quiet",
+    "--detach",
+    registeredPath,
+  ]);
+  const secondRunId = "run_20260904T120001Z_012345abcdee";
+  await createExplicitRun(repository, secondRunId);
+  await expect(
+    run(executable, [
+      "worktree",
+      "prepare",
+      "--repo",
+      repository,
+      "--run",
+      secondRunId,
+      "--worktree",
+      join(registeredPath, "nested"),
+    ]),
+  ).rejects.toMatchObject({ code: 4, stdout: "" });
+});
+
+test("flow refuses symlinked Feature worktree path components", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260904T120000Z_012345abcdef";
+  await createExplicitRun(repository, runId);
+  const caller = await temporaryDirectory();
+  const redirected = await temporaryDirectory();
+  await symlink(redirected, join(caller, "redirected"));
+
+  await expect(
+    run(
+      executable,
+      [
+        "worktree",
+        "prepare",
+        "--repo",
+        repository,
+        "--run",
+        runId,
+        "--worktree",
+        "redirected/feature",
+      ],
+      { cwd: caller },
+    ),
+  ).rejects.toMatchObject({
+    code: 4,
+    stdout: "",
+    stderr: expect.stringContaining("symbolic link"),
+  });
+});
+
+test("flow prepares a run whose Target repository is a linked worktree", async () => {
+  const mainRepository = await createCommittedTargetRepository();
+  const linkedRepository = join(await temporaryDirectory(), "linked-target");
+  await run("git", [
+    "-C",
+    mainRepository,
+    "worktree",
+    "add",
+    "--quiet",
+    linkedRepository,
+  ]);
+  const runId = "run_20260904T120000Z_012345abcdef";
+  await createExplicitRun(linkedRepository, runId);
+
+  const { stdout } = await run(executable, [
+    "worktree",
+    "prepare",
+    "--repo",
+    linkedRepository,
+    "--run",
+    runId,
+    "--json",
+  ]);
+  expect(JSON.parse(stdout)).toMatchObject({
+    runId,
+    phase: "implementing",
+    git: { worktreeStatus: "ready" },
+  });
+});
+
 async function createExplicitRun(
   repository: string,
   runId: string,
@@ -740,4 +987,9 @@ async function createBareRepository(): Promise<string> {
   const repository = await temporaryDirectory();
   await run("git", ["init", "--quiet", "--bare", repository]);
   return repository;
+}
+
+async function gitOutput(repository: string, args: string[]): Promise<string> {
+  const { stdout } = await run("git", ["-C", repository, ...args]);
+  return stdout.trim();
 }
