@@ -9,13 +9,20 @@
   "packageManager": "pnpm@11.25.0",
   "scripts": {
     "build": "tsup src/cli.ts --format esm --clean",
+    "format": "prettier --write package.json pnpm-workspace.yaml tsconfig.json eslint.config.js src tests",
+    "format:check": "prettier --check package.json pnpm-workspace.yaml tsconfig.json eslint.config.js src tests",
+    "lint": "eslint .",
     "test": "pnpm build && vitest run",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^24.13.3",
+    "eslint": "^10.9.1",
+    "prettier": "^3.9.6",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
+    "typescript-eslint": "^8.69.0",
     "vitest": "4.0.17"
   }
 }
