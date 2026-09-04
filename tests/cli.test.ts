@@ -5,6 +5,7 @@ import {
   readdir,
   readFile,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -122,6 +123,69 @@ test("flow creates an explicit Workflow run", async () => {
     data: { specification: "specs/feature.md" },
   });
   expect(history[0].eventId).toEqual(expect.any(String));
+});
+
+test("flow bootstraps ignored runtime state without replacing existing ignore rules", async () => {
+  const repository = await createTargetRepository();
+  const existingIgnore = "dist/\n# keep this rule\n";
+  await writeFile(join(repository, ".gitignore"), existingIgnore);
+
+  await createExplicitRun(repository, "run_20260904T120000Z_012345abcdef");
+
+  expect(await readFile(join(repository, ".gitignore"), "utf8")).toBe(
+    `${existingIgnore}.orchestrator/runs/\n`,
+  );
+  await expect(
+    run("git", [
+      "-C",
+      repository,
+      "check-ignore",
+      "--quiet",
+      "--no-index",
+      "--",
+      ".orchestrator/runs/probe",
+    ]),
+  ).resolves.toBeDefined();
+});
+
+test("flow rejects a specification symlink that escapes the Target repository", async () => {
+  const repository = await createTargetRepository();
+  const externalDirectory = await temporaryDirectory();
+  const externalSpecification = join(externalDirectory, "external.md");
+  await writeFile(externalSpecification, "# External\n");
+  await symlink(externalSpecification, join(repository, "specs", "linked.md"));
+
+  await expect(
+    run(executable, [
+      "run",
+      "create",
+      "--repo",
+      repository,
+      "--spec",
+      "specs/linked.md",
+      "--run",
+      "run_20260904T120000Z_012345abcdef",
+    ]),
+  ).rejects.toMatchObject({ code: 3, stdout: "" });
+});
+
+test("flow rejects a redirected runtime directory before reading or writing", async () => {
+  const repository = await createTargetRepository();
+  const redirected = await temporaryDirectory();
+  await symlink(redirected, join(repository, ".orchestrator"));
+
+  await expect(
+    run(executable, [
+      "run",
+      "create",
+      "--repo",
+      repository,
+      "--spec",
+      "specs/feature.md",
+      "--run",
+      "run_20260904T120000Z_012345abcdef",
+    ]),
+  ).rejects.toMatchObject({ code: 4, stdout: "" });
 });
 
 test.each([
@@ -432,6 +496,78 @@ test("flow displays explicit run status in human and structured forms", async ()
       synchronized: true,
     },
   });
+});
+
+test("flow reports a one-revision interrupted audit without modifying persisted bytes", async () => {
+  const repository = await createTargetRepository();
+  const runId = "run_20260904T120000Z_012345abcdef";
+  await createExplicitRun(repository, runId);
+  const statePath = join(
+    repository,
+    ".orchestrator",
+    "runs",
+    runId,
+    "state.json",
+  );
+  const historyPath = join(
+    repository,
+    ".orchestrator",
+    "runs",
+    runId,
+    "history.jsonl",
+  );
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  state.revision = 2;
+  const stateBytes = `${JSON.stringify(state, null, 2)}\n`;
+  const historyBytes = await readFile(historyPath, "utf8");
+  await writeFile(statePath, stateBytes);
+
+  const human = await run(executable, [
+    "status",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+  ]);
+  expect(human.stdout).toContain("interrupted audit");
+  const structured = await run(executable, [
+    "status",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+    "--json",
+  ]);
+  expect(JSON.parse(structured.stdout).history).toMatchObject({
+    synchronized: false,
+    warning: expect.stringContaining("one revision behind"),
+  });
+  expect(await readFile(statePath, "utf8")).toBe(stateBytes);
+  expect(await readFile(historyPath, "utf8")).toBe(historyBytes);
+});
+
+test("flow rejects malformed history with corruption status and preserves bytes", async () => {
+  const repository = await createTargetRepository();
+  const runId = "run_20260904T120000Z_012345abcdef";
+  await createExplicitRun(repository, runId);
+  const historyPath = join(
+    repository,
+    ".orchestrator",
+    "runs",
+    runId,
+    "history.jsonl",
+  );
+  const original = await readFile(historyPath, "utf8");
+  await writeFile(historyPath, `${original}\n`);
+
+  await expect(
+    run(executable, ["status", "--repo", repository, "--run", runId, "--json"]),
+  ).rejects.toMatchObject({
+    code: 4,
+    stdout: "",
+    stderr: expect.stringMatching(/CORRUPT_RUN/),
+  });
+  expect(await readFile(historyPath, "utf8")).toBe(`${original}\n`);
 });
 
 test("flow displays explicit run history in human and structured forms", async () => {

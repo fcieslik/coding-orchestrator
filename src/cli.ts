@@ -75,7 +75,7 @@ try {
     const repository = values.get("--repo");
     const runId = values.get("--run");
     const selected = await selectRun(repository, runId);
-    const { operationalHistory, snapshot } = await inspectRun(
+    const { operationalHistory, snapshot, audit } = await inspectRun(
       selected.repository,
       selected.runId,
     );
@@ -83,7 +83,9 @@ try {
     const operationalHistoryMetadata = {
       lastSequence: lastEvent?.sequence ?? 0,
       lastStateRevision: lastEvent?.stateRevision ?? 0,
-      synchronized: lastEvent?.stateRevision === snapshot.revision,
+      synchronized: audit.synchronized,
+      ...(audit.warning === undefined ? {} : { warning: audit.warning }),
+      ...(selected.diagnostics ?? {}),
     };
     if (flags.has("--json")) {
       console.log(
@@ -97,8 +99,13 @@ try {
       console.log(`Created: ${snapshot.createdAt}`);
       console.log(`Updated: ${snapshot.updatedAt}`);
       console.log(
-        `History: ${operationalHistoryMetadata.synchronized ? "synchronized" : "out of sync"}`,
+        `History: ${operationalHistoryMetadata.synchronized ? "synchronized" : `interrupted audit (${audit.warning})`}`,
       );
+      if (selected.diagnostics?.stagingDirectories.length) {
+        console.log(
+          `Diagnostics: interrupted creation staging directories remain (${selected.diagnostics.stagingDirectories.join(", ")})`,
+        );
+      }
     }
   } else if (argument === "history") {
     const { flags, values } = parseOptions(
