@@ -47,6 +47,8 @@ export const runPhaseSchema = z.enum([
   "completed",
 ]);
 
+export type RunPhase = z.infer<typeof runPhaseSchema>;
+
 const utcTimestampSchema = z.iso.datetime({ precision: 3 });
 
 export const stateSnapshotSchema = z.looseObject({
@@ -55,6 +57,8 @@ export const stateSnapshotSchema = z.looseObject({
   revision: z.int().positive(),
   phase: runPhaseSchema,
   specification: z.string().min(1),
+  interruptedPhase: runPhaseSchema.optional(),
+  fixReturnPhase: z.enum(["reviewing", "checking"]).optional(),
   createdAt: utcTimestampSchema,
   updatedAt: utcTimestampSchema,
 });

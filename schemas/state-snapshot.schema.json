@@ -51,6 +51,28 @@
       "type": "string",
       "minLength": 1
     },
+    "interruptedPhase": {
+      "type": "string",
+      "enum": [
+        "created",
+        "preparing",
+        "implementing",
+        "reviewing",
+        "checking",
+        "fixing",
+        "blocked",
+        "failed",
+        "cancelled",
+        "completed"
+      ]
+    },
+    "fixReturnPhase": {
+      "type": "string",
+      "enum": [
+        "reviewing",
+        "checking"
+      ]
+    },
     "createdAt": {
       "type": "string",
       "format": "date-time",

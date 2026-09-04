@@ -10,8 +10,10 @@ import {
   rename,
   rm,
   stat,
+  unlink,
   writeFile,
 } from "node:fs/promises";
+import { hostname as getHostname } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
@@ -22,6 +24,29 @@ import {
   type StateSnapshot,
   stateSnapshotSchema,
 } from "./schema.js";
+import {
+  normalizeRunTransition,
+  runTransitionEventType,
+  transition,
+  type RunLifecycleState,
+  type RunTransitionInput,
+} from "./lifecycle.js";
+
+export {
+  InvalidRunTransitionError,
+  InvalidTransitionError,
+  normalizeRunTransition,
+  runTransitionEventType,
+  transition,
+} from "./lifecycle.js";
+export type {
+  FixReturnPhase,
+  RunLifecycleState,
+  RunTransitionEvent,
+  RunTransitionAlias,
+  RunTransitionInput,
+  RunTransitionType,
+} from "./lifecycle.js";
 
 const run = promisify(execFile);
 const runtimeDirectoryName = ".orchestrator";
@@ -58,6 +83,30 @@ export interface CreateRunOptions {
 export interface RunDependencies {
   clock?: () => Date;
   randomBytes?: (size: number) => Buffer;
+  hostname?: () => string;
+  beforeSnapshotPublication?: () => void | Promise<void>;
+  afterSnapshotPublication?: () => void | Promise<void>;
+  beforeHistoryPublication?: () => void | Promise<void>;
+  afterHistoryPublication?: () => void | Promise<void>;
+}
+
+export interface MutateRunOptions {
+  repository?: string;
+  runId: string;
+  event: RunTransitionInput;
+  data?: Record<string, unknown>;
+}
+
+export interface RunLockOwner {
+  pid: number;
+  hostname: string;
+  acquiredAt: string;
+}
+
+export interface RunLock {
+  path: string;
+  ownerToken: string;
+  owner: RunLockOwner;
 }
 
 export interface RunAudit {
@@ -351,6 +400,148 @@ function corruption(runId: string, reason: string): FlowError {
   );
 }
 
+function notFound(runId: string): FlowError {
+  return new FlowError(
+    `Workflow run was not found: ${runId}`,
+    3,
+    "RUN_NOT_FOUND",
+  );
+}
+
+function parseLockOwner(value: unknown): RunLockOwner | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.pid !== "number" ||
+    !Number.isInteger(record.pid) ||
+    typeof record.hostname !== "string" ||
+    typeof record.acquiredAt !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    pid: record.pid,
+    hostname: record.hostname,
+    acquiredAt: record.acquiredAt,
+  };
+}
+
+async function readLockOwner(path: string): Promise<RunLockOwner | undefined> {
+  try {
+    const contents = await readFile(path, "utf8");
+    return parseLockOwner(JSON.parse(contents));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Acquire the run lock without waiting or breaking an existing owner. */
+export async function acquireRunLock(
+  repository: string,
+  runId: string,
+  dependencies: RunDependencies = {},
+): Promise<RunLock> {
+  const targetRepository = await realpath(repository).catch(
+    (error: unknown) => {
+      if (isNodeError(error, "ENOENT")) throw notFound(runId);
+      throw error;
+    },
+  );
+  const runDirectory = join(
+    targetRepository,
+    runtimeDirectoryName,
+    runsDirectoryName,
+    runId,
+  );
+  const lockPath = join(runDirectory, "lock");
+  try {
+    await assertNoSymlink(join(targetRepository, runtimeDirectoryName));
+    await assertNoSymlink(
+      join(targetRepository, runtimeDirectoryName, runsDirectoryName),
+    );
+    await assertNoSymlink(runDirectory);
+    const directory = await lstat(runDirectory);
+    if (!directory.isDirectory())
+      throw new Error("run path is not a directory");
+    await assertNoSymlink(lockPath);
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) throw notFound(runId);
+    if (error instanceof FlowError) throw error;
+    throw corruption(
+      runId,
+      "runtime paths are missing, redirected, or invalid",
+    );
+  }
+
+  const owner: RunLockOwner = {
+    pid: process.pid,
+    hostname: (dependencies.hostname ?? getHostname)(),
+    acquiredAt: (dependencies.clock ?? (() => new Date()))().toISOString(),
+  };
+  const ownerToken = (dependencies.randomBytes ?? randomBytes)(16).toString(
+    "hex",
+  );
+  const contents = JSON.stringify({ ...owner, ownerToken }) + "\n";
+  let handle;
+  try {
+    handle = await open(lockPath, "wx", 0o600);
+    await handle.writeFile(contents, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    return { path: lockPath, ownerToken, owner };
+  } catch (error) {
+    if (handle) await handle.close().catch(() => undefined);
+    if (isNodeError(error, "EEXIST")) {
+      const existingOwner = await readLockOwner(lockPath);
+      throw new FlowError(
+        `Workflow run is locked: ${runId}`,
+        5,
+        "LOCK_CONTENTION",
+        {
+          runId,
+          owner: existingOwner,
+        },
+      );
+    }
+    throw error;
+  }
+}
+
+/** Release a lock only when the persisted owner token still belongs to the caller. */
+export async function releaseRunLock(lock: RunLock): Promise<void> {
+  const persisted = await readFile(lock.path, "utf8").catch(
+    (error: unknown) => {
+      if (isNodeError(error, "ENOENT"))
+        throw new FlowError(
+          `Run lock disappeared before release: ${lock.path}`,
+          4,
+          "LOCK_RELEASE_FAILED",
+        );
+      throw error;
+    },
+  );
+  let parsed: Record<string, unknown>;
+  try {
+    const value: unknown = JSON.parse(persisted);
+    if (!value || typeof value !== "object") throw new Error("invalid lock");
+    parsed = value as Record<string, unknown>;
+  } catch {
+    throw new FlowError(
+      `Run lock is not valid and cannot be released: ${lock.path}`,
+      4,
+      "LOCK_RELEASE_FAILED",
+    );
+  }
+  if (parsed.ownerToken !== lock.ownerToken)
+    throw new FlowError(
+      `Run lock owner mismatch; refusing to release ${lock.path}`,
+      4,
+      "LOCK_RELEASE_FAILED",
+    );
+  await unlink(lock.path);
+}
+
 export function validateHistory(
   snapshot: StateSnapshot,
   history: RunEvent[],
@@ -571,6 +762,142 @@ export async function inspectRun(
     throw new FlowError(`Invalid run ID: ${runId}`, 2, "INVALID_RUN_ID");
   const repository = await resolveRepository(repositoryPath);
   return readRunAt(repository, runId);
+}
+
+function maxPersistedTimestamp(...timestamps: string[]): string {
+  return timestamps.reduce(
+    (latest, timestamp) => (timestamp > latest ? timestamp : latest),
+    timestamps[0] ?? new Date(0).toISOString(),
+  );
+}
+
+function withLifecycleState(snapshot: StateSnapshot): RunLifecycleState {
+  return {
+    phase: snapshot.phase,
+    ...(snapshot.interruptedPhase === undefined
+      ? {}
+      : { interruptedPhase: snapshot.interruptedPhase }),
+    ...(snapshot.fixReturnPhase === undefined
+      ? {}
+      : { fixReturnPhase: snapshot.fixReturnPhase }),
+  };
+}
+
+function snapshotForLifecycle(
+  snapshot: StateSnapshot,
+  lifecycle: RunLifecycleState,
+  revision: number,
+  updatedAt: string,
+): StateSnapshot {
+  const next: Record<string, unknown> = {
+    ...snapshot,
+    phase: lifecycle.phase,
+    revision,
+    updatedAt,
+  };
+  if (lifecycle.interruptedPhase === undefined) delete next.interruptedPhase;
+  else next.interruptedPhase = lifecycle.interruptedPhase;
+  if (lifecycle.fixReturnPhase === undefined) delete next.fixReturnPhase;
+  else next.fixReturnPhase = lifecycle.fixReturnPhase;
+  return stateSnapshotSchema.parse(next);
+}
+
+/**
+ * Apply one internal lifecycle event under the run lock. The snapshot is
+ * deliberately published before history, so an interrupted audit is visible
+ * and blocks a later mutation until recovery reconciles it.
+ */
+export async function mutateRun(
+  options: MutateRunOptions,
+  dependencies: RunDependencies = {},
+): Promise<ReadRunResult> {
+  if (!runIdSchema.safeParse(options.runId).success)
+    throw new FlowError(
+      `Invalid run ID: ${options.runId}`,
+      2,
+      "INVALID_RUN_ID",
+    );
+  const repository = await resolveRepository(options.repository);
+  const lock = await acquireRunLock(repository, options.runId, dependencies);
+  try {
+    const current = await readRunAt(repository, options.runId);
+    if (!current.audit.synchronized) {
+      throw new FlowError(
+        `Workflow run ${options.runId} has an unresolved history audit gap`,
+        4,
+        "AUDIT_GAP",
+        { runId: options.runId, warning: current.audit.warning },
+      );
+    }
+
+    const lifecycle = transition(
+      withLifecycleState(current.snapshot),
+      options.event,
+    );
+    const eventType = normalizeRunTransition(options.event);
+    const priorEvent = current.operationalHistory.at(-1);
+    if (!priorEvent)
+      throw corruption(options.runId, "history is empty during mutation");
+    const timestamp = maxPersistedTimestamp(
+      (dependencies.clock ?? (() => new Date()))().toISOString(),
+      current.snapshot.updatedAt,
+      priorEvent.timestamp,
+    );
+    const nextSnapshot = snapshotForLifecycle(
+      current.snapshot,
+      lifecycle,
+      current.snapshot.revision + 1,
+      timestamp,
+    );
+    const nextEvent = runEventSchema.parse({
+      schemaVersion: 1,
+      eventId: `event_${randomUUID()}`,
+      runId: options.runId,
+      sequence: priorEvent.sequence + 1,
+      stateRevision: nextSnapshot.revision,
+      timestamp,
+      type: runTransitionEventType(eventType),
+      data: {
+        ...((typeof options.event === "string"
+          ? undefined
+          : options.event.data) ??
+          options.data ??
+          {}),
+        ...(options.data ?? {}),
+        transition: eventType,
+      },
+    });
+    const statePath = join(
+      repository,
+      runtimeDirectoryName,
+      runsDirectoryName,
+      options.runId,
+      "state.json",
+    );
+    const historyPath = join(
+      repository,
+      runtimeDirectoryName,
+      runsDirectoryName,
+      options.runId,
+      "history.jsonl",
+    );
+    await dependencies.beforeSnapshotPublication?.();
+    await writeSynchronizedFile(
+      statePath,
+      `${JSON.stringify(nextSnapshot, null, 2)}\n`,
+    );
+    await dependencies.afterSnapshotPublication?.();
+    await dependencies.beforeHistoryPublication?.();
+    const historyContents = await readFile(historyPath, "utf8");
+    await writeSynchronizedFile(
+      historyPath,
+      `${historyContents.endsWith("\n") ? historyContents : `${historyContents}\n`}${JSON.stringify(nextEvent)}\n`,
+    );
+    await dependencies.afterHistoryPublication?.();
+    return readRunAt(repository, options.runId);
+  } finally {
+    await releaseRunLock(lock);
+  }
 }
 
 interface RunListing {
