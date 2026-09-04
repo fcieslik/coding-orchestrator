@@ -17,7 +17,12 @@ import { promisify } from "node:util";
 import { afterEach, expect, test } from "vitest";
 
 import { prepareWorktree } from "../src/git-worktree.js";
-import { FlowError, inspectRun } from "../src/workflow-run.js";
+import {
+  acquireRunLock,
+  FlowError,
+  inspectRun,
+  releaseRunLock,
+} from "../src/workflow-run.js";
 
 const run = promisify(execFile);
 const executable = fileURLToPath(new URL("../scripts/flow", import.meta.url));
@@ -758,6 +763,310 @@ test("flow retries an interrupted preparation from persisted intent", async () =
     "git.preparation.started",
     "git.worktree.prepared",
   ]);
+});
+
+test("flow validates a healthy Feature worktree baseline in human and JSON output", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260904T120000Z_121212121212";
+  await createExplicitRun(repository, runId);
+  const prepared = JSON.parse(
+    (
+      await run(executable, [
+        "worktree",
+        "prepare",
+        "--repo",
+        repository,
+        "--run",
+        runId,
+        "--json",
+      ])
+    ).stdout,
+  ) as { git: { featureWorktree: string } };
+
+  const structured = await run(executable, [
+    "worktree",
+    "validate",
+    "--repo",
+    repository,
+    "--json",
+  ]);
+  const report = JSON.parse(structured.stdout);
+  expect(report).toMatchObject({
+    runId,
+    valid: true,
+    git: { worktreeStatus: "ready" },
+    checks: {
+      repository: { valid: true },
+      registration: { valid: true },
+      path: { valid: true },
+      branch: { valid: true },
+      head: { valid: true },
+      cleanliness: { valid: true },
+    },
+  });
+  expect(report.git.featureWorktree).toBe(prepared.git.featureWorktree);
+
+  const human = await run(executable, [
+    "worktree",
+    "validate",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+  ]);
+  expect(human.stdout).toContain("repository: valid");
+  expect(human.stdout).toContain("registration: valid");
+  expect(human.stdout).toContain("cleanliness: valid");
+  expect(human.stdout).toContain("Result: valid");
+});
+
+test.each([
+  [
+    "missing Feature worktree",
+    "FEATURE_WORKTREE_NOT_FOUND",
+    async (path: string) => {
+      await run("git", ["-C", path, "worktree", "remove", path]);
+    },
+  ],
+  [
+    "missing registration",
+    "WORKTREE_REGISTRATION_NOT_FOUND",
+    async (path: string) => {
+      await run("git", ["-C", path, "worktree", "remove", path]);
+    },
+  ],
+  [
+    "detached HEAD",
+    "WORKTREE_INVARIANT_VIOLATION",
+    async (path: string) => {
+      await run("git", ["-C", path, "checkout", "--detach", "--quiet"]);
+    },
+  ],
+  [
+    "advanced HEAD",
+    "WORKTREE_INVARIANT_VIOLATION",
+    async (path: string) => {
+      await writeFile(join(path, "advanced.txt"), "advanced\n");
+      await run("git", ["-C", path, "add", "advanced.txt"]);
+      await run("git", ["-C", path, "commit", "--quiet", "-m", "advanced"]);
+    },
+  ],
+  [
+    "missing Feature branch",
+    "FEATURE_BRANCH_NOT_FOUND",
+    async (path: string, branch: string) => {
+      await run("git", ["-C", path, "checkout", "--detach", "--quiet"]);
+      await run("git", ["-C", path, "branch", "-D", branch]);
+    },
+  ],
+  [
+    "wrong Feature branch",
+    "WORKTREE_INVARIANT_VIOLATION",
+    async (path: string) => {
+      await run("git", [
+        "-C",
+        path,
+        "checkout",
+        "-b",
+        "other-feature",
+        "--quiet",
+      ]);
+    },
+  ],
+  [
+    "tracked changes",
+    "DIRTY_WORKTREE",
+    async (path: string) => {
+      await writeFile(join(path, "specs", "feature.md"), "changed\n");
+    },
+  ],
+  [
+    "non-ignored untracked files",
+    "UNTRACKED_WORKTREE",
+    async (path: string) => {
+      await writeFile(join(path, "untracked.txt"), "untracked\n");
+    },
+  ],
+] as const)(
+  "flow rejects %s without repairing persisted state",
+  async (_label, code, mutate) => {
+    const repository = await createCommittedTargetRepository();
+    const runId = "run_20260904T120000Z_131313131313";
+    await createExplicitRun(repository, runId);
+    const prepared = JSON.parse(
+      (
+        await run(executable, [
+          "worktree",
+          "prepare",
+          "--repo",
+          repository,
+          "--run",
+          runId,
+          "--json",
+        ])
+      ).stdout,
+    ) as { git: { featureWorktree: string; featureBranch: string } };
+    const statePath = join(
+      repository,
+      ".orchestrator",
+      "runs",
+      runId,
+      "state.json",
+    );
+    const historyPath = join(
+      repository,
+      ".orchestrator",
+      "runs",
+      runId,
+      "history.jsonl",
+    );
+    const beforeState = await readFile(statePath, "utf8");
+    const beforeHistory = await readFile(historyPath, "utf8");
+    await mutate(prepared.git.featureWorktree, prepared.git.featureBranch);
+    if (_label === "missing registration")
+      await mkdir(prepared.git.featureWorktree, { recursive: true });
+
+    await expect(
+      run(executable, [
+        "worktree",
+        "validate",
+        "--repo",
+        repository,
+        "--run",
+        runId,
+        "--json",
+      ]),
+    ).rejects.toMatchObject({
+      code:
+        _label === "missing Feature worktree" ||
+        _label === "missing registration" ||
+        _label === "missing Feature branch"
+          ? 3
+          : 4,
+      stdout: "",
+      stderr: expect.stringContaining(code),
+    });
+    expect(await readFile(statePath, "utf8")).toBe(beforeState);
+    expect(await readFile(historyPath, "utf8")).toBe(beforeHistory);
+  },
+);
+
+test("flow permits ignored files during baseline validation", async () => {
+  const repository = await createCommittedTargetRepository();
+  await writeFile(join(repository, ".gitignore"), "ignored.txt\n");
+  await run("git", ["-C", repository, "add", ".gitignore"]);
+  await run("git", ["-C", repository, "commit", "--quiet", "-m", "ignore"]);
+  const runId = "run_20260904T120000Z_141414141414";
+  await createExplicitRun(repository, runId);
+  const prepared = JSON.parse(
+    (
+      await run(executable, [
+        "worktree",
+        "prepare",
+        "--repo",
+        repository,
+        "--run",
+        runId,
+        "--json",
+      ])
+    ).stdout,
+  ) as { git: { featureWorktree: string } };
+  await writeFile(
+    join(prepared.git.featureWorktree, "ignored.txt"),
+    "ignored\n",
+  );
+
+  const { stdout } = await run(executable, [
+    "worktree",
+    "validate",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+    "--json",
+  ]);
+  expect(JSON.parse(stdout)).toMatchObject({
+    valid: true,
+    checks: { cleanliness: { valid: true } },
+  });
+});
+
+test("flow reports a Feature worktree from a different Git repository", async () => {
+  const repository = await createCommittedTargetRepository();
+  const otherRepository = await createCommittedTargetRepository();
+  const runId = "run_20260904T120000Z_151515151515";
+  await createExplicitRun(repository, runId);
+  const prepared = JSON.parse(
+    (
+      await run(executable, [
+        "worktree",
+        "prepare",
+        "--repo",
+        repository,
+        "--run",
+        runId,
+        "--json",
+      ])
+    ).stdout,
+  ) as { git: { featureWorktree: string } };
+  await writeFile(
+    join(prepared.git.featureWorktree, ".git"),
+    `gitdir: ${join(otherRepository, ".git")}\n`,
+  );
+
+  await expect(
+    run(executable, [
+      "worktree",
+      "validate",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--json",
+    ]),
+  ).rejects.toMatchObject({
+    code: 4,
+    stdout: "",
+    stderr: expect.stringContaining("GIT_INVARIANT_VIOLATION"),
+  });
+});
+
+test("flow validates without acquiring the run mutation lock", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260904T120000Z_161616161616";
+  await createExplicitRun(repository, runId);
+  const prepared = JSON.parse(
+    (
+      await run(executable, [
+        "worktree",
+        "prepare",
+        "--repo",
+        repository,
+        "--run",
+        runId,
+        "--json",
+      ])
+    ).stdout,
+  );
+  const lock = await acquireRunLock(repository, runId);
+  try {
+    const { stdout } = await run(executable, [
+      "worktree",
+      "validate",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--json",
+    ]);
+    expect(JSON.parse(stdout)).toMatchObject({
+      runId,
+      valid: true,
+      git: prepared.git,
+    });
+  } finally {
+    await releaseRunLock(lock);
+  }
 });
 
 test("failed Git execution preserves the synchronized preparation intent", async () => {

@@ -1,6 +1,6 @@
 import packageMetadata from "../package.json" with { type: "json" };
 
-import { prepareWorktree } from "./git-worktree.js";
+import { prepareWorktree, validateWorktree } from "./git-worktree.js";
 import { createRun, FlowError, inspectRun, selectRun } from "./workflow-run.js";
 
 const arguments_ = process.argv.slice(2);
@@ -8,7 +8,8 @@ const [argument] = arguments_;
 const structuredRequest =
   (argument === "status" ||
     argument === "history" ||
-    (argument === "worktree" && arguments_[1] === "prepare")) &&
+    (argument === "worktree" &&
+      (arguments_[1] === "prepare" || arguments_[1] === "validate"))) &&
   arguments_.includes("--json");
 
 function parseOptions(
@@ -196,6 +197,25 @@ try {
       console.log(`Worktree: ${gitState.worktreeStatus}`);
       for (const warning of prepared.warnings ?? [])
         console.log(`Warning: ${warning}`);
+    }
+  } else if (argument === "worktree" && arguments_[1] === "validate") {
+    const { flags, values } = parseOptions(
+      arguments_.slice(2),
+      ["--repo", "--run"],
+      ["--json"],
+    );
+    const selected = await selectRun(values.get("--repo"), values.get("--run"));
+    const report = await validateWorktree(selected);
+    if (flags.has("--json")) console.log(JSON.stringify(report));
+    else {
+      console.log(`Run: ${report.runId}`);
+      console.log(`Repository: ${report.repository}`);
+      console.log(`Run base: ${report.git.runBase}`);
+      console.log(`Feature branch: ${report.git.featureBranch}`);
+      console.log(`Feature worktree: ${report.git.featureWorktree}`);
+      for (const [name, check] of Object.entries(report.checks))
+        console.log(`${name}: ${check.valid ? "valid" : "invalid"}`);
+      console.log(`Result: ${report.valid ? "valid" : "invalid"}`);
     }
   } else {
     const label = arguments_.length === 1 ? "argument" : "arguments";

@@ -51,6 +51,33 @@ export interface PreparedWorktree {
   warnings?: string[];
 }
 
+export interface ValidateWorktreeOptions {
+  repository?: string;
+  runId: string;
+}
+
+export interface WorktreeValidationCheck {
+  valid: boolean;
+  expected?: unknown;
+  actual?: unknown;
+  reason?: string;
+}
+
+export interface WorktreeValidationReport {
+  repository: string;
+  runId: string;
+  git: NonNullable<StateSnapshot["git"]>;
+  valid: boolean;
+  checks: {
+    repository: WorktreeValidationCheck;
+    registration: WorktreeValidationCheck;
+    path: WorktreeValidationCheck;
+    branch: WorktreeValidationCheck;
+    head: WorktreeValidationCheck;
+    cleanliness: WorktreeValidationCheck;
+  };
+}
+
 interface TargetRepository {
   path: string;
   commonDirectory: string;
@@ -415,6 +442,349 @@ async function validatePreparedWorktree(
       { expectedPath: gitState.featureWorktree },
     );
   }
+}
+
+function validationFailure(
+  report: WorktreeValidationReport,
+  message: string,
+  code: string,
+  exitCode = 4,
+): FlowError {
+  const failedChecks = Object.entries(report.checks)
+    .filter(([, check]) => !check.valid)
+    .map(([name]) => name);
+  return new FlowError(
+    `${message}: ${failedChecks.join(", ")}`,
+    exitCode,
+    code,
+    { ...report, failedChecks },
+  );
+}
+
+function checkFailure(
+  reason: string,
+  expected?: unknown,
+  actual?: unknown,
+): WorktreeValidationCheck {
+  return {
+    valid: false,
+    reason,
+    ...(expected === undefined ? {} : { expected }),
+    ...(actual === undefined ? {} : { actual }),
+  };
+}
+
+function checkSuccess(
+  expected?: unknown,
+  actual?: unknown,
+): WorktreeValidationCheck {
+  return {
+    valid: true,
+    ...(expected === undefined ? {} : { expected }),
+    ...(actual === undefined ? {} : { actual }),
+  };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error
+    ? error.message
+    : "Git state could not be inspected";
+}
+
+/** Prove the persisted Feature worktree baseline without locks or mutations. */
+export async function validateWorktree(
+  options: ValidateWorktreeOptions,
+): Promise<WorktreeValidationReport> {
+  const target = await resolveTargetRepository(options.repository);
+  const current = await inspectRun(target.path, options.runId);
+  if (!current.audit.synchronized)
+    throw new FlowError(
+      `Workflow run ${options.runId} has an unresolved history audit gap`,
+      4,
+      "AUDIT_GAP",
+      { runId: options.runId, warning: current.audit.warning },
+    );
+  const persisted = gitStateSchema.safeParse(current.snapshot.git);
+  if (!persisted.success || persisted.data.worktreeStatus !== "ready")
+    throw new FlowError(
+      `Workflow run ${options.runId} does not have a ready Feature worktree`,
+      4,
+      "WORKTREE_NOT_READY",
+      { runId: options.runId },
+    );
+  if (!persisted.data.validatedHead)
+    throw new FlowError(
+      `Workflow run ${options.runId} has no validated Feature worktree HEAD`,
+      4,
+      "WORKTREE_NOT_READY",
+      { runId: options.runId },
+    );
+
+  const gitState = persisted.data;
+  const expectedPath = resolve(gitState.featureWorktree);
+  const checks = {
+    repository: checkSuccess(target.commonDirectory),
+    registration: checkFailure("not checked"),
+    path: checkFailure("not checked"),
+    branch: checkFailure("not checked"),
+    head: checkFailure("not checked"),
+    cleanliness: checkFailure("not checked"),
+  };
+  let pathExists = false;
+  let pathFailure: FlowError | undefined;
+
+  try {
+    await assertNoSymlinkComponents(expectedPath);
+    const entry = await lstat(expectedPath);
+    if (!entry.isDirectory()) {
+      checks.path = checkFailure(
+        "Feature worktree path is not a directory",
+        expectedPath,
+      );
+      pathFailure = new FlowError(
+        `Feature worktree path is not a directory: ${expectedPath}`,
+        4,
+        "WORKTREE_PATH_INVALID",
+      );
+    } else {
+      pathExists = true;
+      const canonicalPath = await realpath(expectedPath);
+      checks.path =
+        canonicalPath === expectedPath
+          ? checkSuccess(expectedPath, canonicalPath)
+          : checkFailure(
+              "Feature worktree path is not canonical",
+              expectedPath,
+              canonicalPath,
+            );
+    }
+  } catch (error) {
+    pathFailure =
+      error instanceof FlowError
+        ? error
+        : (error as NodeJS.ErrnoException).code === "ENOENT"
+          ? new FlowError(
+              `Feature worktree was not found: ${expectedPath}`,
+              3,
+              "FEATURE_WORKTREE_NOT_FOUND",
+            )
+          : undefined;
+    checks.path = checkFailure(
+      pathFailure?.code === "FEATURE_WORKTREE_NOT_FOUND"
+        ? "Feature worktree is missing"
+        : errorMessage(error),
+      expectedPath,
+    );
+  }
+
+  try {
+    const registrations = await listWorktrees(target.path);
+    const registration = registrations.find(
+      (entry) => entry.path === expectedPath,
+    );
+    checks.registration = registration
+      ? checkSuccess(expectedPath, {
+          path: registration.path,
+          ...(registration.branch === undefined
+            ? {}
+            : { branch: registration.branch }),
+        })
+      : checkFailure(
+          "Feature worktree is not registered at the persisted path",
+          expectedPath,
+          registrations.map((entry) => entry.path),
+        );
+  } catch (error) {
+    checks.registration = checkFailure(
+      "Git worktree registrations could not be inspected",
+      errorMessage(error),
+    );
+  }
+  const registrationFailure = checks.registration.valid
+    ? undefined
+    : new FlowError(
+        `Feature worktree registration was not found: ${expectedPath}`,
+        3,
+        "WORKTREE_REGISTRATION_NOT_FOUND",
+      );
+
+  let actualHead: string | undefined;
+  let actualBranch: string | undefined;
+  let actualBranchRef: string | undefined;
+  if (pathExists) {
+    try {
+      const actualCommonDirectory = await canonicalGitPath(
+        expectedPath,
+        await runGit(expectedPath, ["rev-parse", "--git-common-dir"]),
+      );
+      checks.repository =
+        actualCommonDirectory === target.commonDirectory
+          ? checkSuccess(target.commonDirectory, actualCommonDirectory)
+          : checkFailure(
+              "Feature worktree belongs to a different Git repository",
+              target.commonDirectory,
+              actualCommonDirectory,
+            );
+    } catch (error) {
+      checks.repository = checkFailure(
+        "Feature worktree is not a Git checkout",
+        target.commonDirectory,
+        errorMessage(error),
+      );
+    }
+
+    try {
+      actualBranch = await runGit(expectedPath, [
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "HEAD",
+      ]);
+    } catch {
+      actualBranch = undefined;
+    }
+    try {
+      actualHead = await resolveCommit(
+        expectedPath,
+        "HEAD",
+        target.objectFormat,
+      );
+    } catch {
+      actualHead = undefined;
+    }
+    try {
+      actualBranchRef = await resolveCommit(
+        target.path,
+        `refs/heads/${gitState.featureBranch}`,
+        target.objectFormat,
+      );
+    } catch {
+      actualBranchRef = undefined;
+    }
+    checks.branch =
+      actualBranch === gitState.featureBranch &&
+      actualBranchRef === gitState.validatedHead
+        ? checkSuccess(
+            { name: gitState.featureBranch, ref: gitState.validatedHead },
+            { name: actualBranch, ref: actualBranchRef },
+          )
+        : checkFailure(
+            actualBranch === undefined
+              ? "Feature worktree HEAD is detached"
+              : actualBranchRef === undefined
+                ? "Feature branch is missing"
+                : "Feature branch does not match the persisted baseline",
+            { name: gitState.featureBranch, ref: gitState.validatedHead },
+            { name: actualBranch, ref: actualBranchRef },
+          );
+    checks.head =
+      actualHead === gitState.validatedHead
+        ? checkSuccess(gitState.validatedHead, actualHead)
+        : checkFailure(
+            actualHead === undefined
+              ? "Feature worktree HEAD could not be resolved"
+              : "Feature worktree HEAD does not match the persisted baseline",
+            gitState.validatedHead,
+            actualHead,
+          );
+    try {
+      const status = await runGit(expectedPath, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]);
+      const lines = status.length === 0 ? [] : status.split(/\r?\n/);
+      const untracked = lines.filter((line) => line.startsWith("?? "));
+      const tracked = lines.filter((line) => !line.startsWith("?? "));
+      checks.cleanliness =
+        lines.length === 0
+          ? checkSuccess("clean", "clean")
+          : checkFailure(
+              untracked.length > 0 && tracked.length > 0
+                ? "Feature worktree has tracked changes and non-ignored untracked files"
+                : untracked.length > 0
+                  ? "Feature worktree has non-ignored untracked files"
+                  : "Feature worktree has tracked changes",
+              "clean",
+              { tracked, untracked },
+            );
+    } catch (error) {
+      checks.cleanliness = checkFailure(
+        "Feature worktree cleanliness could not be inspected",
+        "clean",
+        errorMessage(error),
+      );
+    }
+  } else {
+    checks.repository = checkFailure(
+      "Feature worktree is missing",
+      target.commonDirectory,
+    );
+    checks.branch = checkFailure("Feature worktree is missing", {
+      name: gitState.featureBranch,
+      ref: gitState.validatedHead,
+    });
+    checks.head = checkFailure(
+      "Feature worktree is missing",
+      gitState.validatedHead,
+    );
+    checks.cleanliness = checkFailure("Feature worktree is missing", "clean");
+  }
+
+  const report: WorktreeValidationReport = {
+    repository: target.path,
+    runId: options.runId,
+    git: gitState,
+    valid: Object.values(checks).every((check) => check.valid),
+    checks,
+  };
+  if (report.valid) return report;
+  if (pathFailure)
+    throw validationFailure(
+      report,
+      pathFailure.message,
+      pathFailure.code,
+      pathFailure.exitCode,
+    );
+  if (registrationFailure)
+    throw validationFailure(
+      report,
+      registrationFailure.message,
+      registrationFailure.code,
+      registrationFailure.exitCode,
+    );
+  if (!checks.repository.valid)
+    throw validationFailure(
+      report,
+      "Feature worktree repository identity does not match the Target repository",
+      "GIT_INVARIANT_VIOLATION",
+    );
+  if (!checks.branch.valid && actualBranchRef === undefined)
+    throw validationFailure(
+      report,
+      `Feature branch was not found: ${gitState.featureBranch}`,
+      "FEATURE_BRANCH_NOT_FOUND",
+      3,
+    );
+  if (!checks.cleanliness.valid) {
+    const actual = checks.cleanliness.actual;
+    const hasUntracked =
+      typeof actual === "object" &&
+      actual !== null &&
+      "untracked" in actual &&
+      Array.isArray(actual.untracked) &&
+      actual.untracked.length > 0;
+    throw validationFailure(
+      report,
+      "Feature worktree is not clean",
+      hasUntracked ? "UNTRACKED_WORKTREE" : "DIRTY_WORKTREE",
+    );
+  }
+  throw validationFailure(
+    report,
+    "Feature worktree baseline does not match persisted Git facts",
+    "WORKTREE_INVARIANT_VIOLATION",
+  );
 }
 
 async function assertNoSymlinkComponents(path: string): Promise<void> {
