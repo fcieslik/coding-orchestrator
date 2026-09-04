@@ -1,5 +1,12 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,6 +45,7 @@ test("agent names are deterministic and Herdr-safe", () => {
 test("smoke forwards the multiline prompt byte-for-byte and cleans its pane", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "herdr-smoke-"));
   temporaryDirectories.push(cwd);
+  const outputFile = join(cwd, "smoke-report.json");
   const calls: string[][] = [];
   let submittedPrompt = "";
   const runner: HerdrCommandRunner = async (_executable, args) => {
@@ -82,6 +90,7 @@ test("smoke forwards the multiline prompt byte-for-byte and cleans its pane", as
     cwd,
     environment: { HERDR_ENV: "1", HERDR_PANE_ID: "caller" },
     runner,
+    outputFile,
     randomBytes: () => Buffer.from("12345678"),
   });
 
@@ -96,6 +105,7 @@ test("smoke forwards the multiline prompt byte-for-byte and cleans its pane", as
   expect(submittedPrompt).toContain("$implement");
   expect(submittedPrompt).toContain("\n");
   expect(JSON.stringify(report)).not.toContain(submittedPrompt);
+  expect(JSON.parse(await readFile(outputFile, "utf8"))).toEqual(report);
   expect(calls.map((call) => call.slice(0, 2))).toEqual([
     ["--version"],
     ["pane", "split"],
@@ -110,11 +120,210 @@ test("smoke forwards the multiline prompt byte-for-byte and cleans its pane", as
   expect(calls[3]).toContain("120000");
 });
 
+test("reports output-file failures without losing lifecycle evidence", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "herdr-export-failure-"));
+  temporaryDirectories.push(cwd);
+  const calls: string[][] = [];
+  let submittedPrompt = "";
+  const runner: HerdrCommandRunner = async (_executable, args) => {
+    calls.push([...args]);
+    if (args[0] === "--version")
+      return { stdout: "0.8.2", stderr: "", exitCode: 0 };
+    if (args[0] === "pane" && args[1] === "split")
+      return {
+        stdout: JSON.stringify({ result: { pane: { pane_id: "owned:p2" } } }),
+        stderr: "",
+        exitCode: 0,
+      };
+    if (args[0] === "agent" && args[1] === "start")
+      return {
+        stdout: JSON.stringify({
+          result: { agent: { name: args[2], pane_id: "owned:p2" } },
+        }),
+        stderr: "",
+        exitCode: 0,
+      };
+    if (args[0] === "agent" && args[1] === "prompt") {
+      submittedPrompt = args[3] ?? "";
+      return {
+        stdout: JSON.stringify({ result: { agent: { state: "done" } } }),
+        stderr: "",
+        exitCode: 0,
+      };
+    }
+    if (args[0] === "agent" && args[1] === "read")
+      return {
+        stdout: JSON.stringify({ result: { read: { text: submittedPrompt } } }),
+        stderr: "",
+        exitCode: 0,
+      };
+    if (args[0] === "pane" && args[1] === "close")
+      return { stdout: "{}", stderr: "", exitCode: 0 };
+    throw new Error(`unexpected args: ${args.join(" ")}`);
+  };
+
+  const report = await runHerdrSmoke({
+    agent: "codex",
+    cwd,
+    environment: smokeEnvironment(),
+    runner,
+    outputFile: cwd,
+    randomBytes: () => Buffer.from("export01"),
+  });
+
+  expect(report.ok).toBe(false);
+  expect(report.cleanup).toMatchObject({
+    status: "closed",
+    paneId: "owned:p2",
+  });
+  expect(report.challenge).toMatchObject({
+    delivered: true,
+    outputContainsNonce: true,
+    outputContainsCwd: true,
+  });
+  expect(report.error).toMatchObject({ operation: "report export" });
+  expect(report.reportExport).toMatchObject({
+    status: "failed",
+    path: cwd,
+    error: { operation: "report export" },
+  });
+  expect(JSON.stringify(report)).not.toContain(submittedPrompt);
+});
+
+test("keep-pane is an explicitly non-passing diagnostic result", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "herdr-keep-pane-"));
+  temporaryDirectories.push(cwd);
+  const calls: string[][] = [];
+  let submittedPrompt = "";
+  const runner: HerdrCommandRunner = async (_executable, args) => {
+    calls.push([...args]);
+    if (args[0] === "--version")
+      return { stdout: "0.8.2", stderr: "", exitCode: 0 };
+    if (args[0] === "pane" && args[1] === "split")
+      return {
+        stdout: JSON.stringify({ result: { pane: { pane_id: "owned:p2" } } }),
+        stderr: "",
+        exitCode: 0,
+      };
+    if (args[0] === "agent" && args[1] === "start")
+      return {
+        stdout: JSON.stringify({
+          result: { agent: { name: args[2], pane_id: "owned:p2" } },
+        }),
+        stderr: "",
+        exitCode: 0,
+      };
+    if (args[0] === "agent" && args[1] === "prompt") {
+      submittedPrompt = args[3] ?? "";
+      return {
+        stdout: JSON.stringify({ result: { agent: { state: "done" } } }),
+        stderr: "",
+        exitCode: 0,
+      };
+    }
+    if (args[0] === "agent" && args[1] === "read")
+      return {
+        stdout: JSON.stringify({ result: { read: { text: submittedPrompt } } }),
+        stderr: "",
+        exitCode: 0,
+      };
+    throw new Error(`unexpected args: ${args.join(" ")}`);
+  };
+
+  const report = await runHerdrSmoke({
+    agent: "codex",
+    cwd,
+    environment: smokeEnvironment(),
+    runner,
+    keepPane: true,
+    randomBytes: () => Buffer.from("keep0001"),
+  });
+
+  expect(report).toMatchObject({
+    ok: false,
+    result: "failed",
+    owned: { paneId: "owned:p2" },
+    cleanup: { status: "skipped", paneId: "owned:p2" },
+    error: {
+      operation: "cleanup",
+      message: expect.stringContaining("incomplete"),
+    },
+  });
+  expect(calls.map((call) => call.slice(0, 2))).not.toContain([
+    "pane",
+    "close",
+  ]);
+});
+
+test("close failure remains non-passing and identifies the owned pane", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "herdr-close-failure-"));
+  temporaryDirectories.push(cwd);
+  const calls: string[][] = [];
+  let submittedPrompt = "";
+  const runner: HerdrCommandRunner = async (_executable, args) => {
+    calls.push([...args]);
+    if (args[0] === "--version")
+      return { stdout: "0.8.2", stderr: "", exitCode: 0 };
+    if (args[0] === "pane" && args[1] === "split")
+      return {
+        stdout: JSON.stringify({ result: { pane: { pane_id: "owned:p2" } } }),
+        stderr: "",
+        exitCode: 0,
+      };
+    if (args[0] === "agent" && args[1] === "start")
+      return {
+        stdout: JSON.stringify({
+          result: { agent: { name: args[2], pane_id: "owned:p2" } },
+        }),
+        stderr: "",
+        exitCode: 0,
+      };
+    if (args[0] === "agent" && args[1] === "prompt") {
+      submittedPrompt = args[3] ?? "";
+      return {
+        stdout: JSON.stringify({ result: { agent: { state: "done" } } }),
+        stderr: "",
+        exitCode: 0,
+      };
+    }
+    if (args[0] === "agent" && args[1] === "read")
+      return {
+        stdout: JSON.stringify({ result: { read: { text: submittedPrompt } } }),
+        stderr: "",
+        exitCode: 0,
+      };
+    if (args[0] === "pane" && args[1] === "close")
+      return { stdout: "", stderr: "pane close denied", exitCode: 9 };
+    throw new Error(`unexpected args: ${args.join(" ")}`);
+  };
+
+  const report = await runHerdrSmoke({
+    agent: "codex",
+    cwd,
+    environment: smokeEnvironment(),
+    runner,
+    randomBytes: () => Buffer.from("close001"),
+  });
+
+  expect(report.ok).toBe(false);
+  expect(report.cleanup).toMatchObject({
+    status: "failed",
+    paneId: "owned:p2",
+  });
+  expect(report.cleanupError).toMatchObject({
+    operation: "pane close",
+    exitCode: 9,
+  });
+  expect(report.error?.operation).toBe("pane close");
+  expect(calls.filter((call) => call[0] === "pane")).toHaveLength(2);
+});
+
 test("the public smoke command works through a fake Herdr executable", async () => {
   const directory = await mkdtemp(join(tmpdir(), "herdr-fake-"));
   temporaryDirectories.push(directory);
   const fake = join(directory, "herdr");
   const promptFile = join(directory, "prompt.txt");
+  const outputFile = join(directory, "smoke-report.json");
   await writeFile(
     fake,
     `#!/usr/bin/env node
@@ -126,7 +335,7 @@ else if (args[0] === "pane" && args[1] === "split") console.log(JSON.stringify({
 else if (args[0] === "agent" && args[1] === "start") console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:p2",state:"idle"}}}));
 else if (args[0] === "agent" && args[1] === "prompt") { writeFileSync(process.env.FAKE_PROMPT, args[3]); console.log(JSON.stringify({result:{agent:{state:"done"}}})); }
 else if (args[0] === "agent" && args[1] === "read") console.log(JSON.stringify({result:{read:{text:readFileSync(process.env.FAKE_PROMPT,"utf8")}}}));
-else if (args[0] === "pane" && args[1] === "close") console.log("{}");
+else if (args[0] === "pane" && args[1] === "close") { if (process.env.FAKE_CLOSE_FAILURE === "1") { console.error("pane close denied"); process.exit(9); } console.log("{}"); }
 else process.exit(2);
 `,
     "utf8",
@@ -135,7 +344,7 @@ else process.exit(2);
   const log = join(directory, "calls.log");
   const result = await exec(
     flow,
-    ["herdr", "smoke", "--agent", "codex", "--json"],
+    ["herdr", "smoke", "--agent", "codex", "--json", "--output", outputFile],
     {
       cwd: directory,
       env: {
@@ -154,10 +363,169 @@ else process.exit(2);
   };
   expect(report.ok).toBe(true);
   expect(report.cleanup.status).toBe("closed");
+  expect(result.stdout.trim().split("\n")).toHaveLength(1);
+  expect(JSON.parse(await readFile(outputFile, "utf8"))).toEqual(report);
   expect((await readFile(promptFile, "utf8")).includes("$implement")).toBe(
     true,
   );
   expect((await readFile(log, "utf8")).trim().split("\n")).toHaveLength(6);
+
+  const help = await exec(flow, ["herdr", "smoke", "--help"], {
+    cwd: directory,
+  });
+  expect(help.stdout).toContain("may incur normal agent usage");
+  expect(help.stdout).toContain("diagnostics");
+  expect(help.stdout).toContain("can never pass the complete gate");
+
+  let humanKeepPane: { stdout: string; stderr: string; code?: number };
+  try {
+    await exec(flow, ["herdr", "smoke", "--agent", "codex", "--keep-pane"], {
+      cwd: directory,
+      env: {
+        ...process.env,
+        HERDR_ENV: "1",
+        HERDR_PANE_ID: "caller",
+        HERDR_BIN_PATH: fake,
+        FAKE_LOG: log,
+        FAKE_PROMPT: promptFile,
+      },
+    });
+    throw new Error("expected human keep-pane smoke to be non-passing");
+  } catch (error) {
+    humanKeepPane = error as typeof humanKeepPane;
+  }
+  expect(humanKeepPane.stdout).toContain("Herdr smoke: failed");
+  expect(humanKeepPane.stdout).toContain("Cleanup: skipped");
+  expect(humanKeepPane.stdout).toContain("not a complete gate pass");
+
+  let exportFailure: {
+    stdout: string;
+    stderr: string;
+    code?: number;
+  };
+  try {
+    await exec(
+      flow,
+      ["herdr", "smoke", "--agent", "codex", "--json", "--output", directory],
+      {
+        cwd: directory,
+        env: {
+          ...process.env,
+          HERDR_ENV: "1",
+          HERDR_PANE_ID: "caller",
+          HERDR_BIN_PATH: fake,
+          FAKE_LOG: log,
+          FAKE_PROMPT: promptFile,
+        },
+      },
+    );
+    throw new Error("expected report export to fail");
+  } catch (error) {
+    exportFailure = error as typeof exportFailure;
+  }
+  expect(exportFailure.code).toBe(1);
+  expect(exportFailure.stderr).toBe("");
+  expect(exportFailure.stdout.trim().split("\n")).toHaveLength(1);
+  const failedReport = JSON.parse(exportFailure.stdout) as {
+    ok: boolean;
+    cleanup: { status: string };
+    challenge: { outputContainsNonce: boolean; outputContainsCwd: boolean };
+    reportExport?: { status: string };
+  };
+  expect(failedReport).toMatchObject({
+    ok: false,
+    cleanup: { status: "closed" },
+    challenge: { outputContainsNonce: true, outputContainsCwd: true },
+    reportExport: { status: "failed" },
+  });
+
+  let keepPane: {
+    stdout: string;
+    stderr: string;
+    code?: number;
+  };
+  try {
+    await exec(
+      flow,
+      ["herdr", "smoke", "--agent", "codex", "--json", "--keep-pane"],
+      {
+        cwd: directory,
+        env: {
+          ...process.env,
+          HERDR_ENV: "1",
+          HERDR_PANE_ID: "caller",
+          HERDR_BIN_PATH: fake,
+          FAKE_LOG: log,
+          FAKE_PROMPT: promptFile,
+        },
+      },
+    );
+    throw new Error("expected keep-pane smoke to be non-passing");
+  } catch (error) {
+    keepPane = error as typeof keepPane;
+  }
+  expect(keepPane.code).toBe(1);
+  expect(keepPane.stderr).toBe("");
+  expect(JSON.parse(keepPane.stdout)).toMatchObject({
+    ok: false,
+    owned: { paneId: "fake:p2" },
+    cleanup: { status: "skipped", paneId: "fake:p2" },
+    error: { operation: "cleanup" },
+  });
+
+  let closeFailure: {
+    stdout: string;
+    stderr: string;
+    code?: number;
+  };
+  try {
+    await exec(flow, ["herdr", "smoke", "--agent", "codex", "--json"], {
+      cwd: directory,
+      env: {
+        ...process.env,
+        HERDR_ENV: "1",
+        HERDR_PANE_ID: "caller",
+        HERDR_BIN_PATH: fake,
+        FAKE_LOG: log,
+        FAKE_PROMPT: promptFile,
+        FAKE_CLOSE_FAILURE: "1",
+      },
+    });
+    throw new Error("expected pane close to fail");
+  } catch (error) {
+    closeFailure = error as typeof closeFailure;
+  }
+  expect(closeFailure.code).toBe(1);
+  expect(closeFailure.stderr).toBe("");
+  expect(JSON.parse(closeFailure.stdout)).toMatchObject({
+    ok: false,
+    owned: { paneId: "fake:p2" },
+    cleanup: { status: "failed", paneId: "fake:p2" },
+    cleanupError: { operation: "pane close" },
+  });
+
+  let humanCloseFailure: { stdout: string; stderr: string; code?: number };
+  try {
+    await exec(flow, ["herdr", "smoke", "--agent", "codex"], {
+      cwd: directory,
+      env: {
+        ...process.env,
+        HERDR_ENV: "1",
+        HERDR_PANE_ID: "caller",
+        HERDR_BIN_PATH: fake,
+        FAKE_LOG: log,
+        FAKE_PROMPT: promptFile,
+        FAKE_CLOSE_FAILURE: "1",
+      },
+    });
+    throw new Error("expected human pane close to fail");
+  } catch (error) {
+    humanCloseFailure = error as typeof humanCloseFailure;
+  }
+  expect(humanCloseFailure.stdout).toContain("Cleanup: failed");
+  expect(humanCloseFailure.stdout).toContain("Manual recovery");
+  expect(humanCloseFailure.stdout).toContain("fake:p2");
+  expect(await readdir(directory)).not.toContain(".orchestrator");
 });
 
 test("smoke refuses to control Herdr without caller context", async () => {

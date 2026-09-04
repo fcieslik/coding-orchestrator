@@ -99,6 +99,11 @@ export interface HerdrSmokeReport {
     arguments?: string[];
   };
   cleanupError?: HerdrSmokeReport["error"];
+  reportExport?: {
+    status: "failed";
+    path: string;
+    error: NonNullable<HerdrSmokeReport["error"]>;
+  };
 }
 
 function bounded(value: string, limit: number): string {
@@ -555,7 +560,7 @@ function challengePrompt(nonce: string, cwd: string): string {
 function failureDetails(
   operation: string,
   error: unknown,
-): HerdrSmokeReport["error"] {
+): NonNullable<HerdrSmokeReport["error"]> {
   if (error instanceof FlowError) {
     const details = error.details;
     return {
@@ -783,12 +788,25 @@ export async function runHerdrSmoke(
     }
     return report;
   } finally {
-    if (options.outputFile)
-      await writeFile(
-        options.outputFile,
-        `${JSON.stringify(report)}\n`,
-        "utf8",
-      );
+    if (options.outputFile) {
+      try {
+        await writeFile(
+          options.outputFile,
+          `${JSON.stringify(report)}\n`,
+          "utf8",
+        );
+      } catch (error) {
+        const exportError = failureDetails("report export", error);
+        report.reportExport = {
+          status: "failed",
+          path: options.outputFile,
+          error: exportError,
+        };
+        report.ok = false;
+        report.result = "failed";
+        if (!report.error) report.error = exportError;
+      }
+    }
   }
 }
 

@@ -287,7 +287,10 @@ try {
       "Usage: flow herdr smoke --agent codex [--json] [--output <file>] [--keep-pane]",
     );
     console.log(
-      "Launches a Codex agent in a fresh Herdr sibling pane; requires a genuine managed caller.",
+      "Launches Codex in a fresh Herdr sibling pane; requires a genuine managed caller and may incur normal agent usage.",
+    );
+    console.log(
+      "--keep-pane retains only this invocation's pane for diagnostics and can never pass the complete gate.",
     );
   } else if (argument === "herdr" && arguments_[1] === "smoke") {
     const { flags, values } = parseOptions(
@@ -325,7 +328,19 @@ try {
         `Challenge cwd: ${report.challenge.outputContainsCwd ? "matched" : "missing"}`,
       );
       console.log(`Cleanup: ${report.cleanup.status}`);
+      if (report.cleanup.status === "skipped")
+        console.log(
+          `Diagnostic: pane ${report.cleanup.paneId ?? "unknown"} was retained; this is not a complete gate pass`,
+        );
+      if (report.cleanup.status === "failed")
+        console.log(
+          `Manual recovery: close owned pane ${report.cleanup.paneId ?? "unknown"} in Herdr; no broader cleanup was attempted`,
+        );
       if (report.error) console.log(`Error: ${report.error.message}`);
+      if (report.reportExport)
+        console.log(
+          `Report export: failed for ${report.reportExport.path} (${report.reportExport.error.message})`,
+        );
     }
     if (!report.ok) process.exitCode = 1;
   } else {
