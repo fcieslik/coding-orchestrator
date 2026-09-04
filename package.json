@@ -8,12 +8,17 @@
   },
   "packageManager": "pnpm@11.25.0",
   "scripts": {
-    "build": "tsup src/cli.ts --format esm --clean",
-    "format": "prettier --write package.json pnpm-workspace.yaml tsconfig.json eslint.config.js src tests",
-    "format:check": "prettier --check package.json pnpm-workspace.yaml tsconfig.json eslint.config.js src tests",
+    "build": "pnpm schema:generate && tsup src/cli.ts --format esm --clean",
+    "format": "prettier --write package.json pnpm-workspace.yaml tsconfig.json eslint.config.js scripts/generate-schemas.ts src tests",
+    "format:check": "prettier --check package.json pnpm-workspace.yaml tsconfig.json eslint.config.js scripts/generate-schemas.ts src tests",
     "lint": "eslint .",
+    "schema:check": "node --experimental-strip-types scripts/generate-schemas.ts --check",
+    "schema:generate": "node --experimental-strip-types scripts/generate-schemas.ts",
     "test": "pnpm build && vitest run",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "4.1.12"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

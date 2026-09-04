@@ -63,8 +63,18 @@ test("installer creates a fresh runtime snapshot", async () => {
   expect((await readdir(target)).sort()).toEqual([
     "SKILL.md",
     "dist",
+    "schemas",
     "scripts",
   ]);
+  expect(
+    await readFile(
+      join(target, "schemas", "state-snapshot.schema.json"),
+      "utf8",
+    ),
+  ).not.toBe("");
+  expect(
+    await readFile(join(target, "schemas", "run-event.schema.json"), "utf8"),
+  ).not.toBe("");
   expect(await readFile(join(target, "SKILL.md"), "utf8")).toContain(
     "name: orchestrate",
   );
@@ -98,6 +108,7 @@ test("installer force-replaces an existing destination", async () => {
   expect((await readdir(target)).sort()).toEqual([
     "SKILL.md",
     "dist",
+    "schemas",
     "scripts",
   ]);
 });
