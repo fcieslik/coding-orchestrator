@@ -19,10 +19,14 @@ export type HerdrLifecycleState =
 export type HerdrTransportState =
   "settled" | "blocked" | "unknown" | "timed-out" | "disappeared";
 
+export type HerdrObservedState =
+  HerdrLifecycleState | "timed-out" | "disappeared";
+
 export interface HerdrCommandResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  signal?: string;
 }
 
 export type HerdrCommandRunner = (
@@ -71,7 +75,7 @@ export interface HerdrSmokeReport {
     agentKind: "codex";
   };
   lifecycle?: {
-    observed?: HerdrLifecycleState;
+    observed?: HerdrObservedState;
     transport?: HerdrTransportState;
   };
   challenge: {
@@ -91,7 +95,10 @@ export interface HerdrSmokeReport {
     message: string;
     stderr?: string;
     exitCode?: number;
+    transport?: HerdrTransportState;
+    arguments?: string[];
   };
+  cleanupError?: HerdrSmokeReport["error"];
 }
 
 function bounded(value: string, limit: number): string {
@@ -117,6 +124,7 @@ const defaultRunner: HerdrCommandRunner = async (
       stdout?: string;
       stderr?: string;
       code?: string | number;
+      signal?: string;
     };
     const exitCode =
       typeof failure.code === "number"
@@ -129,6 +137,7 @@ const defaultRunner: HerdrCommandRunner = async (
       stderr:
         typeof failure.stderr === "string" ? failure.stderr : failure.message,
       exitCode,
+      ...(typeof failure.signal === "string" ? { signal: failure.signal } : {}),
     };
   }
 };
@@ -145,18 +154,44 @@ function protocolError(operation: string, message: string): FlowError {
 function invocationError(
   operation: string,
   result: HerdrCommandResult,
+  args: readonly string[],
 ): FlowError {
   const reason =
     result.exitCode === 124 ? "timed out" : `exited with ${result.exitCode}`;
+  const transport =
+    result.exitCode === 124
+      ? "timed-out"
+      : result.exitCode === 137 ||
+          result.signal === "SIGKILL" ||
+          result.signal === "SIGHUP" ||
+          (operation.startsWith("agent ") &&
+            /(?:disappeared|no such agent|agent.+(?:gone|exited|terminated))/i.test(
+              result.stderr,
+            ))
+        ? "disappeared"
+        : undefined;
   return new FlowError(
     `Herdr ${operation} ${reason}`,
     1,
-    "HERDR_INVOCATION_ERROR",
+    operation === "agent start" &&
+      /(?:collision|already exists|already running|in use)/i.test(result.stderr)
+      ? "HERDR_AGENT_COLLISION"
+      : "HERDR_INVOCATION_ERROR",
     {
       operation,
       exitCode: result.exitCode,
       stderr: bounded(result.stderr, maxDiagnosticBytes),
+      ...(transport === undefined ? {} : { transport }),
+      arguments: safeArguments(args),
     },
+  );
+}
+
+function safeArguments(args: readonly string[]): string[] {
+  return args.map((argument, index) =>
+    args[0] === "agent" && args[1] === "prompt" && index === 3
+      ? "<redacted-prompt>"
+      : argument,
   );
 }
 
@@ -191,7 +226,41 @@ function stringField(value: unknown, ...paths: string[][]): string | undefined {
   return undefined;
 }
 
-function lifecycleField(value: unknown): HerdrLifecycleState | undefined {
+function stringFieldAllowEmpty(
+  value: unknown,
+  ...paths: string[][]
+): string | undefined {
+  for (const path of paths) {
+    const candidate = nested(value, ...path);
+    if (typeof candidate === "string") return candidate;
+  }
+  return undefined;
+}
+
+function validateAgentIdentity(
+  operation: string,
+  response: Record<string, unknown>,
+  handle: HerdrExecutionHandle,
+): void {
+  const returnedName = stringField(
+    response,
+    ["result", "agent", "name"],
+    ["result", "agent", "agent_name"],
+    ["agent", "name"],
+  );
+  const returnedPane = stringField(
+    response,
+    ["result", "agent", "pane_id"],
+    ["result", "agent", "paneId"],
+    ["agent", "pane_id"],
+  );
+  if (returnedName !== undefined && returnedName !== handle.agentName)
+    throw protocolError(operation, "returned an unexpected agent name");
+  if (returnedPane !== undefined && returnedPane !== handle.paneId)
+    throw protocolError(operation, "returned an unexpected pane");
+}
+
+function lifecycleField(value: unknown): HerdrObservedState | undefined {
   const state = stringField(
     value,
     ["result", "agent", "state"],
@@ -199,15 +268,19 @@ function lifecycleField(value: unknown): HerdrLifecycleState | undefined {
     ["result", "state"],
     ["state"],
   );
-  return state &&
-    ["working", "idle", "done", "blocked", "unknown"].includes(state)
-    ? (state as HerdrLifecycleState)
-    : undefined;
+  if (!state) return undefined;
+  if (["working", "idle", "done", "blocked", "unknown"].includes(state))
+    return state as HerdrLifecycleState;
+  if (["timed-out", "timed_out", "timeout"].includes(state)) return "timed-out";
+  if (["disappeared", "process-disappeared", "gone"].includes(state))
+    return "disappeared";
+  return undefined;
 }
 
-function transportState(state: HerdrLifecycleState): HerdrTransportState {
+function transportState(state: HerdrObservedState): HerdrTransportState {
   if (state === "idle" || state === "done") return "settled";
   if (state === "blocked" || state === "unknown") return state;
+  if (state === "timed-out" || state === "disappeared") return state;
   return "unknown";
 }
 
@@ -245,7 +318,7 @@ export class HerdrAdapter {
     timeoutMs: number,
   ): Promise<HerdrCommandResult> {
     const result = await this.runner(this.executable, args, timeoutMs);
-    if (result.exitCode !== 0) throw invocationError(operation, result);
+    if (result.exitCode !== 0) throw invocationError(operation, result, args);
     return {
       stdout: bounded(result.stdout, this.maxBytes),
       stderr: bounded(result.stderr, this.maxBytes),
@@ -257,12 +330,13 @@ export class HerdrAdapter {
     const result = await this.invoke("version", ["--version"], timeoutMs);
     const text = result.stdout.trim();
     if (!text) throw protocolError("version", "missing version");
-    try {
+    if (/^(?:\{|\[)/.test(text)) {
       const parsed = parseJson("version", text);
-      return stringField(parsed, ["version"], ["result", "version"]) ?? text;
-    } catch {
-      return text.split(/\r?\n/, 1)[0] ?? text;
+      const version = stringField(parsed, ["version"], ["result", "version"]);
+      if (!version) throw protocolError("version", "missing version field");
+      return version;
     }
+    return text.split(/\r?\n/, 1)[0] ?? text;
   }
 
   async splitSibling(
@@ -275,7 +349,8 @@ export class HerdrAdapter {
       [
         "pane",
         "split",
-        "--current",
+        "--pane",
+        callerPaneId,
         "--direction",
         "right",
         "--cwd",
@@ -300,7 +375,7 @@ export class HerdrAdapter {
   async start(
     handle: HerdrExecutionHandle,
     timeoutMs = defaultStartupTimeoutMs,
-  ): Promise<HerdrLifecycleState | undefined> {
+  ): Promise<HerdrObservedState | undefined> {
     const result = await this.invoke(
       "agent start",
       [
@@ -327,9 +402,20 @@ export class HerdrAdapter {
       ["result", "agent", "pane_id"],
       ["result", "agent", "paneId"],
     );
-    if (returnedName && returnedName !== handle.agentName)
+    if (!returnedName)
+      throw protocolError("agent start", "missing result.agent.name");
+    if (!returnedPane)
+      throw protocolError("agent start", "missing result.agent.pane_id");
+    const returnedKind = stringField(
+      parsed,
+      ["result", "agent", "kind"],
+      ["result", "agent", "agent_kind"],
+    );
+    if (returnedKind !== undefined && returnedKind !== handle.agentKind)
+      throw protocolError("agent start", "returned an unexpected agent kind");
+    if (returnedName !== handle.agentName)
       throw protocolError("agent start", "returned an unexpected agent name");
-    if (returnedPane && returnedPane !== handle.paneId)
+    if (returnedPane !== handle.paneId)
       throw protocolError("agent start", "returned an unexpected pane");
     return lifecycleField(parsed);
   }
@@ -361,7 +447,7 @@ export class HerdrAdapter {
     handle: HerdrExecutionHandle,
     prompt: string,
     timeoutMs = defaultSettlementTimeoutMs,
-  ): Promise<HerdrLifecycleState> {
+  ): Promise<HerdrObservedState> {
     const result = await this.invoke(
       "agent prompt",
       [
@@ -376,6 +462,7 @@ export class HerdrAdapter {
       timeoutMs,
     );
     const parsed = parseJson("agent prompt", result.stdout);
+    validateAgentIdentity("agent prompt", parsed, handle);
     const state = lifecycleField(parsed);
     if (!state)
       throw protocolError("agent prompt", "missing supported lifecycle state");
@@ -385,7 +472,7 @@ export class HerdrAdapter {
   async wait(
     handle: HerdrExecutionHandle,
     timeoutMs = defaultSettlementTimeoutMs,
-  ): Promise<HerdrLifecycleState> {
+  ): Promise<HerdrObservedState> {
     const result = await this.invoke(
       "agent wait",
       [
@@ -402,6 +489,7 @@ export class HerdrAdapter {
       timeoutMs,
     );
     const parsed = parseJson("agent wait", result.stdout);
+    validateAgentIdentity("agent wait", parsed, handle);
     const state = lifecycleField(parsed);
     if (!state)
       throw protocolError("agent wait", "missing supported lifecycle state");
@@ -425,21 +513,17 @@ export class HerdrAdapter {
       ],
       timeoutMs,
     );
-    const trimmed = result.stdout.trim();
-    if (!trimmed) return "";
-    try {
-      const parsed = parseJson("agent read", trimmed);
-      return (
-        stringField(
-          parsed,
-          ["result", "read", "text"],
-          ["result", "text"],
-          ["text"],
-        ) ?? ""
-      );
-    } catch {
-      return result.stdout;
-    }
+    const parsed = parseJson("agent read", result.stdout.trim());
+    validateAgentIdentity("agent read", parsed, handle);
+    const text = stringFieldAllowEmpty(
+      parsed,
+      ["result", "read", "text"],
+      ["result", "text"],
+      ["text"],
+    );
+    if (text === undefined)
+      throw protocolError("agent read", "missing diagnostic text");
+    return text;
   }
 
   async close(
@@ -483,12 +567,41 @@ function failureDetails(
       ...(typeof details?.exitCode === "number"
         ? { exitCode: details.exitCode }
         : {}),
+      ...(details?.transport === "timed-out" ||
+      details?.transport === "disappeared"
+        ? { transport: details.transport }
+        : {}),
+      ...(Array.isArray(details?.arguments)
+        ? {
+            arguments: details.arguments.filter(
+              (value): value is string => typeof value === "string",
+            ),
+          }
+        : {}),
     };
   }
   return {
     operation,
     message: error instanceof Error ? error.message : String(error),
   };
+}
+
+function errorTransport(error: unknown): HerdrTransportState | undefined {
+  if (!(error instanceof FlowError)) return undefined;
+  const transport = error.details?.transport;
+  return transport === "timed-out" || transport === "disappeared"
+    ? transport
+    : undefined;
+}
+
+function lifecycleFailure(state: HerdrObservedState): FlowError {
+  const transport = transportState(state);
+  return new FlowError(
+    `Herdr agent reported ${state}; settlement was not established`,
+    1,
+    "HERDR_LIFECYCLE_FAILED",
+    { operation: "lifecycle", lifecycle: state, transport },
+  );
 }
 
 export async function runHerdrSmoke(
@@ -543,6 +656,8 @@ export async function runHerdrSmoke(
     timings: {},
   };
   let handle: HerdrExecutionHandle | undefined;
+  let operation = "version";
+  let cleanupAttempted = false;
   const timed = async <T>(
     name: string,
     action: () => Promise<T>,
@@ -555,20 +670,32 @@ export async function runHerdrSmoke(
     }
   };
   try {
+    operation = "version";
     report.version = await timed("version", () => adapter.version());
+    operation = "pane split";
     const paneId = await timed("paneCreation", () =>
       adapter.splitSibling(callerPaneId, cwd),
     );
     handle = { paneId, agentName, agentKind: options.agent, cwd };
     report.owned.paneId = paneId;
     report.lifecycle = {};
-    await timed("agentStartup", () =>
+    operation = "agent start";
+    const startupState = await timed("agentStartup", () =>
       adapter.start(
         handle!,
         options.startupTimeoutMs ?? defaultStartupTimeoutMs,
       ),
     );
+    if (startupState !== undefined) {
+      report.lifecycle = {
+        observed: startupState,
+        transport: transportState(startupState),
+      };
+      if (transportState(startupState) !== "settled")
+        throw lifecycleFailure(startupState);
+    }
     const prompt = challengePrompt(nonce, cwd);
+    operation = "agent prompt";
     const state = await timed("promptSettlement", () =>
       adapter.prompt(
         handle!,
@@ -578,13 +705,14 @@ export async function runHerdrSmoke(
     );
     report.lifecycle = { observed: state, transport: transportState(state) };
     report.challenge.delivered = true;
+    if (report.lifecycle.transport !== "settled") throw lifecycleFailure(state);
+    operation = "agent read";
     const output = await timed("diagnosticRead", () =>
       adapter.read(handle!, options.readTimeoutMs ?? defaultReadTimeoutMs),
     );
     report.challenge.outputContainsNonce = output.includes(nonce);
     report.challenge.outputContainsCwd = output.includes(cwd);
     if (
-      report.lifecycle.transport !== "settled" ||
       !report.challenge.outputContainsNonce ||
       !report.challenge.outputContainsCwd
     )
@@ -595,8 +723,14 @@ export async function runHerdrSmoke(
       );
     if (options.keepPane) {
       report.cleanup = { status: "skipped", paneId };
+      report.error = {
+        operation: "cleanup",
+        message: "Pane retention was requested; smoke evidence is incomplete",
+      };
       return report;
     }
+    operation = "pane close";
+    cleanupAttempted = true;
     await timed("cleanup", () =>
       adapter.close(handle!, options.closeTimeoutMs ?? defaultCloseTimeoutMs),
     );
@@ -606,11 +740,27 @@ export async function runHerdrSmoke(
     return report;
   } catch (error) {
     Object.assign(report, {
-      error: failureDetails(handle ? "lifecycle" : "launch", error),
+      error: failureDetails(operation, error),
     });
+    const transport = errorTransport(error);
+    if (transport !== undefined)
+      report.lifecycle = {
+        ...(report.lifecycle ?? {}),
+        transport,
+      };
     if (handle) {
-      report.cleanup = { status: "not-attempted", paneId: handle.paneId };
-      if (!options.keepPane) {
+      if (operation === "pane close") {
+        const cleanupDetails = failureDetails("pane close", error);
+        report.cleanup = {
+          status: "failed",
+          paneId: handle.paneId,
+          error: cleanupDetails?.message ?? String(error),
+        };
+        report.cleanupError = cleanupDetails;
+      }
+      if (report.cleanup.status === "not-attempted")
+        report.cleanup = { status: "not-attempted", paneId: handle.paneId };
+      if (!options.keepPane && !cleanupAttempted) {
         try {
           await timed("cleanup", () =>
             adapter.close(
@@ -620,16 +770,16 @@ export async function runHerdrSmoke(
           );
           report.cleanup = { status: "closed", paneId: handle.paneId };
         } catch (cleanupError) {
+          const cleanupDetails = failureDetails("pane close", cleanupError);
           report.cleanup = {
             status: "failed",
             paneId: handle.paneId,
-            error:
-              cleanupError instanceof Error
-                ? cleanupError.message
-                : String(cleanupError),
+            error: cleanupDetails?.message ?? String(cleanupError),
           };
+          report.cleanupError = cleanupDetails;
         }
-      } else report.cleanup = { status: "skipped", paneId: handle.paneId };
+      } else if (options.keepPane)
+        report.cleanup = { status: "skipped", paneId: handle.paneId };
     }
     return report;
   } finally {
