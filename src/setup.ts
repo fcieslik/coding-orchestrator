@@ -349,3 +349,20 @@ export async function setupRepository(
     config,
   };
 }
+
+/** Read the repository-local worker contract without creating or changing it. */
+export async function readOrchestrationConfig(
+  repositoryPath?: string,
+): Promise<{ repository: string; path: string; config: OrchestrationConfig }> {
+  const repository = await resolveRepository(repositoryPath);
+  const path = join(repository, runtimeDirectory, "config.yaml");
+  const contents = await readExistingFile(path);
+  if (contents === undefined)
+    throw new FlowError(
+      `Orchestration configuration was not found: ${path}. Run flow setup first.`,
+      3,
+      "CONFIGURATION_NOT_FOUND",
+      { path },
+    );
+  return { repository, path, config: validateConfiguration(contents, path) };
+}

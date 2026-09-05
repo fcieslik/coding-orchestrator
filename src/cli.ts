@@ -8,6 +8,7 @@ import {
 } from "./git-worktree.js";
 import { runHerdrSmoke } from "./herdr.js";
 import { setupRepository } from "./setup.js";
+import { executeWorker } from "./worker-execution.js";
 import { createRun, FlowError, inspectRun, selectRun } from "./workflow-run.js";
 
 const arguments_ = process.argv.slice(2);
@@ -23,6 +24,9 @@ const structuredRequest =
     arguments_.includes("--json")) ||
   (argument === "herdr" &&
     arguments_[1] === "smoke" &&
+    arguments_.includes("--json")) ||
+  (argument === "worker" &&
+    arguments_[1] === "execute" &&
     arguments_.includes("--json"));
 const setupStructuredRequest =
   argument === "setup" && arguments_.includes("--json");
@@ -120,6 +124,47 @@ try {
       ...(runId === undefined ? {} : { runId }),
     });
     console.log(`Created run ${createdRunId}`);
+  } else if (
+    argument === "worker" &&
+    arguments_[1] === "execute" &&
+    arguments_.includes("--help")
+  ) {
+    console.log(
+      "Usage: flow worker execute --run <id> --ticket <file> [--repo <path>] [--json]",
+    );
+    console.log(
+      "Execute one explicit Markdown ticket in the ready Feature worktree through a fresh Codex worker.",
+    );
+  } else if (argument === "worker" && arguments_[1] === "execute") {
+    const { flags, values } = parseOptions(
+      arguments_.slice(2),
+      ["--repo", "--run", "--ticket"],
+      ["--json"],
+    );
+    const runId = values.get("--run");
+    const ticket = values.get("--ticket");
+    if (!runId || !ticket)
+      throw new FlowError(
+        "Usage: flow worker execute --run <id> --ticket <file> [--repo <path>] [--json]",
+        2,
+      );
+    const repository = values.get("--repo");
+    const report = await executeWorker(
+      repository === undefined
+        ? { runId, ticket }
+        : { repository, runId, ticket },
+    );
+    if (flags.has("--json")) console.log(JSON.stringify(report));
+    else {
+      console.log(`Worker execution: ${report.status}`);
+      console.log(`Run: ${report.runId}`);
+      console.log(`Ticket: ${report.ticketId}`);
+      console.log(`Attempt: ${report.attemptId}`);
+      console.log(`Execution: ${report.executionId}`);
+      console.log(`Accepted Git checkpoint: ${report.acceptedCommit}`);
+      console.log(`Execution record: ${report.artifacts.record}`);
+      console.log(`Worker result: ${report.artifacts.output}`);
+    }
   } else if (argument === "status") {
     const { flags, values } = parseOptions(
       arguments_.slice(1),

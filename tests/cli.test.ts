@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import {
   lstat,
+  chmod,
   mkdir,
   mkdtemp,
   readdir,
@@ -17,7 +18,11 @@ import { promisify } from "node:util";
 
 import { afterEach, expect, test } from "vitest";
 
-import { cleanupWorktree, prepareWorktree } from "../src/git-worktree.js";
+import {
+  cleanupWorktree,
+  inspectCheckpoint,
+  prepareWorktree,
+} from "../src/git-worktree.js";
 import {
   acquireRunLock,
   FlowError,
@@ -838,7 +843,10 @@ test("flow accepts a new Git checkpoint and exposes its audit event", async () =
         "--json",
       ])
     ).stdout,
-  ) as { git: { featureWorktree: string }; revision: number };
+  ) as {
+    git: { featureWorktree: string; runBase: string };
+    revision: number;
+  };
   const feature = prepared.git.featureWorktree;
   await writeFile(join(feature, "checkpoint.txt"), "checkpoint\n");
   await run("git", ["-C", feature, "add", "checkpoint.txt"]);
@@ -846,6 +854,17 @@ test("flow accepts a new Git checkpoint and exposes its audit event", async () =
   const commit = (
     await run("git", ["-C", feature, "rev-parse", "HEAD"])
   ).stdout.trim();
+
+  const beforeInspection = await inspectRun(repository, runId);
+  await expect(
+    inspectCheckpoint({ repository, runId, commit }),
+  ).resolves.toMatchObject({
+    previousValidatedHead: prepared.git.runBase,
+    acceptedCommit: commit,
+  });
+  expect((await inspectRun(repository, runId)).snapshot).toEqual(
+    beforeInspection.snapshot,
+  );
 
   const accepted = await run(executable, [
     "checkpoint",
@@ -1748,6 +1767,154 @@ test("flow prepares a run whose Target repository is a linked worktree", async (
     phase: "implementing",
     git: { worktreeStatus: "ready" },
   });
+});
+
+test("flow executes one ticket through a fake Herdr worker and accepts its checkpoint", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260906T120000Z_030303030303";
+  const ticket = "tickets/03-ship-widget.md";
+  await mkdir(join(repository, "tickets"));
+  await writeFile(
+    join(repository, ticket),
+    "# Ship widget\n\nImplement the widget.\n",
+  );
+  await run(executable, ["setup", "--repo", repository]);
+  await createExplicitRun(repository, runId);
+  const prepared = await prepareFeatureWorktree(repository, runId);
+
+  const fakeDirectory = await temporaryDirectory();
+  const fake = join(fakeDirectory, "herdr");
+  const state = join(fakeDirectory, "state.json");
+  const promptPath = join(fakeDirectory, "prompt.txt");
+  await writeFile(
+    fake,
+    `#!/usr/bin/env node
+import { execFileSync } from "node:child_process";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+if (args[0] === "--version") console.log("fake-herdr 0.8.2");
+else if (args[0] === "pane" && args[1] === "split") console.log(JSON.stringify({result:{pane:{pane_id:"fake:worker"}}}));
+else if (args[0] === "agent" && args[1] === "start") {
+  const delimiter = args.indexOf("--");
+  const child = args.slice(delimiter + 1);
+  const worktree = child[child.indexOf("-C") + 1];
+  const output = child[child.indexOf("--add-dir") + 1];
+  writeFileSync(process.env.FAKE_STATE, JSON.stringify({ worktree, output, name: args[2] }));
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"idle"}}}));
+}
+else if (args[0] === "agent" && args[1] === "prompt") {
+  const prompt = args[3];
+  writeFileSync(process.env.FAKE_PROMPT, prompt);
+  const current = JSON.parse(readFileSync(process.env.FAKE_STATE, "utf8"));
+  const ticket = prompt.match(/- Ticket: ([^\\n]+)/)[1];
+  const resultPath = prompt.match(/Write the structured execution result to: "([^"]+)"/)[1];
+  writeFileSync(current.worktree + "/worker-change.txt", "implemented\\n");
+  execFileSync("git", ["-C", current.worktree, "add", "worker-change.txt"]);
+  execFileSync("git", ["-C", current.worktree, "commit", "--quiet", "-m", "worker implementation"]);
+  const commit = execFileSync("git", ["-C", current.worktree, "rev-parse", "HEAD"], {encoding:"utf8"}).trim();
+  const temporary = resultPath + ".tmp";
+  writeFileSync(temporary, JSON.stringify({schemaVersion:1,ticketId:ticket,status:"completed",summary:"Implemented widget.",commit,commands:[{command:"git commit",status:"passed",exitCode:0}]}));
+  renameSync(temporary, resultPath);
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"done"}}}));
+}
+else if (args[0] === "agent" && args[1] === "read") process.stdout.write("fake worker completed\\n");
+else if (args[0] === "pane" && args[1] === "close") console.log("{}");
+else process.exit(2);
+`,
+    "utf8",
+  );
+  await chmod(fake, 0o755);
+
+  const { stdout } = await run(
+    executable,
+    [
+      "worker",
+      "execute",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--ticket",
+      ticket,
+      "--json",
+    ],
+    {
+      cwd: repository,
+      env: {
+        ...process.env,
+        HERDR_ENV: "1",
+        HERDR_PANE_ID: "caller",
+        HERDR_BIN_PATH: fake,
+        FAKE_STATE: state,
+        FAKE_PROMPT: promptPath,
+      },
+    },
+  );
+  const report = JSON.parse(stdout) as {
+    status: string;
+    ticketId: string;
+    acceptedCommit: string;
+    artifacts: { input: string; record: string; output: string };
+    snapshot: {
+      phase: string;
+      git?: { validatedHead?: string };
+      activeExecution?: unknown;
+      lastExecution?: { ticketId: string };
+    };
+  };
+  expect(report).toMatchObject({
+    status: "accepted",
+    ticketId: "03-ship-widget",
+    snapshot: {
+      phase: "implementing",
+      git: { validatedHead: report.acceptedCommit },
+      lastExecution: { ticketId: "03-ship-widget" },
+    },
+  });
+  expect(report.snapshot.activeExecution).toBeUndefined();
+  expect(await readFile(report.artifacts.input, "utf8")).toContain(
+    "Ship widget",
+  );
+  expect(await readFile(promptPath, "utf8")).toContain(
+    `$implement "${report.artifacts.input}"`,
+  );
+  expect(
+    JSON.parse(await readFile(report.artifacts.output, "utf8")),
+  ).toMatchObject({
+    status: "completed",
+    ticketId: "03-ship-widget",
+    commit: report.acceptedCommit,
+  });
+  expect(
+    JSON.parse(await readFile(report.artifacts.record, "utf8")),
+  ).toMatchObject({
+    status: "accepted",
+    cleanup: { status: "closed" },
+    herdr: { paneId: "fake:worker" },
+  });
+  expect(
+    await gitOutput(prepared.featureWorktree, ["log", "-1", "--format=%s"]),
+  ).toBe("worker implementation");
+  const historyEvents = (
+    await run(executable, [
+      "history",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--json",
+    ])
+  ).stdout;
+  expect(
+    JSON.parse(historyEvents).map((event: { type: string }) => event.type),
+  ).toEqual([
+    "run.created",
+    "git.preparation.started",
+    "git.worktree.prepared",
+    "worker.attempt.prepared",
+    "worker.attempt.started",
+    "worker.attempt.accepted",
+  ]);
 });
 
 async function createExplicitRun(

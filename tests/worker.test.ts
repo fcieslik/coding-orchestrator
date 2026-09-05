@@ -16,7 +16,7 @@ const execution: LogicalWorkerExecution = {
   skill: "implement",
   input:
     "/repo/.orchestrator/runs/run_1/workers/T01/attempt-01/input/ticket.md",
-  runId: "run_1",
+  runId: "run_20260904T120000Z_012345abcdef",
   ticketId: "T01",
   worktree: "/repo/.worktrees/feature",
   resultPath:
@@ -43,7 +43,7 @@ test("renderers keep logical execution distinct and use exact agent syntax", () 
       "",
       "Orchestration contract:",
       "",
-      "- Run: run_1",
+      "- Run: run_20260904T120000Z_012345abcdef",
       "- Ticket: T01",
       '- Worktree: "/repo/.worktrees/feature"',
       '- Write the structured execution result to: "/repo/.orchestrator/runs/run_1/workers/T01/attempt-01/output/result.json"',

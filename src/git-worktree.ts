@@ -78,6 +78,11 @@ export interface ValidateCheckpointOptions {
   runId: string;
   commit: string;
   dependencies?: RunDependencies;
+  finalization?: {
+    historyEventType: string;
+    data?: Record<string, unknown>;
+    updateSnapshot?: (snapshot: StateSnapshot) => Record<string, unknown>;
+  };
 }
 
 export interface AcceptedCheckpoint {
@@ -874,6 +879,184 @@ function checkpointFailure(
   return new FlowError(message, exitCode, code, details);
 }
 
+export interface CheckpointInspection {
+  snapshot: StateSnapshot;
+  previousValidatedHead: string;
+  acceptedCommit: string;
+}
+
+/** Inspect a candidate checkpoint without advancing the persisted checkpoint. */
+export async function inspectCheckpoint(
+  options: ValidateCheckpointOptions,
+): Promise<CheckpointInspection> {
+  const target = await resolveTargetRepository(options.repository);
+  const current = await inspectRun(target.path, options.runId);
+  if (!current.audit.synchronized)
+    throw new FlowError(
+      `Workflow run ${options.runId} has an unresolved history audit gap`,
+      4,
+      "AUDIT_GAP",
+      { runId: options.runId, warning: current.audit.warning },
+    );
+  const persisted = gitStateSchema.safeParse(current.snapshot.git);
+  if (!persisted.success || persisted.data.worktreeStatus !== "ready")
+    throw checkpointFailure(
+      `Workflow run ${options.runId} does not have a ready Feature worktree`,
+      "WORKTREE_NOT_READY",
+    );
+  if (!persisted.data.validatedHead)
+    throw checkpointFailure(
+      `Workflow run ${options.runId} has no validated Feature worktree HEAD`,
+      "WORKTREE_NOT_READY",
+    );
+  const gitState = persisted.data;
+  const previousValidatedHead = gitState.validatedHead;
+  if (!previousValidatedHead)
+    throw checkpointFailure(
+      `Workflow run ${options.runId} has no validated Feature worktree HEAD`,
+      "WORKTREE_NOT_READY",
+    );
+  let candidate: string;
+  try {
+    candidate = await resolveCommit(
+      target.path,
+      options.commit,
+      target.objectFormat,
+    );
+  } catch (error) {
+    if (error instanceof FlowError && error.exitCode === 3)
+      throw checkpointFailure(
+        `Checkpoint commit was not found locally or is not a commit: ${options.commit}`,
+        "CHECKPOINT_NOT_FOUND",
+        3,
+        { commit: options.commit },
+      );
+    throw error;
+  }
+  const expectedPath = resolve(gitState.featureWorktree);
+  await assertNoSymlinkComponents(expectedPath);
+  try {
+    const entry = await lstat(expectedPath);
+    if (!entry.isDirectory() || (await realpath(expectedPath)) !== expectedPath)
+      throw checkpointFailure(
+        `Feature worktree path is not canonical: ${expectedPath}`,
+        "WORKTREE_PATH_INVALID",
+      );
+  } catch (error) {
+    if (error instanceof FlowError) throw error;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT")
+      throw checkpointFailure(
+        `Feature worktree was not found: ${expectedPath}`,
+        "FEATURE_WORKTREE_NOT_FOUND",
+        3,
+      );
+    throw error;
+  }
+  const registration = (await listWorktrees(target.path)).find(
+    (entry) => entry.path === expectedPath,
+  );
+  if (!registration)
+    throw checkpointFailure(
+      `Feature worktree registration was not found: ${expectedPath}`,
+      "WORKTREE_REGISTRATION_NOT_FOUND",
+      3,
+    );
+  if (registration.branch !== gitState.featureBranch)
+    throw checkpointFailure(
+      "Feature worktree registration does not match the persisted branch",
+      "GIT_INVARIANT_VIOLATION",
+      4,
+      {
+        expectedBranch: gitState.featureBranch,
+        actualBranch: registration.branch,
+      },
+    );
+  const targetCommonDirectory = await canonicalGitPath(
+    target.path,
+    await runGit(target.path, ["rev-parse", "--git-common-dir"]),
+  );
+  const worktreeCommonDirectory = await canonicalGitPath(
+    expectedPath,
+    await runGit(expectedPath, ["rev-parse", "--git-common-dir"]),
+  );
+  if (targetCommonDirectory !== worktreeCommonDirectory)
+    throw checkpointFailure(
+      "Feature worktree belongs to a different Git repository",
+      "GIT_INVARIANT_VIOLATION",
+    );
+  let branch: string;
+  try {
+    branch = await runGit(expectedPath, [
+      "symbolic-ref",
+      "--quiet",
+      "--short",
+      "HEAD",
+    ]);
+  } catch {
+    throw checkpointFailure(
+      "Feature worktree HEAD is detached",
+      "GIT_INVARIANT_VIOLATION",
+    );
+  }
+  if (branch !== gitState.featureBranch)
+    throw checkpointFailure(
+      "Feature worktree is on the wrong Feature branch",
+      "GIT_INVARIANT_VIOLATION",
+      4,
+      { expectedBranch: gitState.featureBranch, actualBranch: branch },
+    );
+  const branchHead = await resolveCommit(
+    target.path,
+    `refs/heads/${gitState.featureBranch}`,
+    target.objectFormat,
+  );
+  const worktreeHead = await resolveCommit(
+    expectedPath,
+    "HEAD",
+    target.objectFormat,
+  );
+  if (branchHead !== candidate || worktreeHead !== candidate)
+    throw checkpointFailure(
+      "Feature worktree and branch HEAD must match the reported checkpoint",
+      "GIT_INVARIANT_VIOLATION",
+      4,
+      { candidate, branchHead, worktreeHead },
+    );
+  const status = await runGit(expectedPath, [
+    "status",
+    "--porcelain=v1",
+    "--untracked-files=all",
+  ]);
+  if (status.length > 0)
+    throw checkpointFailure(
+      "Feature worktree is not clean",
+      "DIRTY_WORKTREE",
+      4,
+      {
+        status: status.split(/\r?\n/),
+      },
+    );
+  if (candidate === previousValidatedHead)
+    throw checkpointFailure(
+      "Checkpoint commit is equal to the previously accepted checkpoint",
+      "CHECKPOINT_STALE",
+      4,
+      { candidate, previousValidatedHead },
+    );
+  if (!(await isAncestor(target.path, previousValidatedHead, candidate)))
+    throw checkpointFailure(
+      "Checkpoint commit does not descend from the previously accepted checkpoint",
+      "CHECKPOINT_DIVERGED",
+      4,
+      { candidate, previousValidatedHead },
+    );
+  return {
+    snapshot: current.snapshot,
+    previousValidatedHead,
+    acceptedCommit: candidate,
+  };
+}
+
 /** Validate and accept one explicit commit as the next Git checkpoint. */
 export async function validateCheckpoint(
   options: ValidateCheckpointOptions,
@@ -1112,16 +1295,19 @@ export async function validateCheckpoint(
         repository: target.path,
         runId: options.runId,
         event: "checkpoint",
-        historyEventType: "git.checkpoint.accepted",
         data: {
           commit: candidate,
           previousValidatedHead,
           acceptedCommit: candidate,
           validatedHead: candidate,
+          ...(options.finalization?.data ?? {}),
         },
         lock: runLock,
+        historyEventType:
+          options.finalization?.historyEventType ?? "git.checkpoint.accepted",
         updateSnapshot: (snapshot) => ({
           git: { ...snapshot.git!, validatedHead: candidate },
+          ...(options.finalization?.updateSnapshot?.(snapshot) ?? {}),
         }),
       },
       dependencies,

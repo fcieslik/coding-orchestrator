@@ -123,6 +123,62 @@
         "worktreeStatus"
       ],
       "additionalProperties": {}
+    },
+    "activeExecution": {
+      "type": "object",
+      "properties": {
+        "executionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ticketId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attemptId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "executionId",
+        "ticketId",
+        "attemptId",
+        "path"
+      ],
+      "additionalProperties": {}
+    },
+    "lastExecution": {
+      "type": "object",
+      "properties": {
+        "executionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ticketId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attemptId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "executionId",
+        "ticketId",
+        "attemptId",
+        "path"
+      ],
+      "additionalProperties": {}
     }
   },
   "required": [

@@ -8,6 +8,7 @@ import {
   type HerdrObservedState,
   validateChildAgentArguments,
 } from "./herdr.js";
+import { runIdSchema } from "./schema.js";
 import { FlowError } from "./workflow-run.js";
 
 export type WorkerAgentKind = "codex" | "claude-code" | "pi";
@@ -97,7 +98,10 @@ export function validateLogicalWorkerExecution(
   validateIdentifier(execution.skill, "skill");
   if (execution.skill !== "implement")
     throw invalid("Phase 4 worker skill must be implement");
-  validateIdentifier(execution.runId, "runId");
+  if (!runIdSchema.safeParse(execution.runId).success)
+    throw invalid("runId must be a valid Workflow run identifier", {
+      runId: execution.runId,
+    });
   if (!execution.ticketId || !ticketPattern.test(execution.ticketId))
     throw invalid("ticketId must be a single path component");
   validatePath(execution.input, "input");

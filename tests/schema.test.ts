@@ -6,8 +6,10 @@ import { expect, test } from "vitest";
 import {
   generateJsonSchemas,
   orchestrationConfigSchema,
+  executionRecordSchema,
   runEventSchema,
   stateSnapshotSchema,
+  workerResultSchema,
 } from "../src/schema.js";
 
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -105,6 +107,52 @@ test("runtime schema validates additive Git worktree state", () => {
   ).toThrow();
 });
 
+test("execution and Worker result schemas keep their independent version-one contracts", () => {
+  const execution = executionRecordSchema.parse({
+    schemaVersion: 1,
+    executionId: "exec_1",
+    runId: "run_20260904T120000Z_012345abcdef",
+    ticketId: "03-ticket",
+    attemptId: "attempt-01",
+    attempt: 1,
+    status: "accepted",
+    role: "worker",
+    agentProfile: "codex",
+    agentKind: "codex",
+    skill: "implement",
+    ticket: {
+      source: "tickets/03-ticket.md",
+      input: "/repo/.orchestrator/runs/run/input/ticket.md",
+      hash: "a".repeat(64),
+    },
+    worktree: "/repo/.worktrees/feature",
+    artifacts: {
+      directory: "/repo/.orchestrator/runs/run/workers/03-ticket/attempt-01",
+      input: "/repo/.orchestrator/runs/run/input/ticket.md",
+      record: "/repo/.orchestrator/runs/run/execution.json",
+      output: "/repo/.orchestrator/runs/run/output/result.json",
+    },
+    promptHash: "b".repeat(64),
+    timestamps: { preparedAt: timestamp },
+    futureExecutionField: true,
+  });
+  const result = workerResultSchema.parse({
+    schemaVersion: 1,
+    ticketId: "03-ticket",
+    status: "completed",
+    summary: "done",
+    commit: "c".repeat(40),
+    commands: [{ command: "test", status: "passed" }],
+    futureResultField: "kept",
+  });
+
+  expect(execution.futureExecutionField).toBe(true);
+  expect(result.futureResultField).toBe("kept");
+  expect(() =>
+    workerResultSchema.parse({ ...result, schemaVersion: 2 }),
+  ).toThrow();
+});
+
 test("orchestration configuration validates worker contract and bounds", () => {
   expect(
     orchestrationConfigSchema.parse({
@@ -154,4 +202,10 @@ test("committed JSON Schemas match their deterministic runtime sources", async (
   ).resolves.toBe(
     `${JSON.stringify(generated.orchestrationConfig, null, 2)}\n`,
   );
+  await expect(
+    readFile(`${projectRoot}/schemas/execution-record.schema.json`, "utf8"),
+  ).resolves.toBe(`${JSON.stringify(generated.executionRecord, null, 2)}\n`);
+  await expect(
+    readFile(`${projectRoot}/schemas/worker-result.schema.json`, "utf8"),
+  ).resolves.toBe(`${JSON.stringify(generated.workerResult, null, 2)}\n`);
 });
