@@ -40,12 +40,23 @@ export interface HerdrExecutionHandle {
   agentName: string;
   agentKind: "codex";
   cwd: string;
+  /** Arguments passed to the child agent after Herdr's `--` delimiter. */
+  childArguments?: readonly string[];
 }
 
 export interface HerdrAdapterOptions {
   executable?: string;
   runner?: HerdrCommandRunner;
   maxDiagnosticBytes?: number;
+}
+
+export interface HerdrLaunchOptions {
+  callerPaneId: string;
+  cwd: string;
+  agentName: string;
+  agentKind?: "codex";
+  startupTimeoutMs?: number;
+  childArguments?: readonly string[];
 }
 
 export interface HerdrSmokeOptions {
@@ -154,6 +165,33 @@ function protocolError(operation: string, message: string): FlowError {
     "HERDR_PROTOCOL_ERROR",
     { operation, message },
   );
+}
+
+/** Validate an argv vector before it crosses the Herdr process boundary. */
+export function validateChildAgentArguments(
+  arguments_: readonly string[],
+): string[] {
+  if (arguments_.length > 32)
+    throw new FlowError(
+      "Child-agent arguments are limited to 32 values",
+      2,
+      "INVALID_ARGUMENT",
+    );
+  for (const argument of arguments_) {
+    if (
+      argument.length === 0 ||
+      argument.includes("\0") ||
+      /[\r\n]/.test(argument) ||
+      argument === "--" ||
+      /danger-full-access|no-sandbox/i.test(argument)
+    )
+      throw new FlowError(
+        "Child-agent arguments contain an unsafe value",
+        2,
+        "INVALID_ARGUMENT",
+      );
+  }
+  return [...arguments_];
 }
 
 function invocationError(
@@ -381,6 +419,9 @@ export class HerdrAdapter {
     handle: HerdrExecutionHandle,
     timeoutMs = defaultStartupTimeoutMs,
   ): Promise<HerdrObservedState | undefined> {
+    const childArguments = validateChildAgentArguments(
+      handle.childArguments ?? [],
+    );
     const result = await this.invoke(
       "agent start",
       [
@@ -393,6 +434,7 @@ export class HerdrAdapter {
         handle.paneId,
         "--timeout",
         String(timeoutMs),
+        ...(childArguments.length > 0 ? ["--", ...childArguments] : []),
       ],
       timeoutMs,
     );
@@ -427,14 +469,60 @@ export class HerdrAdapter {
 
   /** Create and start one owned agent without inferring either identity. */
   async launch(
+    options: HerdrLaunchOptions,
+  ): Promise<HerdrExecutionHandle>;
+  async launch(
     callerPaneId: string,
     cwd: string,
     agentName: string,
-    agentKind: "codex" = "codex",
-    startupTimeoutMs = defaultStartupTimeoutMs,
+    agentKind?: "codex",
+    startupTimeoutMs?: number,
+    childArguments?: readonly string[],
+  ): Promise<HerdrExecutionHandle>;
+  async launch(
+    callerPaneOrOptions: string | HerdrLaunchOptions,
+    cwdArgument?: string,
+    agentNameArgument?: string,
+    agentKindArgument: "codex" = "codex",
+    startupTimeoutArgument = defaultStartupTimeoutMs,
+    childArgumentsArgument: readonly string[] = [],
   ): Promise<HerdrExecutionHandle> {
-    const paneId = await this.splitSibling(callerPaneId, cwd, startupTimeoutMs);
-    const handle: HerdrExecutionHandle = { paneId, agentName, agentKind, cwd };
+    const options: HerdrLaunchOptions =
+      typeof callerPaneOrOptions === "string"
+        ? {
+            callerPaneId: callerPaneOrOptions,
+            cwd: cwdArgument ?? "",
+            agentName: agentNameArgument ?? "",
+            agentKind: agentKindArgument,
+            startupTimeoutMs: startupTimeoutArgument,
+            childArguments: childArgumentsArgument,
+          }
+        : callerPaneOrOptions;
+    if (!options.callerPaneId || !options.cwd || !options.agentName)
+      throw new FlowError(
+        "Herdr launch requires callerPaneId, cwd, and agentName",
+        2,
+        "INVALID_ARGUMENT",
+      );
+    const agentKind = options.agentKind ?? "codex";
+    const startupTimeoutMs =
+      options.startupTimeoutMs ?? defaultStartupTimeoutMs;
+    const childArguments = options.childArguments ?? [];
+    const checkedChildArguments = validateChildAgentArguments(childArguments);
+    const paneId = await this.splitSibling(
+      options.callerPaneId,
+      options.cwd,
+      startupTimeoutMs,
+    );
+    const handle: HerdrExecutionHandle = {
+      paneId,
+      agentName: options.agentName,
+      agentKind,
+      cwd: options.cwd,
+      ...(checkedChildArguments.length > 0
+        ? { childArguments: checkedChildArguments }
+        : {}),
+    };
     try {
       await this.start(handle, startupTimeoutMs);
     } catch (error) {
