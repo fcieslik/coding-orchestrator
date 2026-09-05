@@ -7,6 +7,7 @@ import {
   validateWorktree,
 } from "./git-worktree.js";
 import { runHerdrSmoke } from "./herdr.js";
+import { setupRepository } from "./setup.js";
 import { createRun, FlowError, inspectRun, selectRun } from "./workflow-run.js";
 
 const arguments_ = process.argv.slice(2);
@@ -23,6 +24,8 @@ const structuredRequest =
   (argument === "herdr" &&
     arguments_[1] === "smoke" &&
     arguments_.includes("--json"));
+const setupStructuredRequest =
+  argument === "setup" && arguments_.includes("--json");
 
 function parseOptions(
   tokens: string[],
@@ -61,6 +64,41 @@ try {
     console.log("Usage: flow [options]");
   } else if (arguments_.length === 1 && argument === "--version") {
     console.log(packageMetadata.version);
+  } else if (argument === "setup" && arguments_.includes("--help")) {
+    console.log("Usage: flow setup [--repo <path>] [--json]");
+    console.log(
+      "Create and validate the repository-local orchestration contract.",
+    );
+    console.log(
+      "Existing policy and documentation are preserved; conflicts fail closed.",
+    );
+  } else if (argument === "setup") {
+    const { flags, values } = parseOptions(
+      arguments_.slice(1),
+      ["--repo"],
+      ["--json"],
+    );
+    const repository = values.get("--repo");
+    const report = await setupRepository(
+      repository === undefined ? {} : { repository },
+    );
+    if (flags.has("--json")) {
+      console.log(JSON.stringify(report));
+    } else {
+      console.log(
+        `Orchestration setup: ${report.created.length > 0 ? "updated" : "already initialized"}`,
+      );
+      console.log(`Repository: ${report.repository}`);
+      for (const path of report.created) console.log(`Created: ${path}`);
+      for (const path of report.preserved) console.log(`Preserved: ${path}`);
+      console.log(
+        `Worker: ${report.config.roles.worker.agent} / ${report.config.roles.worker.skill}`,
+      );
+      console.log(`Timeout: ${report.config.workflow.workerTimeoutSeconds}s`);
+      console.log(
+        `Maximum attempts: ${report.config.workflow.maxWorkerAttempts}`,
+      );
+    }
   } else if (argument === "run" && arguments_[1] === "create") {
     const { values } = parseOptions(arguments_.slice(2), [
       "--repo",
@@ -351,7 +389,7 @@ try {
 } catch (error) {
   if (error instanceof FlowError) {
     console.error(
-      structuredRequest
+      structuredRequest || setupStructuredRequest
         ? JSON.stringify(error.toStructuredError())
         : error.message,
     );

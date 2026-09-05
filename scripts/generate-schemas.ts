@@ -10,6 +10,7 @@ const schemas = generateJsonSchemas();
 const documents = new Map([
   ["state-snapshot.schema.json", schemas.stateSnapshot],
   ["run-event.schema.json", schemas.runEvent],
+  ["orchestration-config.schema.json", schemas.orchestrationConfig],
 ]);
 const checkOnly = process.argv.includes("--check");
 

@@ -5,6 +5,7 @@ import { expect, test } from "vitest";
 
 import {
   generateJsonSchemas,
+  orchestrationConfigSchema,
   runEventSchema,
   stateSnapshotSchema,
 } from "../src/schema.js";
@@ -104,6 +105,41 @@ test("runtime schema validates additive Git worktree state", () => {
   ).toThrow();
 });
 
+test("orchestration configuration validates worker contract and bounds", () => {
+  expect(
+    orchestrationConfigSchema.parse({
+      version: 1,
+      agents: { codex: { kind: "codex" } },
+      roles: { worker: { agent: "codex", skill: "implement" } },
+      workflow: { workerTimeoutSeconds: 1800, maxWorkerAttempts: 2 },
+    }),
+  ).toMatchObject({ version: 1 });
+  expect(() =>
+    orchestrationConfigSchema.parse({
+      version: 2,
+      agents: { codex: { kind: "codex" } },
+      roles: { worker: { agent: "codex", skill: "implement" } },
+      workflow: { workerTimeoutSeconds: 1800, maxWorkerAttempts: 2 },
+    }),
+  ).toThrow();
+  expect(() =>
+    orchestrationConfigSchema.parse({
+      version: 1,
+      agents: { codex: { kind: "claude" } },
+      roles: { worker: { agent: "codex", skill: "implement" } },
+      workflow: { workerTimeoutSeconds: 1800, maxWorkerAttempts: 2 },
+    }),
+  ).toThrow();
+  expect(() =>
+    orchestrationConfigSchema.parse({
+      version: 1,
+      agents: { codex: { kind: "codex", args: ["--danger"] } },
+      roles: { worker: { agent: "codex", skill: "implement" } },
+      workflow: { workerTimeoutSeconds: 1800, maxWorkerAttempts: 2 },
+    }),
+  ).toThrow();
+});
+
 test("committed JSON Schemas match their deterministic runtime sources", async () => {
   const generated = generateJsonSchemas();
 
@@ -113,4 +149,9 @@ test("committed JSON Schemas match their deterministic runtime sources", async (
   await expect(
     readFile(`${projectRoot}/schemas/run-event.schema.json`, "utf8"),
   ).resolves.toBe(`${JSON.stringify(generated.runEvent, null, 2)}\n`);
+  await expect(
+    readFile(`${projectRoot}/schemas/orchestration-config.schema.json`, "utf8"),
+  ).resolves.toBe(
+    `${JSON.stringify(generated.orchestrationConfig, null, 2)}\n`,
+  );
 });

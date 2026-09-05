@@ -55,6 +55,52 @@ const objectIdSchema = z.string().regex(/^[0-9a-f]{40,64}$/);
 
 export const gitWorktreeStatusSchema = z.enum(["planned", "ready", "removed"]);
 
+const agentProfileSchema = z.strictObject({
+  kind: z.literal("codex"),
+});
+
+const agentProfilesSchema = z
+  .record(z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/), agentProfileSchema)
+  .refine((profiles) => Object.keys(profiles).length > 0, {
+    message: "at least one Agent profile is required",
+  });
+
+const workerRoleSchema = z.strictObject({
+  agent: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/),
+  skill: z.literal("implement"),
+});
+
+const rolesSchema = z
+  .strictObject({
+    worker: workerRoleSchema,
+  })
+  .catchall(z.never());
+
+const workflowConfigSchema = z.strictObject({
+  workerTimeoutSeconds: z.int().min(60).max(7_200),
+  maxWorkerAttempts: z.int().min(1).max(10),
+});
+
+export const orchestrationConfigSchema = z
+  .strictObject({
+    version: z.literal(1),
+    agents: agentProfilesSchema,
+    roles: rolesSchema,
+    workflow: workflowConfigSchema,
+  })
+  .superRefine((config, context) => {
+    const profile = config.agents[config.roles.worker.agent];
+    if (!profile) {
+      context.addIssue({
+        code: "custom",
+        path: ["roles", "worker", "agent"],
+        message: `Agent profile does not exist: ${config.roles.worker.agent}`,
+      });
+    }
+  });
+
+export type OrchestrationConfig = z.infer<typeof orchestrationConfigSchema>;
+
 export const gitStateSchema = z.looseObject({
   schemaVersion: z.literal(1),
   runBase: objectIdSchema,
@@ -117,10 +163,14 @@ export function generateJsonSchemas() {
   const runEvent = z.toJSONSchema(runEventSchema, {
     target: "draft-2020-12",
   });
+  const orchestrationConfig = z.toJSONSchema(orchestrationConfigSchema, {
+    target: "draft-2020-12",
+  });
   addCalendarAwareRunId(stateSnapshot);
   addCalendarAwareRunId(runEvent);
   return {
     stateSnapshot,
     runEvent,
+    orchestrationConfig,
   };
 }

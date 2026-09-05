@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "number",
+      "const": 1
+    },
+    "agents": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "const": "codex"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "roles": {
+      "type": "object",
+      "properties": {
+        "worker": {
+          "type": "object",
+          "properties": {
+            "agent": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+            },
+            "skill": {
+              "type": "string",
+              "const": "implement"
+            }
+          },
+          "required": [
+            "agent",
+            "skill"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "worker"
+      ],
+      "additionalProperties": false
+    },
+    "workflow": {
+      "type": "object",
+      "properties": {
+        "workerTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 7200
+        },
+        "maxWorkerAttempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        }
+      },
+      "required": [
+        "workerTimeoutSeconds",
+        "maxWorkerAttempts"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "version",
+    "agents",
+    "roles",
+    "workflow"
+  ],
+  "additionalProperties": false
+}
