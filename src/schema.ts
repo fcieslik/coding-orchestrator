@@ -238,10 +238,19 @@ export const workerResultSchema = z.discriminatedUnion("status", [
   }),
   workerResultCommonSchema.extend({
     status: z.literal("blocked"),
-    blocker: z.looseObject({
-      type: z.string().min(1),
-      decision: z.string().min(1),
-    }),
+    blocker: z
+      .looseObject({
+        type: z.string().min(1),
+        decision: z.string().min(1).optional(),
+        requiredDecision: z.string().min(1).optional(),
+        summary: z.string().min(1).optional(),
+      })
+      .refine(
+        (blocker) =>
+          blocker.decision !== undefined ||
+          blocker.requiredDecision !== undefined,
+        { message: "a smallest required decision is required" },
+      ),
   }),
   workerResultCommonSchema.extend({
     status: z.literal("failed"),

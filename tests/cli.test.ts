@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   lstat,
   chmod,
@@ -1853,6 +1854,7 @@ else process.exit(2);
   const report = JSON.parse(stdout) as {
     status: string;
     ticketId: string;
+    attemptId: string;
     acceptedCommit: string;
     artifacts: { input: string; record: string; output: string };
     snapshot: {
@@ -1895,6 +1897,22 @@ else process.exit(2);
   expect(
     await gitOutput(prepared.featureWorktree, ["log", "-1", "--format=%s"]),
   ).toBe("worker implementation");
+  const reconciled = await run(executable, [
+    "worker",
+    "reconcile",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+    "--attempt",
+    report.attemptId,
+    "--json",
+  ]);
+  expect(JSON.parse(reconciled.stdout)).toMatchObject({
+    status: "accepted",
+    outcome: "accepted",
+    code: "WORKER_ATTEMPT_ACCEPTED",
+  });
   const historyEvents = (
     await run(executable, [
       "history",
@@ -1917,6 +1935,168 @@ else process.exit(2);
   ]);
 });
 
+test("worker reconcile classifies a missing result as conclusive failure", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260906T120000Z_040404040404";
+  await run(executable, ["setup", "--repo", repository]);
+  await createExplicitRun(repository, runId);
+  const prepared = await prepareFeatureWorktree(repository, runId);
+  const attempt = await createReconciliationAttempt(
+    repository,
+    runId,
+    prepared.featureWorktree,
+    "04-missing-result",
+  );
+
+  const result = await run(
+    executable,
+    [
+      "worker",
+      "reconcile",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--attempt",
+      attempt.attemptId,
+      "--json",
+    ],
+    { cwd: repository },
+  )
+    .then((value) => ({ ...value, code: 0 }))
+    .catch((error: unknown) => error as { stdout: string; code: number });
+  const report = JSON.parse(result.stdout);
+  expect(result.code).toBe(1);
+  expect(report).toMatchObject({
+    status: "failed",
+    outcome: "conclusive-failure",
+    code: "WORKER_EXECUTION_FAILED",
+    evidence: { result: "missing", clean: true },
+    snapshot: { phase: "implementing" },
+  });
+  expect(report.snapshot.activeExecution).toBeUndefined();
+  expect(JSON.parse(await readFile(attempt.record, "utf8"))).toMatchObject({
+    status: "failed",
+  });
+});
+
+test("worker reconcile blocks an explicit Worker blocker and preserves its evidence", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260906T120000Z_050505050505";
+  await run(executable, ["setup", "--repo", repository]);
+  await createExplicitRun(repository, runId);
+  const prepared = await prepareFeatureWorktree(repository, runId);
+  const attempt = await createReconciliationAttempt(
+    repository,
+    runId,
+    prepared.featureWorktree,
+    "04-blocked-worker",
+    {
+      schemaVersion: 1,
+      ticketId: "04-blocked-worker",
+      status: "blocked",
+      summary: "A product decision is required.",
+      blocker: { type: "product-decision", decision: "Choose the API shape." },
+    },
+  );
+
+  const result = await run(
+    executable,
+    [
+      "worker",
+      "reconcile",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--attempt",
+      attempt.attemptId,
+      "--json",
+    ],
+    { cwd: repository },
+  )
+    .then((value) => ({ ...value, code: 0 }))
+    .catch((error: unknown) => error as { stdout: string; code: number });
+  const report = JSON.parse(result.stdout);
+  expect(result.code).toBe(4);
+  expect(report).toMatchObject({
+    status: "blocked",
+    outcome: "reconciliation-required",
+    evidence: { result: "blocked", clean: true },
+    snapshot: { phase: "blocked", interruptedPhase: "implementing" },
+  });
+  expect(JSON.parse(await readFile(attempt.output, "utf8"))).toMatchObject({
+    status: "blocked",
+  });
+});
+
+test("worker reconcile treats a failed result with Git effects as ambiguous", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260906T120000Z_060606060606";
+  await run(executable, ["setup", "--repo", repository]);
+  await createExplicitRun(repository, runId);
+  const prepared = await prepareFeatureWorktree(repository, runId);
+  const attempt = await createReconciliationAttempt(
+    repository,
+    runId,
+    prepared.featureWorktree,
+    "04-failed-with-effects",
+    {
+      schemaVersion: 1,
+      ticketId: "04-failed-with-effects",
+      status: "failed",
+      summary: "The worker encountered a technical failure.",
+      diagnostics: { message: "test failure" },
+    },
+  );
+  await writeFile(
+    join(prepared.featureWorktree, "unreconciled.txt"),
+    "effect\n",
+  );
+
+  const result = await run(
+    executable,
+    [
+      "worker",
+      "reconcile",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--attempt",
+      attempt.attemptId,
+      "--json",
+    ],
+    { cwd: repository },
+  )
+    .then((value) => ({ ...value, code: 0 }))
+    .catch((error: unknown) => error as { stdout: string; code: number });
+  const report = JSON.parse(result.stdout);
+  expect(result.code).toBe(4);
+  expect(report).toMatchObject({
+    status: "blocked",
+    outcome: "reconciliation-required",
+    evidence: { result: "failed", clean: false },
+  });
+  expect(
+    await pathExists(join(prepared.featureWorktree, "unreconciled.txt")),
+  ).toBe(true);
+});
+
+test("worker reconcile exposes a non-launching command help contract", async () => {
+  const { stdout, stderr } = await run(
+    executable,
+    ["worker", "reconcile", "--help"],
+    {
+      cwd: outsideInstallationRoot,
+    },
+  );
+  expect(stderr).toBe("");
+  expect(stdout).toContain(
+    "Inspect an existing Worker attempt without prompting or launching an agent.",
+  );
+});
+
 async function createExplicitRun(
   repository: string,
   runId: string,
@@ -1931,6 +2111,77 @@ async function createExplicitRun(
     "--run",
     runId,
   ]);
+}
+
+async function createReconciliationAttempt(
+  repository: string,
+  runId: string,
+  worktree: string,
+  ticketId: string,
+  result?: Record<string, unknown>,
+): Promise<{ attemptId: string; record: string; output: string }> {
+  const attemptId = "attempt-01";
+  const canonicalRepository = await realpath(repository);
+  const directory = join(
+    canonicalRepository,
+    ".orchestrator",
+    "runs",
+    runId,
+    "workers",
+    ticketId,
+    attemptId,
+  );
+  const input = join(directory, "input", "ticket.md");
+  const record = join(directory, "execution.json");
+  const output = join(directory, "output", "result.json");
+  await mkdir(join(directory, "input"), { recursive: true });
+  await mkdir(join(directory, "output"), { recursive: true });
+  const contents = `# ${ticketId}\n`;
+  await writeFile(input, contents);
+  const timestamp = "2026-09-06T12:00:00.000Z";
+  await writeFile(
+    record,
+    `${JSON.stringify({
+      schemaVersion: 1,
+      executionId: `exec_${ticketId}`,
+      runId,
+      ticketId,
+      attemptId,
+      attempt: 1,
+      status: "reconciling",
+      role: "worker",
+      agentProfile: "codex",
+      agentKind: "codex",
+      skill: "implement",
+      ticket: {
+        source: `tickets/${ticketId}.md`,
+        input,
+        hash: createHash("sha256").update(contents).digest("hex"),
+      },
+      worktree,
+      artifacts: { directory, input, record, output },
+      promptHash: "0".repeat(64),
+      timestamps: { preparedAt: timestamp, startedAt: timestamp },
+    })}\n`,
+  );
+  await mutateRun({
+    repository,
+    runId,
+    event: "checkpoint",
+    preserveLifecycle: true,
+    historyEventType: "worker.attempt.prepared",
+    data: { executionId: `exec_${ticketId}`, ticketId, attemptId },
+    updateSnapshot: () => ({
+      activeExecution: {
+        executionId: `exec_${ticketId}`,
+        ticketId,
+        attemptId,
+        path: record,
+      },
+    }),
+  });
+  if (result) await writeFile(output, `${JSON.stringify(result)}\n`);
+  return { attemptId, record, output };
 }
 
 async function prepareFeatureWorktree(

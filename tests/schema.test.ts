@@ -151,6 +151,32 @@ test("execution and Worker result schemas keep their independent version-one con
   expect(() =>
     workerResultSchema.parse({ ...result, schemaVersion: 2 }),
   ).toThrow();
+  expect(
+    workerResultSchema.parse({
+      schemaVersion: 1,
+      ticketId: "03-ticket",
+      status: "blocked",
+      summary: "A decision is required.",
+      blocker: {
+        type: "product",
+        summary: "The requirement is ambiguous.",
+        requiredDecision: "Choose the supported behavior.",
+      },
+      filesChanged: [],
+      notesForNextTask: ["Keep the decision explicit."],
+    }),
+  ).toMatchObject({
+    blocker: { requiredDecision: "Choose the supported behavior." },
+  });
+  expect(() =>
+    workerResultSchema.parse({
+      schemaVersion: 1,
+      ticketId: "03-ticket",
+      status: "blocked",
+      summary: "A decision is required.",
+      blocker: { type: "product" },
+    }),
+  ).toThrow();
 });
 
 test("orchestration configuration validates worker contract and bounds", () => {

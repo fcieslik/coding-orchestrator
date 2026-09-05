@@ -8,7 +8,7 @@ import {
 } from "./git-worktree.js";
 import { runHerdrSmoke } from "./herdr.js";
 import { setupRepository } from "./setup.js";
-import { executeWorker } from "./worker-execution.js";
+import { executeWorker, reconcileWorker } from "./worker-execution.js";
 import { createRun, FlowError, inspectRun, selectRun } from "./workflow-run.js";
 
 const arguments_ = process.argv.slice(2);
@@ -26,7 +26,7 @@ const structuredRequest =
     arguments_[1] === "smoke" &&
     arguments_.includes("--json")) ||
   (argument === "worker" &&
-    arguments_[1] === "execute" &&
+    (arguments_[1] === "execute" || arguments_[1] === "reconcile") &&
     arguments_.includes("--json"));
 const setupStructuredRequest =
   argument === "setup" && arguments_.includes("--json");
@@ -165,6 +165,59 @@ try {
       console.log(`Execution record: ${report.artifacts.record}`);
       console.log(`Worker result: ${report.artifacts.output}`);
     }
+  } else if (
+    argument === "worker" &&
+    arguments_[1] === "reconcile" &&
+    arguments_.includes("--help")
+  ) {
+    console.log(
+      "Usage: flow worker reconcile --run <id> [--ticket <id>] [--attempt <id> | --execution <id>] [--repo <path>] [--json]",
+    );
+    console.log(
+      "Inspect an existing Worker attempt without prompting or launching an agent.",
+    );
+  } else if (argument === "worker" && arguments_[1] === "reconcile") {
+    const { flags, values } = parseOptions(
+      arguments_.slice(2),
+      ["--repo", "--run", "--ticket", "--attempt", "--execution"],
+      ["--json"],
+    );
+    const runId = values.get("--run");
+    if (!runId)
+      throw new FlowError(
+        "Usage: flow worker reconcile --run <id> [--ticket <id>] [--attempt <id> | --execution <id>] [--repo <path>] [--json]",
+        2,
+      );
+    if (values.has("--attempt") && values.has("--execution"))
+      throw new FlowError("Choose either --attempt or --execution", 2);
+    const repository = values.get("--repo");
+    const ticketId = values.get("--ticket");
+    const attemptId = values.get("--attempt");
+    const executionId = values.get("--execution");
+    const report = await reconcileWorker({
+      ...(repository === undefined ? {} : { repository }),
+      runId,
+      ...(ticketId === undefined ? {} : { ticketId }),
+      ...(attemptId === undefined ? {} : { attemptId }),
+      ...(executionId === undefined ? {} : { executionId }),
+    });
+    if (flags.has("--json")) console.log(JSON.stringify(report));
+    else {
+      console.log(`Worker reconciliation: ${report.outcome}`);
+      console.log(`Run: ${report.runId}`);
+      console.log(`Ticket: ${report.ticketId}`);
+      console.log(`Attempt: ${report.attemptId}`);
+      if (report.executionId) console.log(`Execution: ${report.executionId}`);
+      console.log(`Result evidence: ${report.evidence.result}`);
+      if (report.evidence.currentHead)
+        console.log(`Current HEAD: ${report.evidence.currentHead}`);
+      console.log(
+        `Worktree clean: ${report.evidence.clean === true ? "yes" : "no"}`,
+      );
+      console.log(`Cleanup: ${report.cleanup.status}`);
+      if (report.reason) console.log(`Reason: ${report.reason}`);
+    }
+    if (report.exitCode !== 0) process.exitCode = report.exitCode;
   } else if (argument === "status") {
     const { flags, values } = parseOptions(
       arguments_.slice(1),
