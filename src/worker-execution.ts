@@ -27,7 +27,7 @@ import {
   type HerdrExecutionHandle,
   type HerdrObservedState,
 } from "./herdr.js";
-import { launchSkillAwareWorker } from "./worker.js";
+import { launchSkillAwareWorker, renderWorkerPrompt } from "./worker.js";
 import { readOrchestrationConfig } from "./setup.js";
 import {
   executionRecordSchema,
@@ -168,6 +168,8 @@ interface AttemptArtifacts {
   input: string;
   record: string;
   output: string;
+  claim: string;
+  ownership: string;
 }
 
 interface ExecutionRecordData {
@@ -222,6 +224,18 @@ interface ExecutionRecordData {
     error?: string;
   };
   diagnostics?: { output?: string; truncated?: boolean };
+  ownership?: { token: string; fingerprint: string };
+}
+
+interface AttemptOwnership {
+  token: string;
+  fingerprint: string;
+}
+
+interface AttemptClaim {
+  pid: number;
+  token: string;
+  acquiredAt: string;
 }
 
 function executionError(
@@ -239,6 +253,142 @@ function isNodeError(error: unknown, code: string): boolean {
     "code" in error &&
     (error as NodeJS.ErrnoException).code === code
   );
+}
+
+function stableJson(value: unknown): string {
+  return JSON.stringify(value);
+}
+
+function ownershipFingerprint(record: ExecutionRecordData): string {
+  const immutable = {
+    executionId: record.executionId,
+    runId: record.runId,
+    ticketId: record.ticketId,
+    attemptId: record.attemptId,
+    attempt: record.attempt,
+    role: record.role,
+    agentProfile: record.agentProfile,
+    agentKind: record.agentKind,
+    skill: record.skill,
+    ticket: record.ticket,
+    worktree: record.worktree,
+    artifacts: record.artifacts,
+    retry: record.retry,
+  };
+  return createHash("sha256")
+    .update(stableJson(immutable), "utf8")
+    .digest("hex");
+}
+
+function boundedDiagnosticOutput(
+  output: string,
+  prompt?: string,
+): {
+  output: string;
+  truncated: boolean;
+} {
+  const redacted = prompt
+    ? output.split(prompt).join("[prompt omitted]")
+    : output;
+  const bytes = Buffer.from(redacted, "utf8");
+  const truncated = bytes.byteLength > maxDiagnosticBytes;
+  return {
+    output: (truncated ? bytes.subarray(-maxDiagnosticBytes) : bytes).toString(
+      "utf8",
+    ),
+    truncated,
+  };
+}
+
+async function writeOwnership(path: string, ownership: AttemptOwnership) {
+  await atomicWrite(path, `${JSON.stringify(ownership)}\n`);
+}
+
+async function readOwnership(
+  path: string,
+): Promise<AttemptOwnership | undefined> {
+  try {
+    await assertNoSymlinkComponents(path);
+    const entry = await lstat(path);
+    if (!entry.isFile() || entry.isSymbolicLink()) return undefined;
+    const value: unknown = JSON.parse(await readFile(path, "utf8"));
+    if (!value || typeof value !== "object") return undefined;
+    const token = (value as Record<string, unknown>).token;
+    const fingerprint = (value as Record<string, unknown>).fingerprint;
+    return typeof token === "string" && typeof fingerprint === "string"
+      ? { token, fingerprint }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function acquireAttemptClaim(path: string): Promise<AttemptClaim> {
+  await assertNoSymlinkComponents(dirname(path));
+  await assertNoSymlinkComponents(path);
+  const claim: AttemptClaim = {
+    pid: process.pid,
+    token: randomUUID(),
+    acquiredAt: new Date().toISOString(),
+  };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const handle = await open(path, "wx", 0o600);
+      await handle.writeFile(`${JSON.stringify(claim)}\n`, "utf8");
+      await handle.sync();
+      await handle.close();
+      return claim;
+    } catch (error) {
+      if (!isNodeError(error, "EEXIST")) throw error;
+      let owner: AttemptClaim | undefined;
+      try {
+        owner = JSON.parse(await readFile(path, "utf8")) as AttemptClaim;
+      } catch {
+        throw executionError(
+          "Worker reconciliation claim is invalid; manual recovery is required",
+          "RECONCILIATION_CLAIM_INVALID",
+          4,
+        );
+      }
+      if (!owner || typeof owner.pid !== "number")
+        throw executionError(
+          "Worker reconciliation claim is invalid; manual recovery is required",
+          "RECONCILIATION_CLAIM_INVALID",
+          4,
+        );
+      let alive = true;
+      try {
+        process.kill(owner.pid, 0);
+      } catch (probeError) {
+        alive = (probeError as NodeJS.ErrnoException).code !== "ESRCH";
+      }
+      if (alive)
+        throw executionError(
+          "Worker attempt is already being reconciled",
+          "LOCK_CONTENTION",
+          5,
+          { owner: { pid: owner.pid, acquiredAt: owner.acquiredAt } },
+        );
+      await rm(path, { force: true });
+    }
+  }
+  throw executionError(
+    "Worker reconciliation claim could not be acquired",
+    "LOCK_CONTENTION",
+    5,
+  );
+}
+
+async function releaseAttemptClaim(
+  path: string,
+  claim: AttemptClaim,
+): Promise<void> {
+  try {
+    const persisted = JSON.parse(await readFile(path, "utf8")) as AttemptClaim;
+    if (persisted.token === claim.token) await rm(path, { force: true });
+  } catch {
+    // A crashed or externally removed claim must not alter durable attempt evidence.
+  }
 }
 
 async function assertNoSymlinkComponents(path: string): Promise<void> {
@@ -407,14 +557,120 @@ async function nextAttempt(
       input: resolve(inputDirectory, "ticket.md"),
       record: resolve(directory, "execution.json"),
       output: resolve(outputDirectory, "result.json"),
+      claim: resolve(directory, ".reconcile.lock"),
+      ownership: resolve(directory, "ownership.json"),
     },
   };
+}
+
+async function findRecoverablePreparedAttempt(
+  repository: string,
+  runId: string,
+  ticket: TicketInput,
+): Promise<
+  | {
+      number: number;
+      id: string;
+      artifacts: AttemptArtifacts;
+      execution: ExecutionRecord;
+    }
+  | undefined
+> {
+  const ticketDirectory = resolve(
+    repository,
+    ".orchestrator",
+    "runs",
+    runId,
+    "workers",
+    ticket.id,
+  );
+  let entries;
+  try {
+    await assertNoSymlinkComponents(ticketDirectory);
+    entries = await readdir(ticketDirectory, { withFileTypes: true });
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) return undefined;
+    throw error;
+  }
+  const candidates = entries
+    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+    .map((entry) => {
+      const match = attemptPattern.exec(entry.name);
+      return match ? { id: entry.name, number: Number(match[1]) } : undefined;
+    })
+    .filter(
+      (entry): entry is { id: string; number: number } => entry !== undefined,
+    )
+    .sort((a, b) => b.number - a.number);
+  for (const candidate of candidates) {
+    const artifacts = attemptArtifacts(
+      repository,
+      runId,
+      ticket.id,
+      candidate.id,
+    );
+    const recordRead = await readExecutionRecord(artifacts.record);
+    const record = recordRead.record;
+    if (
+      record?.status !== "prepared" ||
+      record.runId !== runId ||
+      record.ticketId !== ticket.id ||
+      record.ticket.input !== artifacts.input ||
+      record.ticket.hash !== ticket.hash
+    )
+      continue;
+    try {
+      await assertNoSymlinkComponents(artifacts.input);
+      const input = await readFile(artifacts.input, "utf8");
+      if (
+        createHash("sha256").update(input, "utf8").digest("hex") !== ticket.hash
+      )
+        continue;
+      return { ...candidate, artifacts, execution: record };
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
 }
 
 async function writeExecution(
   recordPath: string,
   record: ExecutionRecordData | ExecutionRecord,
 ): Promise<void> {
+  if (record.ownership !== undefined) {
+    const existing = await readFile(recordPath, "utf8").catch(
+      (error: unknown) => {
+        if (isNodeError(error, "ENOENT")) return undefined;
+        throw error;
+      },
+    );
+    if (existing !== undefined) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(existing);
+      } catch {
+        throw executionError(
+          "Execution record was replaced before update",
+          "UNTRUSTED_ARTIFACT",
+          4,
+        );
+      }
+      const prior = executionRecordSchema.safeParse(parsed);
+      if (
+        !prior.success ||
+        prior.data.ownership?.token !== record.ownership.token ||
+        prior.data.ownership?.fingerprint !== record.ownership.fingerprint ||
+        prior.data.ownership?.fingerprint !==
+          ownershipFingerprint(prior.data as ExecutionRecordData)
+      )
+        throw executionError(
+          "Execution record was replaced before update",
+          "UNTRUSTED_ARTIFACT",
+          4,
+        );
+    }
+  }
   const checked = executionRecordSchema.parse(record);
   await atomicWrite(recordPath, `${JSON.stringify(checked, null, 2)}\n`);
   await chmod(recordPath, 0o600);
@@ -653,6 +909,8 @@ function attemptArtifacts(
     input: resolve(inputDirectory, "ticket.md"),
     record: resolve(directory, "execution.json"),
     output: resolve(outputDirectory, "result.json"),
+    claim: resolve(directory, ".reconcile.lock"),
+    ownership: resolve(directory, "ownership.json"),
   };
 }
 
@@ -677,6 +935,130 @@ async function readExecutionRecord(
           : "Execution record could not be read",
     };
   }
+}
+
+async function validateAttemptOwnership(
+  record: ExecutionRecord,
+  artifacts: AttemptArtifacts,
+): Promise<string | undefined> {
+  if (record.ownership === undefined) return undefined;
+  const ownership = await readOwnership(artifacts.ownership);
+  if (
+    ownership === undefined ||
+    ownership.token !== record.ownership.token ||
+    ownership.fingerprint !== record.ownership.fingerprint ||
+    ownership.fingerprint !==
+      ownershipFingerprint(record as ExecutionRecordData)
+  )
+    return "Execution record ownership manifest does not match the attempt";
+  return undefined;
+}
+
+async function validateOutputArea(
+  artifacts: AttemptArtifacts,
+): Promise<string | undefined> {
+  try {
+    await assertNoSymlinkComponents(artifacts.outputDirectory);
+    const entries = await readdir(artifacts.outputDirectory, {
+      withFileTypes: true,
+    });
+    for (const entry of entries) {
+      if (entry.name !== "result.json")
+        return `Unexpected Worker output artifact: ${entry.name}`;
+      if (entry.isSymbolicLink() || !entry.isFile())
+        return "Worker result is not a regular file";
+    }
+    const resultRelative = relative(
+      artifacts.outputDirectory,
+      artifacts.output,
+    );
+    if (resultRelative !== "result.json")
+      return "Worker result destination escaped the exact output directory";
+    return undefined;
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) return undefined;
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+function validatePromptHash(record: ExecutionRecord): string | undefined {
+  if (record.promptDelivery !== "confirmed") return undefined;
+  if (record.promptHash === "0".repeat(64))
+    return "Confirmed Worker prompt is missing its hash";
+  try {
+    const rendered = renderWorkerPrompt({
+      role: "worker",
+      agentProfile: record.agentProfile,
+      agentKind: record.agentKind,
+      skill: record.skill,
+      input: record.ticket.input,
+      runId: record.runId,
+      ticketId: record.ticketId,
+      worktree: record.worktree,
+      resultPath: record.artifacts.output,
+      commitRequired: true,
+    });
+    return rendered.promptHash === record.promptHash
+      ? undefined
+      : "Worker prompt hash does not match the immutable Execution record";
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function assertFinalizationIntegrity(
+  repository: string,
+  runId: string,
+  execution: ExecutionRecordData,
+  artifacts: AttemptArtifacts,
+): Promise<void> {
+  const persisted = await readExecutionRecord(artifacts.record);
+  if (
+    !persisted.record ||
+    persisted.record.executionId !== execution.executionId
+  )
+    throw executionError(
+      "Execution record was replaced before finalization",
+      "UNTRUSTED_ARTIFACT",
+      4,
+    );
+  const ownershipError = await validateAttemptOwnership(
+    persisted.record,
+    artifacts,
+  );
+  const promptError = validatePromptHash(persisted.record);
+  const outputError = await validateOutputArea(artifacts);
+  if (ownershipError || promptError || outputError)
+    throw executionError(
+      ownershipError ??
+        promptError ??
+        outputError ??
+        "Attempt artifact changed",
+      "UNTRUSTED_ARTIFACT",
+      4,
+    );
+  await assertNoSymlinkComponents(artifacts.input);
+  const input = await readFile(artifacts.input, "utf8");
+  const inputHash = createHash("sha256").update(input, "utf8").digest("hex");
+  if (inputHash !== persisted.record.ticket.hash)
+    throw executionError(
+      "Ticket input snapshot changed before finalization",
+      "UNTRUSTED_ARTIFACT",
+      4,
+    );
+  const current = await inspectRun(repository, runId);
+  const reference = current.snapshot.activeExecution;
+  if (
+    !reference ||
+    reference.executionId !== execution.executionId ||
+    reference.attemptId !== execution.attemptId ||
+    resolve(reference.path) !== artifacts.record
+  )
+    throw executionError(
+      "State snapshot no longer owns the active Worker execution",
+      "UNTRUSTED_ARTIFACT",
+      4,
+    );
 }
 
 async function locateAttempt(
@@ -930,7 +1312,7 @@ async function updateAttemptOutcome(
         ...record.timestamps,
         finalizedAt: new Date().toISOString(),
       },
-    });
+    }).catch(() => undefined);
   }
   const current = await inspectRun(repository, runId);
   const event = terminal
@@ -974,14 +1356,12 @@ async function updateAttemptOutcome(
   });
 }
 
-/** Inspect and reconcile one existing Worker attempt without launching or prompting an agent. */
-export async function reconcileWorker(
+async function reconcileWorkerBody(
   options: ReconcileWorkerOptions,
+  repository: string,
+  run: ReadRunResult,
+  located: Awaited<ReturnType<typeof locateAttempt>>,
 ): Promise<WorkerReconciliationReport> {
-  const selected = await selectRun(options.repository, options.runId);
-  const repository = selected.repository;
-  const run = await inspectRun(repository, options.runId);
-  const located = await locateAttempt(repository, options.runId, run, options);
   const { ticketId, attemptId, artifacts } = located;
   const recordRead = await readExecutionRecord(artifacts.record);
   const record = recordRead.record;
@@ -1008,13 +1388,32 @@ export async function reconcileWorker(
     record.ticketId === ticketId &&
     run.snapshot.git !== undefined &&
     resolve(record.worktree) === resolve(run.snapshot.git.featureWorktree) &&
-    (run.snapshot.activeExecution === undefined ||
-      (run.snapshot.activeExecution.executionId === record.executionId &&
+    (record.status === "prepared" ||
+    record.status === "running" ||
+    record.status === "reconciling"
+      ? run.snapshot.activeExecution?.executionId === record.executionId &&
         run.snapshot.activeExecution.ticketId === ticketId &&
         run.snapshot.activeExecution.attemptId === attemptId &&
-        resolve(run.snapshot.activeExecution.path) === artifacts.record));
+        resolve(run.snapshot.activeExecution.path) === artifacts.record
+      : run.snapshot.lastExecution?.executionId === record.executionId &&
+        run.snapshot.lastExecution.ticketId === ticketId &&
+        run.snapshot.lastExecution.attemptId === attemptId &&
+        resolve(run.snapshot.lastExecution.path) === artifacts.record);
   if (!validRecord)
     reason ??= "Execution record does not match the selected attempt";
+
+  if (validRecord && reason === undefined) {
+    reason =
+      (await validateAttemptOwnership(record, artifacts)) ??
+      validatePromptHash(record);
+    if (reason === undefined && record.retry !== undefined) {
+      if (record.retry.inputHash !== record.ticket.hash)
+        reason = "Retry lineage input hash does not match the Ticket snapshot";
+      else if (record.retry.previousAttemptId === record.attemptId)
+        reason = "Retry lineage points to the current attempt";
+    }
+  }
+  if (reason === undefined) reason = await validateOutputArea(artifacts);
 
   if (validRecord) {
     try {
@@ -1113,12 +1512,12 @@ export async function reconcileWorker(
     };
     try {
       const diagnostic = await adapter.read(handle);
-      const boundedDiagnostic = diagnostic.slice(-maxDiagnosticBytes);
+      const boundedDiagnostic = boundedDiagnosticOutput(diagnostic);
       reconciledRecord = {
         ...reconciledRecord,
         diagnostics: {
-          output: boundedDiagnostic,
-          truncated: Buffer.byteLength(diagnostic, "utf8") > maxDiagnosticBytes,
+          output: boundedDiagnostic.output,
+          truncated: boundedDiagnostic.truncated,
         },
       };
       await writeExecution(artifacts.record, reconciledRecord);
@@ -1332,6 +1731,22 @@ export async function reconcileWorker(
   );
 }
 
+/** Inspect and reconcile one existing Worker attempt without launching or prompting an agent. */
+export async function reconcileWorker(
+  options: ReconcileWorkerOptions,
+): Promise<WorkerReconciliationReport> {
+  const selected = await selectRun(options.repository, options.runId);
+  const repository = selected.repository;
+  const run = await inspectRun(repository, options.runId);
+  const located = await locateAttempt(repository, options.runId, run, options);
+  const claim = await acquireAttemptClaim(located.artifacts.claim);
+  try {
+    return await reconcileWorkerBody(options, repository, run, located);
+  } finally {
+    await releaseAttemptClaim(located.artifacts.claim, claim);
+  }
+}
+
 /** Execute one explicitly assigned ticket through a fresh skill-aware worker. */
 export async function executeWorker(
   options: ExecuteWorkerOptions,
@@ -1394,44 +1809,64 @@ export async function executeWorker(
           "EXECUTION_ALREADY_ACTIVE",
           5,
         );
-      attempt = await nextAttempt(repository, options.runId, ticket.id);
-      await atomicWrite(attempt.artifacts.input, ticket.contents, 0o600);
-      execution = {
-        schemaVersion: 1,
-        executionId: `exec_${randomUUID()}`,
-        runId: options.runId,
-        ticketId: ticket.id,
-        attemptId: attempt.id,
-        attempt: attempt.number,
-        status: "prepared",
-        role: "worker",
-        agentProfile: config.roles.worker.agent,
-        agentKind: "codex",
-        skill: config.roles.worker.skill,
-        ticket: {
-          source: ticket.source,
-          input: attempt.artifacts.input,
-          hash: ticket.hash,
-        },
-        worktree: resolve(worktree),
-        artifacts: {
-          directory: attempt.artifacts.directory,
-          input: attempt.artifacts.input,
-          record: attempt.artifacts.record,
-          output: attempt.artifacts.output,
-        },
-        promptHash: "0".repeat(64),
-        ...(options.retryLineage === undefined
-          ? {}
-          : {
-              retry: {
-                ...options.retryLineage,
-                inputHash: ticket.hash,
-              },
-            }),
-        promptDelivery: "not-started" as const,
-        timestamps: { preparedAt: new Date().toISOString() },
-      };
+      const recovered = options.forceNewAttempt
+        ? undefined
+        : await findRecoverablePreparedAttempt(
+            repository,
+            options.runId,
+            ticket,
+          );
+      if (recovered) {
+        attempt = recovered;
+        execution = recovered.execution as ExecutionRecordData;
+      } else {
+        attempt = await nextAttempt(repository, options.runId, ticket.id);
+        await atomicWrite(attempt.artifacts.input, ticket.contents, 0o600);
+        execution = {
+          schemaVersion: 1,
+          executionId: `exec_${randomUUID()}`,
+          runId: options.runId,
+          ticketId: ticket.id,
+          attemptId: attempt.id,
+          attempt: attempt.number,
+          status: "prepared",
+          role: "worker",
+          agentProfile: config.roles.worker.agent,
+          agentKind: "codex",
+          skill: config.roles.worker.skill,
+          ticket: {
+            source: ticket.source,
+            input: attempt.artifacts.input,
+            hash: ticket.hash,
+          },
+          worktree: resolve(worktree),
+          artifacts: {
+            directory: attempt.artifacts.directory,
+            input: attempt.artifacts.input,
+            record: attempt.artifacts.record,
+            output: attempt.artifacts.output,
+          },
+          promptHash: "0".repeat(64),
+          ...(options.retryLineage === undefined
+            ? {}
+            : {
+                retry: {
+                  ...options.retryLineage,
+                  inputHash: ticket.hash,
+                },
+              }),
+          promptDelivery: "not-started" as const,
+          timestamps: { preparedAt: new Date().toISOString() },
+        };
+      }
+      if (execution.ownership === undefined) {
+        const ownership: AttemptOwnership = {
+          token: randomUUID(),
+          fingerprint: ownershipFingerprint(execution),
+        };
+        execution.ownership = ownership;
+        await writeOwnership(attempt.artifacts.ownership, ownership);
+      }
       await writeExecution(attempt.artifacts.record, execution);
       await mutateRun(
         {
@@ -1492,6 +1927,7 @@ export async function executeWorker(
   );
   const adapter = options.adapter ?? new HerdrAdapter({ maxDiagnosticBytes });
   let handle: HerdrExecutionHandle | undefined;
+  const attemptClaim = await acquireAttemptClaim(attempt!.artifacts.claim);
   try {
     const version = await adapter.version();
     execution = {
@@ -1533,6 +1969,19 @@ export async function executeWorker(
       adapter,
       outputDirectory: attempt!.artifacts.outputDirectory,
       settlementTimeoutMs: config.workflow.workerTimeoutSeconds * 1000,
+      onLaunched: async (launchedHandle) => {
+        handle = launchedHandle;
+        execution = {
+          ...execution!,
+          herdr: {
+            callerPaneId,
+            paneId: launchedHandle.paneId,
+            agentName,
+            version,
+          },
+        };
+        await writeExecution(attempt!.artifacts.record, execution);
+      },
     });
     handle = launched.handle;
     execution = {
@@ -1556,11 +2005,15 @@ export async function executeWorker(
     };
     await writeExecution(attempt!.artifacts.record, execution);
     const diagnostic = await adapter.read(launched.handle);
+    const bounded = boundedDiagnosticOutput(
+      diagnostic,
+      launched.rendered.prompt,
+    );
     execution = {
       ...execution,
       diagnostics: {
-        output: diagnostic.slice(-maxDiagnosticBytes),
-        truncated: Buffer.byteLength(diagnostic, "utf8") > maxDiagnosticBytes,
+        output: bounded.output,
+        truncated: bounded.truncated,
       },
     };
     await writeExecution(attempt!.artifacts.record, execution);
@@ -1598,6 +2051,13 @@ export async function executeWorker(
     await adapter.close(launched.handle);
     execution.cleanup = { status: "closed" };
     await writeExecution(attempt!.artifacts.record, execution);
+
+    await assertFinalizationIntegrity(
+      repository,
+      options.runId,
+      execution,
+      attempt!.artifacts,
+    );
 
     const accepted = await validateCheckpoint({
       repository,
@@ -1703,6 +2163,8 @@ export async function executeWorker(
       });
     }
     throw error;
+  } finally {
+    await releaseAttemptClaim(attempt!.artifacts.claim, attemptClaim);
   }
 }
 

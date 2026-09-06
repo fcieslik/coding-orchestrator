@@ -2114,6 +2114,127 @@ test("worker reconcile treats a failed result with Git effects as ambiguous", as
   ).toBe(true);
 });
 
+test("worker reconcile rejects unexpected output artifacts and preserves them", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260906T120000Z_070707070707";
+  await run(executable, ["setup", "--repo", repository]);
+  await createExplicitRun(repository, runId);
+  const prepared = await prepareFeatureWorktree(repository, runId);
+  const attempt = await createReconciliationAttempt(
+    repository,
+    runId,
+    prepared.featureWorktree,
+    "07-output-boundary",
+  );
+  const unexpected = attempt.output.replace("result.json", "partial.tmp");
+  await writeFile(unexpected, "partial\n");
+
+  const result = await run(executable, [
+    "worker",
+    "reconcile",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+    "--attempt",
+    attempt.attemptId,
+    "--json",
+  ])
+    .then((value) => ({ ...value, code: 0 }))
+    .catch((error: unknown) => error as { stdout: string; code: number });
+  const report = JSON.parse(result.stdout);
+  expect(result.code).toBe(4);
+  expect(report).toMatchObject({
+    status: "blocked",
+    evidence: { result: "invalid" },
+  });
+  await expect(readFile(unexpected, "utf8")).resolves.toBe("partial\n");
+});
+
+test("worker reconcile refuses a concurrently claimed attempt", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260906T120000Z_080808080808";
+  await run(executable, ["setup", "--repo", repository]);
+  await createExplicitRun(repository, runId);
+  const prepared = await prepareFeatureWorktree(repository, runId);
+  const attempt = await createReconciliationAttempt(
+    repository,
+    runId,
+    prepared.featureWorktree,
+    "08-claim-contention",
+  );
+  const claim = attempt.record.replace("execution.json", ".reconcile.lock");
+  await writeFile(
+    claim,
+    JSON.stringify({
+      pid: process.pid,
+      token: "held",
+      acquiredAt: new Date().toISOString(),
+    }),
+  );
+
+  await expect(
+    run(executable, [
+      "worker",
+      "reconcile",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--attempt",
+      attempt.attemptId,
+      "--json",
+    ]),
+  ).rejects.toMatchObject({ code: 5, stdout: "" });
+});
+
+test("worker reconcile blocks a replaced Execution record", async () => {
+  const repository = await createCommittedTargetRepository();
+  const runId = "run_20260906T120000Z_090909090909";
+  await run(executable, ["setup", "--repo", repository]);
+  await createExplicitRun(repository, runId);
+  const prepared = await prepareFeatureWorktree(repository, runId);
+  const attempt = await createReconciliationAttempt(
+    repository,
+    runId,
+    prepared.featureWorktree,
+    "09-record-ownership",
+  );
+  const recordValue = JSON.parse(await readFile(attempt.record, "utf8"));
+  recordValue.ownership = {
+    token: "test-owner",
+    fingerprint: "0".repeat(64),
+  };
+  await writeFile(attempt.record, `${JSON.stringify(recordValue)}\n`);
+  await writeFile(
+    attempt.record.replace("execution.json", "ownership.json"),
+    `${JSON.stringify(recordValue.ownership)}\n`,
+  );
+
+  const result = await run(executable, [
+    "worker",
+    "reconcile",
+    "--repo",
+    repository,
+    "--run",
+    runId,
+    "--attempt",
+    attempt.attemptId,
+    "--json",
+  ])
+    .then((value) => ({ ...value, code: 0 }))
+    .catch((error: unknown) => error as { stdout: string; code: number });
+  const report = JSON.parse(result.stdout);
+  expect(result.code).toBe(4);
+  expect(report).toMatchObject({
+    status: "blocked",
+    evidence: { result: "invalid" },
+  });
+  expect(JSON.parse(await readFile(attempt.record, "utf8"))).toMatchObject({
+    ownership: { token: "test-owner" },
+  });
+});
+
 test("worker reconcile exposes a non-launching command help contract", async () => {
   const { stdout, stderr } = await run(
     executable,

@@ -231,6 +231,12 @@ export const executionRecordSchema = z.looseObject({
       truncated: z.boolean().optional(),
     })
     .optional(),
+  ownership: z
+    .looseObject({
+      token: z.string().min(1),
+      fingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+    })
+    .optional(),
 });
 
 const workerCommandOutcomeSchema = z.looseObject({

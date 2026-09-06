@@ -45,6 +45,8 @@ export interface LaunchWorkerOptions extends Omit<
   runner?: HerdrCommandRunner;
   startupTimeoutMs?: number;
   settlementTimeoutMs?: number;
+  /** Called immediately after Herdr creates the owned pane, before prompt delivery. */
+  onLaunched?: (handle: HerdrExecutionHandle) => void | Promise<void>;
 }
 
 export interface LaunchedWorker {
@@ -237,6 +239,7 @@ export async function launchSkillAwareWorker(
     options.startupTimeoutMs,
     codexWorkerArguments(checked.worktree, outputDirectory),
   );
+  await options.onLaunched?.(handle);
   const startupState = await adapter.prompt(
     handle,
     rendered.prompt,

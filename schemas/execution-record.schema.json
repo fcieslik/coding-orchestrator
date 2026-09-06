@@ -261,6 +261,24 @@
         }
       },
       "additionalProperties": {}
+    },
+    "ownership": {
+      "type": "object",
+      "properties": {
+        "token": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fingerprint": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "token",
+        "fingerprint"
+      ],
+      "additionalProperties": {}
     }
   },
   "required": [
