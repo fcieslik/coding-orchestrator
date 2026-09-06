@@ -1853,6 +1853,7 @@ else process.exit(2);
   );
   const report = JSON.parse(stdout) as {
     status: string;
+    executionId: string;
     ticketId: string;
     attemptId: string;
     acceptedCommit: string;
@@ -1897,6 +1898,36 @@ else process.exit(2);
   expect(
     await gitOutput(prepared.featureWorktree, ["log", "-1", "--format=%s"]),
   ).toBe("worker implementation");
+  const repeated = await run(
+    executable,
+    [
+      "worker",
+      "execute",
+      "--repo",
+      repository,
+      "--run",
+      runId,
+      "--ticket",
+      ticket,
+      "--json",
+    ],
+    {
+      cwd: repository,
+      env: {
+        ...process.env,
+        HERDR_ENV: "1",
+        HERDR_PANE_ID: "caller",
+        HERDR_BIN_PATH: fake,
+        FAKE_STATE: state,
+        FAKE_PROMPT: promptPath,
+      },
+    },
+  );
+  expect(JSON.parse(repeated.stdout)).toMatchObject({
+    status: "accepted",
+    attemptId: report.attemptId,
+    executionId: report.executionId,
+  });
   const reconciled = await run(executable, [
     "worker",
     "reconcile",

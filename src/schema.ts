@@ -173,6 +173,19 @@ const executionTimestampSchema = z.looseObject({
   finalizedAt: utcTimestampSchema.optional(),
 });
 
+const executionRetrySchema = z.looseObject({
+  previousAttemptId: z.string().min(1),
+  previousExecutionId: z.string().min(1).optional(),
+  previousInputHash: z.string().regex(/^[0-9a-f]{64}$/),
+  inputHash: z.string().regex(/^[0-9a-f]{64}$/),
+  refreshed: z.boolean(),
+});
+
+const executionCheckpointSchema = z.looseObject({
+  previousValidatedHead: z.string().regex(/^[0-9a-f]{40,64}$/),
+  acceptedCommit: z.string().regex(/^[0-9a-f]{40,64}$/),
+});
+
 export const executionRecordSchema = z.looseObject({
   schemaVersion: z.literal(1),
   executionId: z.string().min(1),
@@ -193,6 +206,9 @@ export const executionRecordSchema = z.looseObject({
   worktree: z.string().min(1),
   artifacts: executionArtifactSchema,
   promptHash: z.string().regex(/^[0-9a-f]{64}$/),
+  promptDelivery: z.enum(["not-started", "unknown", "confirmed"]).optional(),
+  retry: executionRetrySchema.optional(),
+  checkpoint: executionCheckpointSchema.optional(),
   timestamps: executionTimestampSchema,
   herdr: z
     .looseObject({

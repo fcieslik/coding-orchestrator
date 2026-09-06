@@ -113,6 +113,63 @@
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
     },
+    "promptDelivery": {
+      "type": "string",
+      "enum": [
+        "not-started",
+        "unknown",
+        "confirmed"
+      ]
+    },
+    "retry": {
+      "type": "object",
+      "properties": {
+        "previousAttemptId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "previousExecutionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "previousInputHash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "inputHash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "refreshed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "previousAttemptId",
+        "previousInputHash",
+        "inputHash",
+        "refreshed"
+      ],
+      "additionalProperties": {}
+    },
+    "checkpoint": {
+      "type": "object",
+      "properties": {
+        "previousValidatedHead": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40,64}$"
+        },
+        "acceptedCommit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40,64}$"
+        }
+      },
+      "required": [
+        "previousValidatedHead",
+        "acceptedCommit"
+      ],
+      "additionalProperties": {}
+    },
     "timestamps": {
       "type": "object",
       "properties": {

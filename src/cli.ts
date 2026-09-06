@@ -8,8 +8,18 @@ import {
 } from "./git-worktree.js";
 import { runHerdrSmoke } from "./herdr.js";
 import { setupRepository } from "./setup.js";
-import { executeWorker, reconcileWorker } from "./worker-execution.js";
-import { createRun, FlowError, inspectRun, selectRun } from "./workflow-run.js";
+import {
+  executeWorker,
+  reconcileWorker,
+  retryWorker,
+} from "./worker-execution.js";
+import {
+  createRun,
+  FlowError,
+  inspectRun,
+  mutateRun,
+  selectRun,
+} from "./workflow-run.js";
 
 const arguments_ = process.argv.slice(2);
 const [argument] = arguments_;
@@ -22,11 +32,16 @@ const structuredRequest =
         arguments_[1] === "cleanup")) ||
     (argument === "checkpoint" && arguments_[1] === "validate")) &&
     arguments_.includes("--json")) ||
+  (argument === "run" &&
+    arguments_[1] === "resume" &&
+    arguments_.includes("--json")) ||
   (argument === "herdr" &&
     arguments_[1] === "smoke" &&
     arguments_.includes("--json")) ||
   (argument === "worker" &&
-    (arguments_[1] === "execute" || arguments_[1] === "reconcile") &&
+    (arguments_[1] === "execute" ||
+      arguments_[1] === "reconcile" ||
+      arguments_[1] === "retry") &&
     arguments_.includes("--json"));
 const setupStructuredRequest =
   argument === "setup" && arguments_.includes("--json");
@@ -124,6 +139,29 @@ try {
       ...(runId === undefined ? {} : { runId }),
     });
     console.log(`Created run ${createdRunId}`);
+  } else if (argument === "run" && arguments_[1] === "resume") {
+    const { flags, values } = parseOptions(
+      arguments_.slice(2),
+      ["--repo", "--run"],
+      ["--json"],
+    );
+    const runId = values.get("--run");
+    if (!runId)
+      throw new FlowError(
+        "Usage: flow run resume --run <id> [--repo <path>] [--json]",
+        2,
+      );
+    const repository = values.get("--repo");
+    const resumed = await mutateRun({
+      runId,
+      event: "resume",
+      ...(repository === undefined ? {} : { repository }),
+    });
+    if (flags.has("--json")) console.log(JSON.stringify(resumed.snapshot));
+    else {
+      console.log(`Run: ${resumed.snapshot.runId}`);
+      console.log(`Phase: ${resumed.snapshot.phase}`);
+    }
   } else if (
     argument === "worker" &&
     arguments_[1] === "execute" &&
@@ -215,9 +253,71 @@ try {
         `Worktree clean: ${report.evidence.clean === true ? "yes" : "no"}`,
       );
       console.log(`Cleanup: ${report.cleanup.status}`);
+      if (report.retry) {
+        console.log(
+          `Retry: ${report.retry.eligible ? "eligible" : "not eligible"} (${report.retry.attempt}/${report.retry.maxAttempts})`,
+        );
+        if (report.retry.reason)
+          console.log(`Retry reason: ${report.retry.reason}`);
+      }
       if (report.reason) console.log(`Reason: ${report.reason}`);
     }
     if (report.exitCode !== 0) process.exitCode = report.exitCode;
+  } else if (
+    argument === "worker" &&
+    arguments_[1] === "retry" &&
+    arguments_.includes("--help")
+  ) {
+    console.log(
+      "Usage: flow worker retry --run <id> [--ticket <file>] [--attempt <id> | --execution <id>] [--refresh-ticket <file>] [--repo <path>] [--json]",
+    );
+    console.log(
+      "Reconcile the prior Worker attempt, then explicitly launch one bounded fresh retry.",
+    );
+  } else if (argument === "worker" && arguments_[1] === "retry") {
+    const { flags, values } = parseOptions(
+      arguments_.slice(2),
+      [
+        "--repo",
+        "--run",
+        "--ticket",
+        "--attempt",
+        "--execution",
+        "--refresh-ticket",
+      ],
+      ["--json"],
+    );
+    const runId = values.get("--run");
+    if (!runId)
+      throw new FlowError(
+        "Usage: flow worker retry --run <id> [--ticket <file>] [--attempt <id> | --execution <id>] [--refresh-ticket <file>] [--repo <path>] [--json]",
+        2,
+      );
+    if (values.has("--attempt") && values.has("--execution"))
+      throw new FlowError("Choose either --attempt or --execution", 2);
+    const retryOptions = { runId } as Parameters<typeof retryWorker>[0];
+    const repository = values.get("--repo");
+    const ticket = values.get("--ticket");
+    const attemptId = values.get("--attempt");
+    const executionId = values.get("--execution");
+    const refreshTicket = values.get("--refresh-ticket");
+    if (repository !== undefined) retryOptions.repository = repository;
+    if (ticket !== undefined) retryOptions.ticket = ticket;
+    if (attemptId !== undefined) retryOptions.attemptId = attemptId;
+    if (executionId !== undefined) retryOptions.executionId = executionId;
+    if (refreshTicket !== undefined) retryOptions.refreshTicket = refreshTicket;
+    const report = await retryWorker(retryOptions);
+    if (flags.has("--json")) console.log(JSON.stringify(report));
+    else {
+      console.log(`Worker retry: ${report.status}`);
+      console.log(`Run: ${report.runId}`);
+      console.log(`Ticket: ${report.ticketId}`);
+      console.log(`Attempt: ${report.attemptId}`);
+      console.log(`Execution: ${report.executionId}`);
+      console.log(`Accepted Git checkpoint: ${report.acceptedCommit}`);
+      console.log(`Execution record: ${report.artifacts.record}`);
+      console.log(`Worker result: ${report.artifacts.output}`);
+    }
   } else if (argument === "status") {
     const { flags, values } = parseOptions(
       arguments_.slice(1),

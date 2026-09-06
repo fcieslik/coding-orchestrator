@@ -62,6 +62,16 @@ export interface ExecuteWorkerOptions {
   ticket: string;
   dependencies?: RunDependencies;
   adapter?: HerdrAdapter;
+  /** Internal retry seam: use a previously persisted immutable input. */
+  ticketSnapshot?: TicketInput;
+  retryLineage?: {
+    previousAttemptId: string;
+    previousExecutionId?: string;
+    previousInputHash: string;
+    refreshed: boolean;
+  };
+  forceNewAttempt?: boolean;
+  automaticRetry?: boolean;
 }
 
 export interface WorkerExecutionReport {
@@ -88,6 +98,17 @@ export interface ReconcileWorkerOptions {
   ticketId?: string;
   attemptId?: string;
   executionId?: string;
+  dependencies?: RunDependencies;
+  adapter?: HerdrAdapter;
+}
+
+export interface RetryWorkerOptions {
+  repository?: string;
+  runId: string;
+  ticket?: string;
+  attemptId?: string;
+  executionId?: string;
+  refreshTicket?: string;
   dependencies?: RunDependencies;
   adapter?: HerdrAdapter;
 }
@@ -123,6 +144,12 @@ export interface WorkerReconciliationReport {
     input: string;
     record: string;
     output: string;
+  };
+  retry?: {
+    eligible: boolean;
+    attempt: number;
+    maxAttempts: number;
+    reason?: string;
   };
   snapshot: StateSnapshot;
 }
@@ -165,6 +192,18 @@ interface ExecutionRecordData {
     output: string;
   };
   promptHash: string;
+  promptDelivery?: "not-started" | "unknown" | "confirmed";
+  retry?: {
+    previousAttemptId: string;
+    previousExecutionId?: string;
+    previousInputHash: string;
+    inputHash: string;
+    refreshed: boolean;
+  };
+  checkpoint?: {
+    previousValidatedHead: string;
+    acceptedCommit: string;
+  };
   timestamps: {
     preparedAt: string;
     startedAt?: string;
@@ -396,6 +435,38 @@ async function git(repository: string, args: string[]): Promise<string> {
       4,
     );
   }
+}
+
+async function hasNoWorkerEffects(
+  worktree: string,
+  baseline: string | undefined,
+  resultPath: string,
+): Promise<boolean> {
+  if (!baseline) return false;
+  try {
+    const currentHead = await git(worktree, ["rev-parse", "HEAD"]);
+    if (currentHead !== baseline) return false;
+    const dirty = await git(worktree, [
+      "status",
+      "--porcelain=v1",
+      "--untracked-files=all",
+    ]);
+    if (dirty.length > 0) return false;
+    const resultEntry = await lstat(resultPath).catch((error: unknown) => {
+      if (isNodeError(error, "ENOENT")) return undefined;
+      throw error;
+    });
+    return resultEntry === undefined;
+  } catch {
+    return false;
+  }
+}
+
+function promptWasAttempted(error: unknown): boolean {
+  if (!(error instanceof FlowError)) return true;
+  const operation = error.details?.operation;
+  if (typeof operation !== "string") return true;
+  return operation === "agent prompt";
 }
 
 async function mutateExecutionState(
@@ -759,6 +830,7 @@ function reportFor(
     executionId?: string;
     result?: WorkerResult;
     reason?: string;
+    retry?: WorkerReconciliationReport["retry"];
   } = {},
 ): WorkerReconciliationReport {
   const outcome =
@@ -785,6 +857,7 @@ function reportFor(
       : { executionId: extras.executionId }),
     ...(extras.result === undefined ? {} : { result: extras.result }),
     ...(extras.reason === undefined ? {} : { reason: extras.reason }),
+    ...(extras.retry === undefined ? {} : { retry: extras.retry }),
     evidence,
     cleanup,
     artifacts: {
@@ -794,6 +867,46 @@ function reportFor(
       output: artifacts.output,
     },
     snapshot: run.snapshot,
+  };
+}
+
+async function acceptedExecutionReport(
+  repository: string,
+  runId: string,
+  reference: NonNullable<StateSnapshot["lastExecution"]>,
+  dependencies: RunDependencies,
+  adapter?: HerdrAdapter,
+): Promise<WorkerExecutionReport | undefined> {
+  const recordRead = await readExecutionRecord(reference.path);
+  if (recordRead.record?.status !== "accepted") return undefined;
+  const reconciled = await reconcileWorker({
+    repository,
+    runId,
+    ticketId: reference.ticketId,
+    attemptId: reference.attemptId,
+    executionId: reference.executionId,
+    dependencies,
+    ...(adapter === undefined ? {} : { adapter }),
+  });
+  if (
+    reconciled.status !== "accepted" ||
+    reconciled.result?.status !== "completed"
+  )
+    return undefined;
+  return {
+    status: "accepted",
+    executionId: reconciled.executionId ?? reference.executionId,
+    runId,
+    ticketId: reconciled.ticketId,
+    attemptId: reconciled.attemptId,
+    result: reconciled.result,
+    artifacts: reconciled.artifacts,
+    previousValidatedHead:
+      recordRead.record?.checkpoint?.previousValidatedHead ??
+      reconciled.evidence.baselineHead ??
+      reconciled.result.commit,
+    acceptedCommit: reconciled.result.commit,
+    snapshot: reconciled.snapshot,
   };
 }
 
@@ -1186,6 +1299,13 @@ export async function reconcileWorker(
     options.dependencies ?? {},
     terminal,
   );
+  const retryEligible =
+    status === "failed" &&
+    !terminal &&
+    clean === true &&
+    currentHead === baseline &&
+    (evidence.result === "missing" || evidence.result === "failed") &&
+    !cleanupFailed;
   return reportFor(
     status,
     finalRun,
@@ -1200,6 +1320,14 @@ export async function reconcileWorker(
         : { executionId: reconciledRecord.executionId }),
       ...(result === undefined ? {} : { result }),
       reason: finalReason,
+      retry: {
+        eligible: retryEligible,
+        attempt: attemptNumber(attemptId),
+        maxAttempts: currentConfig.config.workflow.maxWorkerAttempts,
+        ...(retryEligible
+          ? {}
+          : { reason: terminal ? "attempt budget exhausted" : finalReason }),
+      },
     },
   );
 }
@@ -1220,7 +1348,21 @@ export async function executeWorker(
       "INVALID_CONFIGURATION",
       2,
     );
-  const ticket = await resolveTicket(repository, options.ticket);
+  const ticket =
+    options.ticketSnapshot ?? (await resolveTicket(repository, options.ticket));
+  if (
+    !options.forceNewAttempt &&
+    run.snapshot.lastExecution?.ticketId === ticket.id
+  ) {
+    const accepted = await acceptedExecutionReport(
+      repository,
+      options.runId,
+      run.snapshot.lastExecution,
+      options.dependencies ?? {},
+      options.adapter,
+    );
+    if (accepted) return accepted;
+  }
   if (run.snapshot.activeExecution)
     throw executionError(
       `Workflow run ${options.runId} already has an active Worker execution: ${run.snapshot.activeExecution.executionId}`,
@@ -1230,73 +1372,111 @@ export async function executeWorker(
 
   const dependencies = options.dependencies ?? {};
   const lock = await acquireRunLock(repository, options.runId, dependencies);
-  let attempt: Awaited<ReturnType<typeof nextAttempt>>;
-  let execution: ExecutionRecordData;
+  let attempt!: Awaited<ReturnType<typeof nextAttempt>>;
+  let execution!: ExecutionRecordData;
+  let existingAcceptedReference: StateSnapshot["lastExecution"];
   try {
     const current = await inspectRun(repository, options.runId);
-    if (current.snapshot.activeExecution)
-      throw executionError(
-        `Workflow run ${options.runId} already has an active Worker execution: ${current.snapshot.activeExecution.executionId}`,
-        "EXECUTION_ALREADY_ACTIVE",
-        5,
+    if (
+      !options.forceNewAttempt &&
+      current.snapshot.lastExecution?.ticketId === ticket.id
+    ) {
+      const existing = await readExecutionRecord(
+        current.snapshot.lastExecution.path,
       );
-    attempt = await nextAttempt(repository, options.runId, ticket.id);
-    await atomicWrite(attempt.artifacts.input, ticket.contents, 0o600);
-    execution = {
-      schemaVersion: 1,
-      executionId: `exec_${randomUUID()}`,
-      runId: options.runId,
-      ticketId: ticket.id,
-      attemptId: attempt.id,
-      attempt: attempt.number,
-      status: "prepared",
-      role: "worker",
-      agentProfile: config.roles.worker.agent,
-      agentKind: "codex",
-      skill: config.roles.worker.skill,
-      ticket: {
-        source: ticket.source,
-        input: attempt.artifacts.input,
-        hash: ticket.hash,
-      },
-      worktree: resolve(worktree),
-      artifacts: {
-        directory: attempt.artifacts.directory,
-        input: attempt.artifacts.input,
-        record: attempt.artifacts.record,
-        output: attempt.artifacts.output,
-      },
-      promptHash: "0".repeat(64),
-      timestamps: { preparedAt: new Date().toISOString() },
-    };
-    await writeExecution(attempt.artifacts.record, execution);
-    await mutateRun(
-      {
-        repository,
+      if (existing.record?.status === "accepted")
+        existingAcceptedReference = current.snapshot.lastExecution;
+    }
+    if (existingAcceptedReference === undefined) {
+      if (current.snapshot.activeExecution)
+        throw executionError(
+          `Workflow run ${options.runId} already has an active Worker execution: ${current.snapshot.activeExecution.executionId}`,
+          "EXECUTION_ALREADY_ACTIVE",
+          5,
+        );
+      attempt = await nextAttempt(repository, options.runId, ticket.id);
+      await atomicWrite(attempt.artifacts.input, ticket.contents, 0o600);
+      execution = {
+        schemaVersion: 1,
+        executionId: `exec_${randomUUID()}`,
         runId: options.runId,
-        event: "checkpoint",
-        preserveLifecycle: true,
-        historyEventType: "worker.attempt.prepared",
-        data: {
-          executionId: execution.executionId,
-          ticketId: ticket.id,
-          attemptId: attempt.id,
-          inputHash: ticket.hash,
+        ticketId: ticket.id,
+        attemptId: attempt.id,
+        attempt: attempt.number,
+        status: "prepared",
+        role: "worker",
+        agentProfile: config.roles.worker.agent,
+        agentKind: "codex",
+        skill: config.roles.worker.skill,
+        ticket: {
+          source: ticket.source,
+          input: attempt.artifacts.input,
+          hash: ticket.hash,
         },
-        updateSnapshot: () => ({
-          activeExecution: executionReference(
-            execution.executionId,
-            ticket.id,
-            attempt.id,
-            attempt.artifacts.record,
-          ),
-        }),
-        lock,
-      },
-      dependencies,
-    );
+        worktree: resolve(worktree),
+        artifacts: {
+          directory: attempt.artifacts.directory,
+          input: attempt.artifacts.input,
+          record: attempt.artifacts.record,
+          output: attempt.artifacts.output,
+        },
+        promptHash: "0".repeat(64),
+        ...(options.retryLineage === undefined
+          ? {}
+          : {
+              retry: {
+                ...options.retryLineage,
+                inputHash: ticket.hash,
+              },
+            }),
+        promptDelivery: "not-started" as const,
+        timestamps: { preparedAt: new Date().toISOString() },
+      };
+      await writeExecution(attempt.artifacts.record, execution);
+      await mutateRun(
+        {
+          repository,
+          runId: options.runId,
+          event: "checkpoint",
+          preserveLifecycle: true,
+          historyEventType: "worker.attempt.prepared",
+          data: {
+            executionId: execution.executionId,
+            ticketId: ticket.id,
+            attemptId: attempt.id,
+            inputHash: ticket.hash,
+          },
+          updateSnapshot: () => ({
+            activeExecution: executionReference(
+              execution.executionId,
+              ticket.id,
+              attempt.id,
+              attempt.artifacts.record,
+            ),
+          }),
+          lock,
+        },
+        dependencies,
+      );
+    }
   } finally {
     await releaseRunLock(lock);
+  }
+
+  if (existingAcceptedReference !== undefined) {
+    const accepted = await acceptedExecutionReport(
+      repository,
+      options.runId,
+      existingAcceptedReference,
+      dependencies,
+      options.adapter,
+    );
+    if (accepted) return accepted;
+    throw executionError(
+      "Previously accepted Worker execution could not be revalidated",
+      "UNTRUSTED_ARTIFACT",
+      4,
+    );
   }
 
   const callerPaneId =
@@ -1317,6 +1497,7 @@ export async function executeWorker(
     execution = {
       ...execution!,
       status: "running",
+      promptDelivery: "unknown",
       timestamps: {
         ...execution!.timestamps,
         startedAt: new Date().toISOString(),
@@ -1357,6 +1538,7 @@ export async function executeWorker(
     execution = {
       ...execution!,
       status: "reconciling",
+      promptDelivery: "confirmed",
       promptHash: launched.rendered.promptHash,
       timestamps: {
         ...execution!.timestamps,
@@ -1443,6 +1625,10 @@ export async function executeWorker(
     execution = {
       ...execution,
       status: "accepted",
+      checkpoint: {
+        previousValidatedHead: accepted.previousValidatedHead,
+        acceptedCommit: accepted.acceptedCommit,
+      },
       timestamps: {
         ...execution.timestamps,
         finalizedAt: new Date().toISOString(),
@@ -1476,6 +1662,20 @@ export async function executeWorker(
         };
       }
     }
+    const maxAttempts = (await readOrchestrationConfig(repository)).config
+      .workflow.maxWorkerAttempts;
+    const automaticRetry =
+      options.automaticRetry !== false &&
+      attempt!.number < maxAttempts &&
+      execution!.promptDelivery !== "confirmed" &&
+      !promptWasAttempted(error) &&
+      execution!.cleanup?.status !== "failed" &&
+      (await hasNoWorkerEffects(
+        execution!.worktree,
+        (await inspectRun(repository, options.runId)).snapshot.git
+          ?.validatedHead,
+        attempt!.artifacts.output,
+      ));
     await recordFailure(
       repository,
       options.runId,
@@ -1484,6 +1684,181 @@ export async function executeWorker(
       error,
       dependencies,
     );
+    if (automaticRetry) {
+      return executeWorker({
+        repository,
+        runId: options.runId,
+        ticket: ticket.source,
+        ticketSnapshot: ticket,
+        forceNewAttempt: true,
+        automaticRetry: false,
+        retryLineage: {
+          previousAttemptId: attempt!.id,
+          previousExecutionId: execution!.executionId,
+          previousInputHash: ticket.hash,
+          refreshed: false,
+        },
+        dependencies,
+        ...(options.adapter === undefined ? {} : { adapter: options.adapter }),
+      });
+    }
     throw error;
   }
+}
+
+/** Reconcile the prior attempt and explicitly create one fresh retry attempt. */
+export async function retryWorker(
+  options: RetryWorkerOptions,
+): Promise<WorkerExecutionReport> {
+  const selected = await selectRun(options.repository, options.runId);
+  const repository = selected.repository;
+  const run = await inspectRun(repository, options.runId);
+  let ticketId: string | undefined;
+  if (options.ticket !== undefined) {
+    ticketId = (await resolveTicket(repository, options.ticket)).id;
+  }
+  const located = await locateAttempt(repository, options.runId, run, {
+    runId: options.runId,
+    ...(ticketId === undefined ? {} : { ticketId }),
+    ...(options.attemptId === undefined
+      ? {}
+      : { attemptId: options.attemptId }),
+    ...(options.executionId === undefined
+      ? {}
+      : { executionId: options.executionId }),
+  });
+  const priorRead = await readExecutionRecord(located.artifacts.record);
+  const prior = priorRead.record;
+  if (!prior)
+    throw executionError(
+      priorRead.error ?? "Prior Worker execution record is unavailable",
+      "RETRY_REQUIRES_RECONCILIATION",
+      4,
+    );
+
+  const maxAttempts = (await readOrchestrationConfig(repository)).config
+    .workflow.maxWorkerAttempts;
+  if (run.snapshot.phase !== "implementing") {
+    if (attemptNumber(located.attemptId) >= maxAttempts) {
+      throw executionError(
+        `Worker attempt budget exhausted (${attemptNumber(located.attemptId)}/${maxAttempts})`,
+        "ATTEMPT_BUDGET_EXHAUSTED",
+        4,
+        { attempt: attemptNumber(located.attemptId), maxAttempts },
+      );
+    }
+    throw executionError(
+      `Workflow run ${options.runId} is not ready for Worker retry (${run.snapshot.phase}). Resume a blocked run after resolving its evidence first.`,
+      "RUN_NOT_EXECUTABLE",
+      4,
+      { phase: run.snapshot.phase },
+    );
+  }
+
+  const reconciled = await reconcileWorker({
+    repository,
+    runId: options.runId,
+    ticketId: located.ticketId,
+    attemptId: located.attemptId,
+    executionId: prior.executionId,
+    ...(options.dependencies === undefined
+      ? {}
+      : { dependencies: options.dependencies }),
+    ...(options.adapter === undefined ? {} : { adapter: options.adapter }),
+  });
+  if (
+    reconciled.status === "accepted" &&
+    reconciled.result?.status === "completed"
+  ) {
+    return {
+      status: "accepted",
+      executionId: reconciled.executionId ?? prior.executionId,
+      runId: options.runId,
+      ticketId: located.ticketId,
+      attemptId: located.attemptId,
+      result: reconciled.result,
+      artifacts: reconciled.artifacts,
+      previousValidatedHead:
+        reconciled.evidence.baselineHead ?? reconciled.result.commit,
+      acceptedCommit: reconciled.result.commit,
+      snapshot: reconciled.snapshot,
+    };
+  }
+
+  const number = attemptNumber(located.attemptId);
+  if (number >= maxAttempts) {
+    throw executionError(
+      `Worker attempt budget exhausted (${number}/${maxAttempts})`,
+      "ATTEMPT_BUDGET_EXHAUSTED",
+      4,
+      { attempt: number, maxAttempts },
+    );
+  }
+  const safeToRetry =
+    reconciled.status === "failed" &&
+    reconciled.evidence.clean === true &&
+    reconciled.evidence.currentHead === reconciled.evidence.baselineHead &&
+    (reconciled.evidence.result === "missing" ||
+      reconciled.evidence.result === "failed") &&
+    reconciled.cleanup.status !== "failed";
+  if (!safeToRetry) {
+    throw executionError(
+      "Worker retry is unsafe until reconciliation proves that no side effects remain",
+      "RETRY_REQUIRES_RECONCILIATION",
+      4,
+      {
+        attempt: number,
+        evidence: reconciled.evidence,
+        cleanup: reconciled.cleanup,
+      },
+    );
+  }
+
+  let snapshot: TicketInput;
+  let refreshed = false;
+  if (options.refreshTicket !== undefined) {
+    const current = await resolveTicket(repository, options.refreshTicket);
+    if (current.id !== prior.ticketId)
+      throw executionError(
+        "Refreshed ticket must retain the prior canonical ticket ID",
+        "TICKET_REFRESH_MISMATCH",
+        2,
+        { previousTicketId: prior.ticketId, refreshedTicketId: current.id },
+      );
+    snapshot = current;
+    refreshed = true;
+  } else {
+    await assertNoSymlinkComponents(prior.ticket.input);
+    const contents = await readFile(prior.ticket.input, "utf8");
+    snapshot = {
+      id: prior.ticketId,
+      source: prior.ticket.source,
+      contents,
+      hash: createHash("sha256").update(contents, "utf8").digest("hex"),
+    };
+    if (snapshot.hash !== prior.ticket.hash)
+      throw executionError(
+        "Prior ticket input snapshot changed; explicit reconciliation is required",
+        "UNTRUSTED_ARTIFACT",
+        4,
+      );
+  }
+
+  return executeWorker({
+    repository,
+    runId: options.runId,
+    ticket: snapshot.source,
+    ticketSnapshot: snapshot,
+    forceNewAttempt: true,
+    retryLineage: {
+      previousAttemptId: prior.attemptId,
+      previousExecutionId: prior.executionId,
+      previousInputHash: prior.ticket.hash,
+      refreshed,
+    },
+    ...(options.dependencies === undefined
+      ? {}
+      : { dependencies: options.dependencies }),
+    ...(options.adapter === undefined ? {} : { adapter: options.adapter }),
+  });
 }
