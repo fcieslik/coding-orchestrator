@@ -123,7 +123,7 @@ try {
     }
   } else if (argument === "orchestrate" && arguments_.includes("--help")) {
     console.log(
-      "Usage: flow orchestrate <workflow-package> <ticket-id> [--repo <path>] [--json]",
+      "Usage: flow orchestrate <workflow-package> <ticket-id> [--repo <path>] [--new-run] [--json]",
     );
     console.log(
       "Execute one explicit ticket from a local spec.md + issues/*.md Workflow package.",
@@ -136,7 +136,7 @@ try {
     for (let index = 1; index < arguments_.length; index += 1) {
       const token = arguments_[index];
       if (!token) continue;
-      if (token === "--json") {
+      if (token === "--json" || token === "--new-run") {
         if (flags.has(token))
           throw new FlowError(`Duplicate option: ${token}`, 2);
         flags.add(token);
@@ -156,13 +156,14 @@ try {
     const ticketId = values.get("--ticket") ?? positional[1];
     if (!packageReference || !ticketId || positional.length > 2)
       throw new FlowError(
-        "Usage: flow orchestrate <workflow-package> <ticket-id> [--repo <path>] [--json]",
+        "Usage: flow orchestrate <workflow-package> <ticket-id> [--repo <path>] [--new-run] [--json]",
         2,
       );
     const repository = values.get("--repo");
     const report = await executeWorkflowStep({
       package: packageReference,
       ticket: ticketId,
+      ...(flags.has("--new-run") ? { newRun: true } : {}),
       ...(repository === undefined ? {} : { repository }),
     });
     if (flags.has("--json")) console.log(JSON.stringify(report));

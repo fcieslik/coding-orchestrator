@@ -168,6 +168,255 @@ else process.exit(2);
   );
 });
 
+test("flow orchestrate resumes a two-ticket queue across processes", async () => {
+  const repository = await createCommittedTargetRepository();
+  const packageDirectory = join(repository, "feature");
+  await mkdir(join(packageDirectory, "issues"), { recursive: true });
+  await writeFile(join(packageDirectory, "spec.md"), "# Feature\n");
+  await writeFile(join(packageDirectory, "issues", "01-first.md"), "# First\n");
+  await writeFile(
+    join(packageDirectory, "issues", "02-second.md"),
+    "# Second\n",
+  );
+  const fakeDirectory = await temporaryDirectory();
+  const fake = join(fakeDirectory, "herdr");
+  const state = join(fakeDirectory, "state.json");
+  const workers = join(fakeDirectory, "workers.log");
+  await writeFile(
+    fake,
+    `#!/usr/bin/env node
+import { appendFileSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+const args = process.argv.slice(2);
+if (args[0] === "--version") console.log("fake-herdr 1.0.0");
+else if (args[0] === "pane" && args[1] === "split") console.log(JSON.stringify({result:{pane:{pane_id:"fake:worker"}}}));
+else if (args[0] === "agent" && args[1] === "start") {
+  const child = args.slice(args.indexOf("--") + 1);
+  const worktree = child[child.indexOf("-C") + 1];
+  appendFileSync(process.env.FAKE_WORKERS, args[2] + "\\n");
+  writeFileSync(process.env.FAKE_STATE, JSON.stringify({worktree}));
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"idle"}}}));
+} else if (args[0] === "agent" && args[1] === "prompt") {
+  const current = JSON.parse(readFileSync(process.env.FAKE_STATE, "utf8"));
+  const prompt = args[3];
+  const ticket = prompt.match(/- Ticket: ([^\\n]+)/)[1];
+  const resultPath = prompt.match(/Write the structured execution result to: "([^"]+)"/)[1];
+  const file = ticket.replace(/[^A-Za-z0-9_-]/g, "_") + ".txt";
+  writeFileSync(current.worktree + "/" + file, ticket + "\\n");
+  execFileSync("git", ["-C", current.worktree, "add", file]);
+  execFileSync("git", ["-C", current.worktree, "commit", "--quiet", "-m", ticket]);
+  const commit = execFileSync("git", ["-C", current.worktree, "rev-parse", "HEAD"], {encoding:"utf8"}).trim();
+  writeFileSync(resultPath + ".tmp", JSON.stringify({schemaVersion:1,ticketId:ticket,status:"completed",summary:ticket,commit,commands:[]}));
+  renameSync(resultPath + ".tmp", resultPath);
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"done"}}}));
+} else if (args[0] === "agent" && args[1] === "read") process.stdout.write("done\\n");
+else if (args[0] === "pane" && args[1] === "close") console.log("{}");
+else process.exit(2);
+`,
+    "utf8",
+  );
+  await chmod(fake, 0o755);
+  const environment = {
+    ...process.env,
+    HERDR_ENV: "1",
+    HERDR_PANE_ID: "caller",
+    HERDR_BIN_PATH: fake,
+    FAKE_STATE: state,
+    FAKE_WORKERS: workers,
+  };
+  const initialHead = await gitOutput(repository, ["rev-parse", "HEAD"]);
+  const first = JSON.parse(
+    (
+      await run(
+        executable,
+        ["orchestrate", "feature", "01-first", "--repo", repository, "--json"],
+        { cwd: repository, env: environment },
+      )
+    ).stdout,
+  ) as {
+    runId: string;
+    acceptedCommit: string;
+    nextTicket?: string;
+    snapshot: { phase: string; git: { featureWorktree: string } };
+    execution: { artifacts: { record: string } };
+  };
+  expect(first).toMatchObject({
+    status: "accepted",
+    nextTicket: "02-second",
+    snapshot: { phase: "implementing" },
+  });
+  expect(await gitOutput(repository, ["rev-parse", "HEAD"])).toBe(initialHead);
+
+  const second = JSON.parse(
+    (
+      await run(
+        executable,
+        ["orchestrate", "feature", "02-second", "--repo", repository, "--json"],
+        { cwd: repository, env: environment },
+      )
+    ).stdout,
+  ) as {
+    runId: string;
+    acceptedCommit: string;
+    snapshot: {
+      phase: string;
+      git: { featureWorktree: string };
+      tickets: Record<string, { commit?: string }>;
+    };
+    execution: { artifacts: { record: string } };
+    phase6: string;
+  };
+  expect(second).toMatchObject({
+    status: "accepted",
+    runId: first.runId,
+    snapshot: { phase: "completed" },
+    phase6: "not-run",
+  });
+  expect(second.snapshot.git.featureWorktree).toBe(
+    first.snapshot.git.featureWorktree,
+  );
+  expect(second.snapshot.tickets["01-first"]!.commit).toBe(
+    first.acceptedCommit,
+  );
+  expect(second.snapshot.tickets["02-second"]!.commit).toBe(
+    second.acceptedCommit,
+  );
+  await expect(
+    gitOutput(second.snapshot.git.featureWorktree, [
+      "merge-base",
+      "--is-ancestor",
+      first.acceptedCommit,
+      second.acceptedCommit,
+    ]),
+  ).resolves.toBe("");
+  expect(
+    JSON.parse(await readFile(first.execution.artifacts.record, "utf8")).herdr
+      .agentName,
+  ).not.toBe(
+    JSON.parse(await readFile(second.execution.artifacts.record, "utf8")).herdr
+      .agentName,
+  );
+
+  const repeated = JSON.parse(
+    (
+      await run(
+        executable,
+        ["orchestrate", "feature", "01-first", "--repo", repository, "--json"],
+        { cwd: repository, env: environment },
+      )
+    ).stdout,
+  );
+  expect(repeated).toMatchObject({
+    status: "noop",
+    runId: first.runId,
+    acceptedCommit: first.acceptedCommit,
+  });
+  expect((await readFile(workers, "utf8")).trim().split("\n")).toHaveLength(2);
+});
+
+test("flow orchestrate safely retries a blocked ticket before advancing the queue", async () => {
+  const repository = await createCommittedTargetRepository();
+  const packageDirectory = join(repository, "feature");
+  await mkdir(join(packageDirectory, "issues"), { recursive: true });
+  await writeFile(join(packageDirectory, "spec.md"), "# Feature\n");
+  await writeFile(join(packageDirectory, "issues", "01-first.md"), "# First\n");
+  await writeFile(
+    join(packageDirectory, "issues", "02-second.md"),
+    "# Second\n",
+  );
+  const fakeDirectory = await temporaryDirectory();
+  const fake = join(fakeDirectory, "herdr");
+  const state = join(fakeDirectory, "state.json");
+  const attempts = join(fakeDirectory, "attempts");
+  await writeFile(attempts, "0");
+  await writeFile(
+    fake,
+    `#!/usr/bin/env node
+import { execFileSync } from "node:child_process";
+import { readFileSync, writeFileSync, renameSync } from "node:fs";
+const args = process.argv.slice(2);
+if (args[0] === "--version") console.log("fake-herdr 1.0.0");
+else if (args[0] === "pane" && args[1] === "split") console.log(JSON.stringify({result:{pane:{pane_id:"fake:worker"}}}));
+else if (args[0] === "agent" && args[1] === "start") {
+  const child = args.slice(args.indexOf("--") + 1);
+  writeFileSync(process.env.FAKE_STATE, JSON.stringify({worktree: child[child.indexOf("-C") + 1]}));
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"idle"}}}));
+} else if (args[0] === "agent" && args[1] === "prompt") {
+  const current = JSON.parse(readFileSync(process.env.FAKE_STATE, "utf8"));
+  const prompt = args[3];
+  const ticket = prompt.match(/- Ticket: ([^\\n]+)/)[1];
+  const resultPath = prompt.match(/Write the structured execution result to: "([^"]+)"/)[1];
+  const count = Number(readFileSync(process.env.FAKE_ATTEMPTS, "utf8")) + 1;
+  writeFileSync(process.env.FAKE_ATTEMPTS, String(count));
+  if (count === 1) {
+    writeFileSync(resultPath + ".tmp", JSON.stringify({schemaVersion:1,ticketId:ticket,status:"blocked",summary:"Need an external decision.",blocker:{type:"product-decision",requiredDecision:"Choose the API."}}));
+  } else {
+    const file = ticket + ".txt";
+    writeFileSync(current.worktree + "/" + file, "resolved\\n");
+    execFileSync("git", ["-C", current.worktree, "add", file]);
+    execFileSync("git", ["-C", current.worktree, "commit", "--quiet", "-m", "resolved blocker"]);
+    const commit = execFileSync("git", ["-C", current.worktree, "rev-parse", "HEAD"], {encoding:"utf8"}).trim();
+    writeFileSync(resultPath + ".tmp", JSON.stringify({schemaVersion:1,ticketId:ticket,status:"completed",summary:"resolved",commit,commands:[]}));
+  }
+  renameSync(resultPath + ".tmp", resultPath);
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"done"}}}));
+} else if (args[0] === "agent" && args[1] === "read") process.stdout.write("done\\n");
+else if (args[0] === "pane" && args[1] === "close") console.log("{}");
+else process.exit(2);
+`,
+    "utf8",
+  );
+  await chmod(fake, 0o755);
+  const environment = {
+    ...process.env,
+    HERDR_ENV: "1",
+    HERDR_PANE_ID: "caller",
+    HERDR_BIN_PATH: fake,
+    FAKE_STATE: state,
+    FAKE_ATTEMPTS: attempts,
+  };
+  const first = await run(
+    executable,
+    ["orchestrate", "feature", "01-first", "--repo", repository, "--json"],
+    { cwd: repository, env: environment },
+  )
+    .then((value) => ({ ...value, code: 0 }))
+    .catch(
+      (error: unknown) =>
+        error as { stdout: string; stderr: string; code: number },
+    );
+  expect(first.code).toBe(4);
+  expect(JSON.parse(first.stderr)).toMatchObject({
+    code: "WORKER_NOT_COMPLETED",
+  });
+  const runs = (
+    await readdir(join(repository, ".orchestrator", "runs"))
+  ).filter((entry) => entry.startsWith("run_"));
+  expect(runs).toHaveLength(1);
+  const resumed = JSON.parse(
+    (
+      await run(
+        executable,
+        ["orchestrate", "feature", "01-first", "--repo", repository, "--json"],
+        { cwd: repository, env: environment },
+      )
+    ).stdout,
+  );
+  expect(resumed).toMatchObject({
+    status: "accepted",
+    ticketId: "01-first",
+    nextTicket: "02-second",
+    snapshot: {
+      phase: "implementing",
+      tickets: {
+        "01-first": { status: "accepted" },
+        "02-second": { status: "pending" },
+      },
+    },
+  });
+  expect(Number(await readFile(attempts, "utf8"))).toBe(2);
+});
+
 test("flow --version displays the package version", async () => {
   const { stderr, stdout } = await run(executable, ["--version"], {
     cwd: outsideInstallationRoot,

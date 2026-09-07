@@ -1923,7 +1923,7 @@ export async function executeWorker(
       3,
     );
   const agentName = normalizeAgentName(
-    `${options.runId}-${ticket.id}-${attempt!.id}`,
+    `${ticket.id}-${attempt!.id}-${options.runId}`,
   );
   const adapter = options.adapter ?? new HerdrAdapter({ maxDiagnosticBytes });
   let handle: HerdrExecutionHandle | undefined;
@@ -2200,7 +2200,10 @@ export async function retryWorker(
 
   const maxAttempts = (await readOrchestrationConfig(repository)).config
     .workflow.maxWorkerAttempts;
-  if (run.snapshot.phase !== "implementing") {
+  const blockedImplementationRun =
+    run.snapshot.phase === "blocked" &&
+    run.snapshot.interruptedPhase === "implementing";
+  if (run.snapshot.phase !== "implementing" && !blockedImplementationRun) {
     if (attemptNumber(located.attemptId) >= maxAttempts) {
       throw executionError(
         `Worker attempt budget exhausted (${attemptNumber(located.attemptId)}/${maxAttempts})`,
@@ -2257,11 +2260,12 @@ export async function retryWorker(
     );
   }
   const safeToRetry =
-    reconciled.status === "failed" &&
+    (reconciled.status === "failed" || reconciled.status === "blocked") &&
     reconciled.evidence.clean === true &&
     reconciled.evidence.currentHead === reconciled.evidence.baselineHead &&
     (reconciled.evidence.result === "missing" ||
-      reconciled.evidence.result === "failed") &&
+      reconciled.evidence.result === "failed" ||
+      reconciled.evidence.result === "blocked") &&
     reconciled.cleanup.status !== "failed";
   if (!safeToRetry) {
     throw executionError(
@@ -2273,6 +2277,19 @@ export async function retryWorker(
         evidence: reconciled.evidence,
         cleanup: reconciled.cleanup,
       },
+    );
+  }
+
+  if (blockedImplementationRun) {
+    await mutateRun(
+      {
+        repository,
+        runId: options.runId,
+        event: "resume",
+        historyEventType: "workflow.retry.resumed",
+        data: { ticketId: prior.ticketId, attemptId: prior.attemptId },
+      },
+      options.dependencies,
     );
   }
 

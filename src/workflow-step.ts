@@ -14,6 +14,7 @@ import { type HerdrAdapter } from "./herdr.js";
 import { setupRepository } from "./setup.js";
 import {
   executeWorker,
+  retryWorker,
   type WorkerExecutionReport,
 } from "./worker-execution.js";
 import {
@@ -64,6 +65,8 @@ export interface WorkflowStepOptions {
   repository?: string;
   dependencies?: RunDependencies;
   adapter?: HerdrAdapter;
+  /** Explicitly create a new run instead of reusing a terminal matching run. */
+  newRun?: boolean;
 }
 
 export interface WorkflowStepReport {
@@ -74,6 +77,8 @@ export interface WorkflowStepReport {
   nextTicket?: string;
   snapshot: StateSnapshot;
   execution?: WorkerExecutionReport;
+  /** Phase 6 review and system validation are intentionally outside this step. */
+  phase6?: "not-run";
 }
 
 function invalid(
@@ -298,6 +303,15 @@ export async function executeWorkflowStep(
   const packageData = await validatePackage(repository, options.package);
   let state = await findMatchingRun(repository, packageData.source);
 
+  if (options.newRun && state !== undefined && !terminalPhases.has(state.phase))
+    throw new FlowError(
+      "An unfinished Workflow run already matches this package; complete or resolve it before starting a new run",
+      3,
+      "WORKFLOW_RUN_EXISTS",
+      { runId: state.runId },
+    );
+  if (options.newRun && state !== undefined) state = undefined;
+
   if (state === undefined) {
     const runId = await createRun({
       repository,
@@ -335,6 +349,12 @@ export async function executeWorkflowStep(
     );
     state = workflowState(prepared.snapshot);
   }
+  if (state === undefined)
+    throw new FlowError(
+      "Workflow run could not be initialized",
+      4,
+      "CORRUPT_RUN",
+    );
 
   const tickets = state.tickets;
   if (!tickets)
@@ -358,6 +378,7 @@ export async function executeWorkflowStep(
       acceptedCommit: selected.commit!,
       snapshot: state,
       ...(next === undefined ? {} : { nextTicket: next }),
+      ...(next === undefined ? { phase6: "not-run" as const } : {}),
     };
   }
   const activeTicket = Object.entries(tickets).find(
@@ -371,6 +392,64 @@ export async function executeWorkflowStep(
       { activeTicket },
     );
   const expected = nextPending(state);
+  const resumingBlockedTicket =
+    state.phase === "blocked" &&
+    selected.status === "active" &&
+    activeTicket === options.ticket;
+  if (resumingBlockedTicket) {
+    const execution = await retryWorker({
+      repository,
+      runId: state.runId,
+      ticket: selected.input,
+      ...(options.dependencies === undefined
+        ? {}
+        : { dependencies: options.dependencies }),
+      ...(options.adapter === undefined ? {} : { adapter: options.adapter }),
+    });
+    state = workflowState(execution.snapshot);
+    const retryState = state;
+    const remaining = Object.entries(state.tickets ?? {}).filter(
+      ([id, ticket]) => id !== options.ticket && ticket.status === "pending",
+    );
+    const completed = remaining.length === 0;
+    const finalized = await mutateRun(
+      {
+        repository,
+        runId: state.runId,
+        event: "checkpoint",
+        preserveLifecycle: true,
+        historyEventType: "workflow.ticket.accepted",
+        data: {
+          ticketId: options.ticket,
+          acceptedCommit: execution.acceptedCommit,
+        },
+        updateSnapshot: () => ({
+          phase: completed ? "completed" : "implementing",
+          tickets: {
+            ...(retryState.tickets ?? {}),
+            [options.ticket]: {
+              ...selected,
+              status: "accepted",
+              commit: execution.acceptedCommit,
+            },
+          },
+        }),
+      },
+      options.dependencies,
+    );
+    const finalState = workflowState(finalized.snapshot);
+    const next = nextPending(finalState);
+    return {
+      status: "accepted",
+      runId: state.runId,
+      ticketId: options.ticket,
+      acceptedCommit: execution.acceptedCommit,
+      snapshot: finalState,
+      execution,
+      ...(next === undefined ? {} : { nextTicket: next }),
+      ...(next === undefined ? { phase6: "not-run" as const } : {}),
+    };
+  }
   if (expected !== options.ticket)
     throw new FlowError(
       `Ticket ${options.ticket} is not the first pending ticket; expected ${expected ?? "none"}`,
@@ -412,22 +491,26 @@ export async function executeWorkflowStep(
       ...(options.adapter === undefined ? {} : { adapter: options.adapter }),
     });
   } catch (error) {
-    await mutateRun(
-      {
-        repository,
-        runId: state.runId,
-        event: "block",
-        historyEventType: "workflow.ticket.blocked",
-        data: { ticketId: options.ticket },
-        updateSnapshot: () => ({
-          tickets: {
-            ...(state.tickets ?? {}),
-            [options.ticket]: { ...selected, status: "active" },
-          },
-        }),
-      },
-      options.dependencies,
-    ).catch(() => undefined);
+    const current = await inspectRun(repository, state.runId).catch(
+      () => undefined,
+    );
+    if (current?.snapshot.phase !== "blocked")
+      await mutateRun(
+        {
+          repository,
+          runId: state.runId,
+          event: "block",
+          historyEventType: "workflow.ticket.blocked",
+          data: { ticketId: options.ticket },
+          updateSnapshot: () => ({
+            tickets: {
+              ...(state.tickets ?? {}),
+              [options.ticket]: { ...selected, status: "active" },
+            },
+          }),
+        },
+        options.dependencies,
+      ).catch(() => undefined);
     throw error;
   }
   const remaining = Object.entries(state.tickets ?? {}).filter(
@@ -469,5 +552,6 @@ export async function executeWorkflowStep(
     snapshot: finalState,
     execution,
     ...(next === undefined ? {} : { nextTicket: next }),
+    ...(next === undefined ? { phase6: "not-run" as const } : {}),
   };
 }
