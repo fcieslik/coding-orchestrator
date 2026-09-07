@@ -388,11 +388,52 @@ else process.exit(2);
   expect(first.code).toBe(4);
   expect(JSON.parse(first.stderr)).toMatchObject({
     code: "WORKER_NOT_COMPLETED",
+    details: {
+      workerStatus: "blocked",
+      requiredAction: "Choose the API.",
+    },
   });
   const runs = (
     await readdir(join(repository, ".orchestrator", "runs"))
   ).filter((entry) => entry.startsWith("run_"));
   expect(runs).toHaveLength(1);
+  const laterTicket = await run(
+    executable,
+    ["orchestrate", "feature", "02-second", "--repo", repository, "--json"],
+    { cwd: repository, env: environment },
+  )
+    .then((value) => ({ ...value, code: 0 }))
+    .catch(
+      (error: unknown) =>
+        error as { stdout: string; stderr: string; code: number },
+    );
+  expect(laterTicket.code).toBe(4);
+  expect(JSON.parse(laterTicket.stderr)).toMatchObject({
+    code: "WORKFLOW_BLOCKED",
+    details: { activeTicket: "01-first" },
+  });
+  expect(Number(await readFile(attempts, "utf8"))).toBe(1);
+
+  await writeFile(
+    join(packageDirectory, "issues", "01-first.md"),
+    "# Changed\n",
+  );
+  const changedPackage = await run(
+    executable,
+    ["orchestrate", "feature", "01-first", "--repo", repository, "--json"],
+    { cwd: repository, env: environment },
+  )
+    .then((value) => ({ ...value, code: 0 }))
+    .catch(
+      (error: unknown) =>
+        error as { stdout: string; stderr: string; code: number },
+    );
+  expect(changedPackage.code).toBe(3);
+  expect(JSON.parse(changedPackage.stderr)).toMatchObject({
+    code: "WORKFLOW_PACKAGE_CHANGED",
+  });
+  await writeFile(join(packageDirectory, "issues", "01-first.md"), "# First\n");
+
   const resumed = JSON.parse(
     (
       await run(
@@ -415,6 +456,88 @@ else process.exit(2);
     },
   });
   expect(Number(await readFile(attempts, "utf8"))).toBe(2);
+});
+
+test("flow orchestrate refuses a blocked retry after an unaccepted worktree change", async () => {
+  const repository = await createCommittedTargetRepository();
+  const packageDirectory = join(repository, "feature");
+  await mkdir(join(packageDirectory, "issues"), { recursive: true });
+  await writeFile(join(packageDirectory, "spec.md"), "# Feature\n");
+  await writeFile(join(packageDirectory, "issues", "01-first.md"), "# First\n");
+  await writeFile(
+    join(packageDirectory, "issues", "02-second.md"),
+    "# Second\n",
+  );
+  const fakeDirectory = await temporaryDirectory();
+  const fake = join(fakeDirectory, "herdr");
+  const state = join(fakeDirectory, "state.json");
+  const attempts = join(fakeDirectory, "attempts");
+  await writeFile(attempts, "0");
+  await writeFile(
+    fake,
+    `#!/usr/bin/env node
+import { readFileSync, writeFileSync, renameSync } from "node:fs";
+const args = process.argv.slice(2);
+if (args[0] === "--version") console.log("fake-herdr 1.0.0");
+else if (args[0] === "pane" && args[1] === "split") console.log(JSON.stringify({result:{pane:{pane_id:"fake:worker"}}}));
+else if (args[0] === "agent" && args[1] === "start") {
+  const child = args.slice(args.indexOf("--") + 1);
+  writeFileSync(process.env.FAKE_STATE, JSON.stringify({worktree: child[child.indexOf("-C") + 1]}));
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"idle"}}}));
+} else if (args[0] === "agent" && args[1] === "prompt") {
+  const current = JSON.parse(readFileSync(process.env.FAKE_STATE, "utf8"));
+  const prompt = args[3];
+  const ticket = prompt.match(/- Ticket: ([^\\n]+)/)[1];
+  const resultPath = prompt.match(/Write the structured execution result to: "([^"]+)"/)[1];
+  const count = Number(readFileSync(process.env.FAKE_ATTEMPTS, "utf8")) + 1;
+  writeFileSync(process.env.FAKE_ATTEMPTS, String(count));
+  writeFileSync(current.worktree + "/unaccepted.txt", "must not be discarded\\n");
+  writeFileSync(resultPath + ".tmp", JSON.stringify({schemaVersion:1,ticketId:ticket,status:"blocked",summary:"The worker changed the worktree.",blocker:{type:"external",requiredDecision:"Clean the worktree."}}));
+  renameSync(resultPath + ".tmp", resultPath);
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"done"}}}));
+} else if (args[0] === "agent" && args[1] === "read") process.stdout.write("done\\n");
+else if (args[0] === "pane" && args[1] === "close") console.log("{}");
+else process.exit(2);
+`,
+    "utf8",
+  );
+  await chmod(fake, 0o755);
+  const environment = {
+    ...process.env,
+    HERDR_ENV: "1",
+    HERDR_PANE_ID: "caller",
+    HERDR_BIN_PATH: fake,
+    FAKE_STATE: state,
+    FAKE_ATTEMPTS: attempts,
+  };
+
+  const first = await run(
+    executable,
+    ["orchestrate", "feature", "01-first", "--repo", repository, "--json"],
+    { cwd: repository, env: environment },
+  )
+    .then((value) => ({ ...value, code: 0 }))
+    .catch(
+      (error: unknown) =>
+        error as { stdout: string; stderr: string; code: number },
+    );
+  expect(first.code).toBe(4);
+  const retry = await run(
+    executable,
+    ["orchestrate", "feature", "01-first", "--repo", repository, "--json"],
+    { cwd: repository, env: environment },
+  )
+    .then((value) => ({ ...value, code: 0 }))
+    .catch(
+      (error: unknown) =>
+        error as { stdout: string; stderr: string; code: number },
+    );
+  expect(retry.code).toBe(4);
+  expect(JSON.parse(retry.stderr)).toMatchObject({
+    code: "RETRY_REQUIRES_RECONCILIATION",
+    details: { evidence: { clean: false } },
+  });
+  expect(Number(await readFile(attempts, "utf8"))).toBe(1);
 });
 
 test("flow --version displays the package version", async () => {

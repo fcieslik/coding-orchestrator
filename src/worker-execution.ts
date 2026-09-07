@@ -814,11 +814,33 @@ function parseCompletedResult(
       "RESULT_TICKET_MISMATCH",
       4,
     );
-  if (parsed.data.status !== "completed")
+  if (parsed.data.status === "blocked") {
+    const requiredAction =
+      parsed.data.blocker.requiredDecision ?? parsed.data.blocker.decision!;
     throw executionError(
-      `Worker did not complete the assigned ticket (${parsed.data.status})`,
+      `Worker blocked the assigned ticket. Required action: ${requiredAction}`,
       "WORKER_NOT_COMPLETED",
       4,
+      {
+        workerStatus: parsed.data.status,
+        requiredAction,
+        blocker: parsed.data.blocker,
+        summary: parsed.data.summary,
+      },
+    );
+  }
+  if (parsed.data.status === "failed")
+    throw executionError(
+      `Worker failed the assigned ticket. Resolve the technical failure before retrying: ${parsed.data.diagnostics.message}`,
+      "WORKER_NOT_COMPLETED",
+      4,
+      {
+        workerStatus: parsed.data.status,
+        requiredAction:
+          "Resolve the technical failure before explicitly retrying the same ticket",
+        diagnostics: parsed.data.diagnostics,
+        summary: parsed.data.summary,
+      },
     );
   return parsed.data;
 }

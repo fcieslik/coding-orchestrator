@@ -254,6 +254,93 @@ function workflowState(snapshot: StateSnapshot): WorkflowSnapshot {
   return snapshot as WorkflowSnapshot;
 }
 
+function contentHash(contents: string): string {
+  return createHash("sha256").update(contents, "utf8").digest("hex");
+}
+
+async function readOwnedPackageFile(
+  path: string,
+  label: string,
+): Promise<string> {
+  await assertNoSymlink(path);
+  let entry;
+  try {
+    entry = await lstat(path);
+  } catch {
+    throw new FlowError(
+      `Workflow run package snapshot is missing: ${label}`,
+      4,
+      "CORRUPT_RUN",
+      { path },
+    );
+  }
+  if (!entry.isFile())
+    throw new FlowError(
+      `Workflow run package snapshot is not a regular file: ${label}`,
+      4,
+      "CORRUPT_RUN",
+      { path },
+    );
+  return readFile(path, "utf8");
+}
+
+/** Refuse source-package changes while an existing run still owns the work. */
+async function assertPackageUnchanged(
+  state: WorkflowSnapshot,
+  packageData: ValidatedPackage,
+): Promise<void> {
+  const captured = state.workflowPackage;
+  const queue = state.tickets;
+  if (!captured || !queue)
+    throw new FlowError(
+      `Workflow run ${state.runId} has no complete immutable package snapshot`,
+      4,
+      "CORRUPT_RUN",
+    );
+
+  const capturedSpecification = await readOwnedPackageFile(
+    captured.specification,
+    "spec.md",
+  );
+  const specificationChanged =
+    captured.source !== packageData.source ||
+    contentHash(capturedSpecification) !== packageData.specification.hash;
+  const packageTicketIds = packageData.tickets.map((ticket) => ticket.id);
+  const capturedTicketIds = Object.keys(queue);
+  if (
+    specificationChanged ||
+    capturedTicketIds.length !== packageTicketIds.length ||
+    capturedTicketIds.some((id, index) => id !== packageTicketIds[index])
+  )
+    throw new FlowError(
+      "Workflow package changed after this run captured its immutable input; prepare a new package and start an explicit new run",
+      3,
+      "WORKFLOW_PACKAGE_CHANGED",
+      { source: packageData.source },
+    );
+
+  for (const ticket of packageData.tickets) {
+    const entry = queue[ticket.id];
+    if (!entry)
+      throw new FlowError(
+        `Workflow run package snapshot is missing ticket ${ticket.id}`,
+        4,
+        "CORRUPT_RUN",
+      );
+    const capturedTicket = await readOwnedPackageFile(
+      entry.input,
+      `issues/${ticket.filename}`,
+    );
+    if (contentHash(capturedTicket) !== ticket.hash)
+      throw new FlowError(
+        "Workflow package changed after this run captured its immutable input; prepare a new package and start an explicit new run",
+        3,
+        "WORKFLOW_PACKAGE_CHANGED",
+        { source: packageData.source, ticketId: ticket.id },
+      );
+  }
+}
+
 async function findMatchingRun(
   repository: string,
   source: string,
@@ -342,6 +429,8 @@ export async function executeWorkflowStep(
     );
     state = workflowState(initialized.snapshot);
   }
+  if (!terminalPhases.has(state.phase))
+    await assertPackageUnchanged(state, packageData);
   if (state.git?.worktreeStatus !== "ready") {
     const prepared = await prepareWorktree(
       { repository, runId: state.runId },
