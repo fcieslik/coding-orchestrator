@@ -94,6 +94,80 @@ test("flow orchestrate rejects an invalid Workflow package before creating a run
   expect(runs).toEqual([]);
 });
 
+test("flow orchestrate executes the first package ticket through a fake Worker", async () => {
+  const repository = await createCommittedTargetRepository();
+  const packageDirectory = join(repository, "feature");
+  await mkdir(join(packageDirectory, "issues"), { recursive: true });
+  await writeFile(join(packageDirectory, "spec.md"), "# Feature\n");
+  await writeFile(
+    join(packageDirectory, "issues", "01-first.md"),
+    "# First ticket\n\nImplement the first slice.\n",
+  );
+  const fakeDirectory = await temporaryDirectory();
+  const fake = join(fakeDirectory, "herdr");
+  const state = join(fakeDirectory, "state.json");
+  await writeFile(
+    fake,
+    `#!/usr/bin/env node
+import { execFileSync } from "node:child_process";
+import { readFileSync, writeFileSync, renameSync } from "node:fs";
+const args = process.argv.slice(2);
+if (args[0] === "--version") console.log("fake-herdr 1.0.0");
+else if (args[0] === "pane" && args[1] === "split") console.log(JSON.stringify({result:{pane:{pane_id:"fake:worker"}}}));
+else if (args[0] === "agent" && args[1] === "start") {
+  const child = args.slice(args.indexOf("--") + 1);
+  const worktree = child[child.indexOf("-C") + 1];
+  writeFileSync(process.env.FAKE_STATE, JSON.stringify({worktree}));
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"idle"}}}));
+} else if (args[0] === "agent" && args[1] === "prompt") {
+  const current = JSON.parse(readFileSync(process.env.FAKE_STATE, "utf8"));
+  const prompt = args[3];
+  const ticket = prompt.match(/- Ticket: ([^\\n]+)/)[1];
+  const resultPath = prompt.match(/Write the structured execution result to: "([^"]+)"/)[1];
+  writeFileSync(current.worktree + "/first-change.txt", "done\\n");
+  execFileSync("git", ["-C", current.worktree, "add", "first-change.txt"]);
+  execFileSync("git", ["-C", current.worktree, "commit", "--quiet", "-m", "first ticket"]);
+  const commit = execFileSync("git", ["-C", current.worktree, "rev-parse", "HEAD"], {encoding:"utf8"}).trim();
+  writeFileSync(resultPath + ".tmp", JSON.stringify({schemaVersion:1,ticketId:ticket,status:"completed",summary:"done",commit,commands:[]}));
+  renameSync(resultPath + ".tmp", resultPath);
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"done"}}}));
+} else if (args[0] === "agent" && args[1] === "read") process.stdout.write("done\\n");
+else if (args[0] === "pane" && args[1] === "close") console.log("{}");
+else process.exit(2);
+`,
+    "utf8",
+  );
+  await chmod(fake, 0o755);
+
+  const { stdout } = await run(
+    executable,
+    ["orchestrate", "feature", "01-first", "--repo", repository, "--json"],
+    {
+      cwd: repository,
+      env: {
+        ...process.env,
+        HERDR_ENV: "1",
+        HERDR_PANE_ID: "caller",
+        HERDR_BIN_PATH: fake,
+        FAKE_STATE: state,
+      },
+    },
+  );
+  const report = JSON.parse(stdout);
+  expect(report).toMatchObject({
+    status: "accepted",
+    ticketId: "01-first",
+    snapshot: {
+      phase: "completed",
+      tickets: { "01-first": { status: "accepted" } },
+    },
+  });
+  expect(report.acceptedCommit).toMatch(/^[0-9a-f]{40}$/);
+  expect(await gitOutput(repository, ["rev-parse", "HEAD"])).not.toBe(
+    report.acceptedCommit,
+  );
+});
+
 test("flow --version displays the package version", async () => {
   const { stderr, stdout } = await run(executable, ["--version"], {
     cwd: outsideInstallationRoot,
