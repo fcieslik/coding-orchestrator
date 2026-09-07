@@ -110,6 +110,18 @@ export const gitStateSchema = z.looseObject({
   validatedHead: objectIdSchema.optional(),
 });
 
+const workflowPackageSchema = z.looseObject({
+  source: z.string().min(1),
+  snapshot: z.string().min(1),
+  specification: z.string().min(1),
+});
+
+const workflowTicketSchema = z.looseObject({
+  status: z.enum(["pending", "active", "accepted"]),
+  input: z.string().min(1),
+  commit: objectIdSchema.optional(),
+});
+
 export const stateSnapshotSchema = z.looseObject({
   schemaVersion: z.literal(1),
   runId: runIdSchema,
@@ -121,6 +133,8 @@ export const stateSnapshotSchema = z.looseObject({
   createdAt: utcTimestampSchema,
   updatedAt: utcTimestampSchema,
   git: gitStateSchema.optional(),
+  workflowPackage: workflowPackageSchema.optional(),
+  tickets: z.record(z.string().min(1), workflowTicketSchema).optional(),
   activeExecution: z
     .looseObject({
       executionId: z.string().min(1),

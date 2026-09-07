@@ -124,6 +124,62 @@
       ],
       "additionalProperties": {}
     },
+    "workflowPackage": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "snapshot": {
+          "type": "string",
+          "minLength": 1
+        },
+        "specification": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "source",
+        "snapshot",
+        "specification"
+      ],
+      "additionalProperties": {}
+    },
+    "tickets": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "active",
+              "accepted"
+            ]
+          },
+          "input": {
+            "type": "string",
+            "minLength": 1
+          },
+          "commit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40,64}$"
+          }
+        },
+        "required": [
+          "status",
+          "input"
+        ],
+        "additionalProperties": {}
+      }
+    },
     "activeExecution": {
       "type": "object",
       "properties": {

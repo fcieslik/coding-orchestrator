@@ -72,6 +72,28 @@ test("flow --help displays usage", async () => {
   expect(stderr).toBe("");
 });
 
+test("flow orchestrate rejects an invalid Workflow package before creating a run", async () => {
+  const repository = await createCommittedTargetRepository();
+  const packageDirectory = join(repository, "feature");
+  await mkdir(packageDirectory);
+  await writeFile(join(packageDirectory, "spec.md"), "# Feature\n");
+  await mkdir(join(packageDirectory, "issues"));
+
+  await expect(
+    run(
+      executable,
+      ["orchestrate", "feature", "01-first", "--repo", repository, "--json"],
+      { cwd: repository },
+    ),
+  ).rejects.toMatchObject({
+    code: 2,
+    stdout: "",
+    stderr: expect.stringContaining("INVALID_WORKFLOW_PACKAGE"),
+  });
+  const runs = await readdir(join(repository, ".orchestrator", "runs"));
+  expect(runs).toEqual([]);
+});
+
 test("flow --version displays the package version", async () => {
   const { stderr, stdout } = await run(executable, ["--version"], {
     cwd: outsideInstallationRoot,
