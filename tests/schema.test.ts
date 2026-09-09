@@ -9,6 +9,7 @@ import {
   executionRecordSchema,
   runEventSchema,
   stateSnapshotSchema,
+  validationResultSchema,
   workerResultSchema,
 } from "../src/schema.js";
 
@@ -125,6 +126,7 @@ test("execution and Worker result schemas keep their independent version-one con
       input: "/repo/.orchestrator/runs/run/input/ticket.md",
       hash: "a".repeat(64),
     },
+    specification: "/repo/.orchestrator/runs/run/input/package/spec.md",
     worktree: "/repo/.worktrees/feature",
     artifacts: {
       directory: "/repo/.orchestrator/runs/run/workers/03-ticket/attempt-01",
@@ -147,6 +149,9 @@ test("execution and Worker result schemas keep their independent version-one con
   });
 
   expect(execution.futureExecutionField).toBe(true);
+  expect(execution.specification).toBe(
+    "/repo/.orchestrator/runs/run/input/package/spec.md",
+  );
   expect(result.futureResultField).toBe("kept");
   expect(() =>
     workerResultSchema.parse({ ...result, schemaVersion: 2 }),
@@ -212,6 +217,202 @@ test("orchestration configuration validates worker contract and bounds", () => {
       workflow: { workerTimeoutSeconds: 1800, maxWorkerAttempts: 2 },
     }),
   ).toThrow();
+});
+
+test("orchestration configuration validates the optional five-check contract", () => {
+  const base = {
+    version: 1,
+    agents: { codex: { kind: "codex" } },
+    roles: { worker: { agent: "codex", skill: "implement" } },
+    workflow: { workerTimeoutSeconds: 1800, maxWorkerAttempts: 2 },
+  };
+
+  // Existing Phase 0–5 configurations remain valid without a validation block.
+  expect(orchestrationConfigSchema.parse(base)).toMatchObject({ version: 1 });
+  expect(
+    orchestrationConfigSchema.parse({
+      ...base,
+      workflow: {
+        ...base.workflow,
+        validation: {
+          test: "pnpm test",
+          lint: "pnpm lint",
+          typecheck: "pnpm typecheck",
+          formatCheck: "pnpm format:check",
+          build: "pnpm build",
+          timeoutSeconds: 900,
+        },
+      },
+    }),
+  ).toMatchObject({
+    workflow: {
+      validation: { timeoutSeconds: 900 },
+    },
+  });
+  // Check names define the five gates; projects may intentionally reuse one command.
+  expect(
+    orchestrationConfigSchema.parse({
+      ...base,
+      workflow: {
+        ...base.workflow,
+        validation: {
+          test: "project-check",
+          lint: "project-check",
+          typecheck: "project-check",
+          formatCheck: "project-check",
+          build: "project-check",
+          timeoutSeconds: 900,
+        },
+      },
+    }),
+  ).toMatchObject({ workflow: { validation: { test: "project-check" } } });
+  expect(() =>
+    orchestrationConfigSchema.parse({
+      ...base,
+      workflow: {
+        ...base.workflow,
+        validation: { test: "pnpm test", timeoutSeconds: 900 },
+      },
+    }),
+  ).toThrow();
+  expect(() =>
+    orchestrationConfigSchema.parse({
+      ...base,
+      workflow: {
+        ...base.workflow,
+        validation: {
+          test: "pnpm test",
+          lint: "pnpm lint",
+          typecheck: "pnpm typecheck",
+          formatCheck: "pnpm format:check",
+          build: "pnpm build",
+          stages: ["extra"],
+          timeoutSeconds: 900,
+        },
+      },
+    }),
+  ).toThrow();
+});
+
+test("state snapshot keeps validation data additive and run-owned", () => {
+  const base = {
+    schemaVersion: 1,
+    runId: "run_20260904T120000Z_012345abcdef",
+    revision: 2,
+    phase: "completed",
+    specification: "specs/feature.md",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+
+  // Existing Phase 0–5 snapshots without validation data remain readable.
+  expect(stateSnapshotSchema.parse(base)).toMatchObject({ phase: "completed" });
+  const snapshot = stateSnapshotSchema.parse({
+    ...base,
+    validation: {
+      status: "passed",
+      validatedHead: "0".repeat(40),
+      result: "validation.json",
+      at: timestamp,
+      futureValidationField: true,
+    },
+  });
+  expect(snapshot.validation?.futureValidationField).toBe(true);
+  expect(() =>
+    stateSnapshotSchema.parse({
+      ...base,
+      validation: { status: "passed" },
+    }),
+  ).toThrow();
+});
+
+test("validation result schema fixes the five named checks", () => {
+  const check = (
+    name:
+      "test" | "lint" | "typecheck" | "formatCheck" | "build" | (string & {}),
+    status: string,
+  ) => ({
+    name,
+    command: `run-${name}`,
+    status,
+    exitCode: 0,
+    durationMs: 5,
+  });
+  const base = {
+    schemaVersion: 1,
+    runId: "run_20260904T120000Z_012345abcdef",
+    validatedHead: "0".repeat(40),
+    status: "passed",
+    startedAt: timestamp,
+    finishedAt: timestamp,
+    git: { cleanAfterValidation: true },
+  };
+
+  expect(
+    validationResultSchema.parse({
+      ...base,
+      checks: [
+        check("test", "passed"),
+        check("lint", "passed"),
+        check("typecheck", "passed"),
+        check("formatCheck", "passed"),
+        check("build", "passed"),
+      ],
+    }),
+  ).toMatchObject({ status: "passed" });
+  expect(() =>
+    validationResultSchema.parse({
+      ...base,
+      checks: [
+        check("lint", "passed"),
+        check("test", "passed"),
+        check("typecheck", "passed"),
+        check("formatCheck", "passed"),
+        check("build", "passed"),
+      ],
+    }),
+  ).toThrow();
+  expect(() =>
+    validationResultSchema.parse({
+      ...base,
+      checks: [
+        check("test", "passed"),
+        check("lint", "passed"),
+        check("typecheck", "passed"),
+        check("formatCheck", "passed"),
+      ],
+    }),
+  ).toThrow();
+  expect(() =>
+    validationResultSchema.parse({
+      ...base,
+      checks: [
+        check("test", "passed"),
+        check("lint", "passed"),
+        check("typecheck", "passed"),
+        check("formatCheck", "passed"),
+        check("build", "passed"),
+        check("review", "passed"),
+      ],
+    }),
+  ).toThrow();
+  const parsed = validationResultSchema.parse({
+    ...base,
+    checks: [
+      { ...check("test", "timed_out"), exitCode: null, stdout: "partial" },
+      { ...check("lint", "passed"), stderr: "warning" },
+      check("typecheck", "passed"),
+      check("formatCheck", "passed"),
+      check("build", "passed"),
+    ],
+  });
+  expect(parsed.checks[0]).toMatchObject({
+    name: "test",
+    status: "timed_out",
+    exitCode: null,
+    stdout: "partial",
+  });
+  expect(parsed.checks[1]).toMatchObject({ name: "lint", stderr: "warning" });
 });
 
 test("committed JSON Schemas match their deterministic runtime sources", async () => {

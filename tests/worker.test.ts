@@ -1,3 +1,7 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
 import { expect, test } from "vitest";
 
 import {
@@ -8,6 +12,8 @@ import {
   type LogicalWorkerExecution,
 } from "../src/worker.js";
 import type { HerdrCommandRunner } from "../src/herdr.js";
+import { workerResultSchema } from "../src/schema.js";
+import { stableJson } from "../src/worker-execution.js";
 
 const execution: LogicalWorkerExecution = {
   role: "worker",
@@ -23,6 +29,12 @@ const execution: LogicalWorkerExecution = {
     "/repo/.orchestrator/runs/run_1/workers/T01/attempt-01/output/result.json",
   commitRequired: true,
 };
+const safeguards = readFileSync(
+  fileURLToPath(
+    new URL("../assets/prompts/worker-safeguards.md", import.meta.url),
+  ),
+  "utf8",
+);
 
 test("renderers keep logical execution distinct and use exact agent syntax", () => {
   expect(renderSkillInvocation("implement", execution.input, "codex")).toBe(
@@ -51,17 +63,96 @@ test("renderers keep logical execution distinct and use exact agent syntax", () 
       "- Implement only the assigned ticket and work only in the provided worktree.",
       "- The assigned ticket input is immutable; do not modify it.",
       "- Global Orchestrator workflow state is read-only.",
-      "- Status must be completed, blocked, or failed.",
-      "- The result must contain the ticket ID, status, commit SHA when completed, a concise summary, and commands/checks executed.",
+      "- Write exactly one JSON object using the camelCase fields in one of the following shapes; do not use snake_case aliases.",
+      '- Completed: {"schemaVersion":1,"ticketId":"T01","status":"completed","commit":"<full commit SHA>","summary":"<concise summary>","commands":[{"command":"git status --short","status":"passed","exitCode":0}]}',
+      '- Blocked: {"schemaVersion":1,"ticketId":"T01","status":"blocked","summary":"<concise summary>","blocker":{"type":"<type>","requiredDecision":"<smallest required decision>"}}',
+      '- Failed: {"schemaVersion":1,"ticketId":"T01","status":"failed","summary":"<concise summary>","diagnostics":{"message":"<failure message>"}}',
       "- Publish the result atomically by writing a temporary file in the output directory, then renaming it to the result path.",
       "- On a product, architecture, security, destructive-operation, credential, or human-decision blocker, do not guess. Write a blocked result with the smallest required decision, then stop.",
       "- On technical failure, write a failed result with relevant diagnostics, then stop.",
+      "",
+      "Worker safeguards (canonical policy):",
+      "",
+      safeguards,
     ].join("\n"),
   );
   expect(rendered.prompt).not.toMatch(
     /inspect|testing|self-review|repository methodology/i,
   );
+  expect(rendered.prompt).not.toMatch(/ticket_id|commit_sha/);
   expect(rendered.promptHash).toBe(renderWorkerPrompt(execution).promptHash);
+  expect(rendered.prompt).toContain(safeguards);
+  expect(rendered.promptHash).toBe(
+    createHash("sha256").update(rendered.prompt, "utf8").digest("hex"),
+  );
+  const changedPrompt = rendered.prompt.replace(
+    safeguards,
+    `${safeguards}\nAdditional safeguard`,
+  );
+  expect(rendered.promptHash).not.toBe(
+    createHash("sha256").update(changedPrompt, "utf8").digest("hex"),
+  );
+});
+
+test("every supported Agent prompt embeds the complete canonical safeguards", () => {
+  for (const agentKind of ["codex", "claude-code", "pi"] as const) {
+    const rendered = renderWorkerPrompt({
+      ...execution,
+      agentKind,
+      agentProfile: agentKind,
+    });
+
+    expect(rendered.skillInvocation).toBe(
+      `${agentKind === "codex" ? "$" : "/"}implement ${JSON.stringify(execution.input)}`,
+    );
+    expect(rendered.prompt).toContain(safeguards);
+    expect(rendered.prompt).toContain("primary checkout");
+    expect(rendered.prompt).toContain("Integration target branch");
+    expect(rendered.prompt).toContain("never push branches, tags, or commits");
+    expect(rendered.prompt).toContain(
+      "never create, update, or merge Pull Requests",
+    );
+    expect(rendered.prompt).toContain(
+      "never merge, rebase, or otherwise combine",
+    );
+    expect(rendered.prompt).toContain("Do not delete workflow Git resources");
+    expect(rendered.prompt).toContain("Do not discard pre-existing changes");
+    expect(rendered.prompt).toContain(
+      "write a valid existing `blocked` or `failed` result",
+    );
+    expect(rendered.prompt).toContain("Do not guess");
+    expect(rendered.prompt).toContain("- Ticket: T01");
+    expect(rendered.prompt).toContain(
+      "Write the structured execution result to:",
+    );
+    expect(rendered.prompt).toContain("- Blocked:");
+    expect(rendered.prompt).not.toMatch(
+      /inspect|testing|self-review|repository methodology/i,
+    );
+  }
+});
+
+test("worker prompt adds immutable specification context without expanding ticket scope", () => {
+  const specification = "/repo/.orchestrator/runs/run_1/input/package/spec.md";
+  const rendered = renderWorkerPrompt({ ...execution, specification });
+
+  expect(rendered.skillInvocation).toBe(
+    '$implement "/repo/.orchestrator/runs/run_1/workers/T01/attempt-01/input/ticket.md"',
+  );
+  expect(rendered.prompt).toContain(`- Specification: "${specification}"`);
+  expect(rendered.prompt).toContain(
+    "- Use the specification as read-only context and common constraints; the assigned ticket remains the only implementation scope.",
+  );
+  expect(rendered.prompt).not.toContain("02-other-ticket");
+  expect(rendered.promptHash).not.toBe(
+    renderWorkerPrompt(execution).promptHash,
+  );
+  expect(() =>
+    renderWorkerPrompt({
+      ...execution,
+      specification: "input/package/spec.md",
+    }),
+  ).toThrow("specification must be an absolute path");
 });
 
 test("codex launch forwards opaque prompt and isolated child argv", async () => {
@@ -135,8 +226,46 @@ test("codex launch forwards opaque prompt and isolated child argv", async () => 
   expect(prompt?.[3]).toBe(renderWorkerPrompt(execution).prompt);
   expect(prompt?.[3]).toContain("$implement");
   expect(start).not.toContain("danger-full-access");
-  expect(start).toContain("workspace-write");
+  expect(start).not.toContain("--sandbox");
+  expect(start).not.toContain("workspace-write");
   expect(start).toContain("--approve-for-me");
+});
+
+test("ownership serialization is independent of nested object key order", () => {
+  const first = {
+    retry: {
+      previousAttemptId: "attempt-01",
+      previousExecutionId: "exec-01",
+      previousInputHash: "a".repeat(64),
+      inputHash: "a".repeat(64),
+      refreshed: false,
+    },
+  };
+  const reordered = {
+    retry: {
+      refreshed: false,
+      inputHash: "a".repeat(64),
+      previousInputHash: "a".repeat(64),
+      previousExecutionId: "exec-01",
+      previousAttemptId: "attempt-01",
+    },
+  };
+
+  expect(stableJson(first)).toBe(stableJson(reordered));
+});
+
+test("worker prompt result examples satisfy the runtime schema", () => {
+  const prompt = renderWorkerPrompt(execution).prompt;
+  for (const label of ["Completed", "Blocked", "Failed"]) {
+    const line = prompt
+      .split("\n")
+      .find((candidate) => candidate.startsWith(`- ${label}: `));
+    expect(line).toBeDefined();
+    const example = line!
+      .slice(line!.indexOf("{"))
+      .replace("<full commit SHA>", "a".repeat(40));
+    expect(() => workerResultSchema.parse(JSON.parse(example))).not.toThrow();
+  }
 });
 
 test("renderer and child policy reject unsafe input", () => {

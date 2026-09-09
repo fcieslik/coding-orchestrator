@@ -207,7 +207,8 @@ async function syncDirectory(directory: string): Promise<void> {
   }
 }
 
-async function writeSynchronizedFile(
+/** Atomically replace a repo-local runtime file with fsync'd, symlink-safe writes. */
+export async function writeSynchronizedFile(
   path: string,
   contents: string,
 ): Promise<void> {

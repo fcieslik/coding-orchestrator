@@ -62,6 +62,7 @@ test("installer creates a fresh runtime snapshot", async () => {
   expect(stderr).toBe("");
   expect((await readdir(target)).sort()).toEqual([
     "SKILL.md",
+    "assets",
     "dist",
     "schemas",
     "scripts",
@@ -78,8 +79,51 @@ test("installer creates a fresh runtime snapshot", async () => {
   expect(await readFile(join(target, "SKILL.md"), "utf8")).toContain(
     "name: orchestrate",
   );
+  expect(await readFile(join(target, "SKILL.md"), "utf8")).toContain(
+    "$orchestrate <workflow-package> <ticket-id>",
+  );
+  expect(await readFile(join(target, "SKILL.md"), "utf8")).toContain(
+    "flow validate <workflow-package>",
+  );
+  expect(await readFile(join(target, "SKILL.md"), "utf8")).toContain(
+    "Treat `flow orchestrate` as a long-running foreground operation",
+  );
+  expect(await readFile(join(target, "SKILL.md"), "utf8")).toContain(
+    "Never invoke the same Workflow step again to poll its progress",
+  );
+  expect(await readFile(join(target, "SKILL.md"), "utf8")).toContain(
+    "flow validate <workflow-package>",
+  );
   expect(await readFile(join(target, "dist", "cli.js"), "utf8")).not.toBe("");
   expect(await readFile(join(target, "scripts", "flow"), "utf8")).not.toBe("");
+  const { stdout } = await run(join(target, "scripts", "flow"), ["--version"]);
+  expect(stdout).toBe("0.1.0\n");
+});
+
+test("installer packages the canonical Worker safeguards unchanged", async () => {
+  const temporaryRoot = await temporaryDirectory();
+  const fixture = await createDevelopmentRepositoryFixture(temporaryRoot);
+  const sourceSafeguards = join(
+    projectRoot,
+    "assets",
+    "prompts",
+    "worker-safeguards.md",
+  );
+  const fixtureSafeguards = join(
+    fixture,
+    "assets",
+    "prompts",
+    "worker-safeguards.md",
+  );
+  await mkdir(join(fixture, "assets", "prompts"), { recursive: true });
+  await cp(sourceSafeguards, fixtureSafeguards);
+  const target = join(temporaryRoot, "installed-skill");
+
+  await run(join(fixture, "install-skill.sh"), ["--target", target]);
+
+  await expect(
+    readFile(join(target, "assets/prompts/worker-safeguards.md"), "utf8"),
+  ).resolves.toBe(await readFile(sourceSafeguards, "utf8"));
 });
 
 test("installer refuses to modify an existing destination", async () => {
@@ -107,6 +151,7 @@ test("installer force-replaces an existing destination", async () => {
 
   expect((await readdir(target)).sort()).toEqual([
     "SKILL.md",
+    "assets",
     "dist",
     "schemas",
     "scripts",

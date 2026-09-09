@@ -1,8 +1,10 @@
 # Coding Workflow Orchestrator — Architecture & Implementation Handoff
 
 > **Status:** design handoff / implementation-ready architecture  
-> **Date:** 2026-09-03  
+> **Updated:** 2026-09-07 — simplified user-driven Phase 5 POC
 > **Purpose:** this document is the durable context for building the project. A fresh LLM should be able to read this file, understand the intended system, and start implementation without needing the original conversation.
+
+For Phase 5 and later, `docs/coding-orchestrator-roadmap-phase-5-onward.md` is the scope authority. The POC deliberately uses user-triggered single-ticket steps; dependency graphs, automatic queue draining and tracker integrations are future improvements.
 
 ---
 
@@ -18,7 +20,7 @@ The intended model is:
 - Herdr is the programmable terminal/multiplexer layer;
 - the Orchestrator uses Herdr to create new panes, choose their working directory, launch fresh coding agents such as Claude Code, Codex, or Pi, send them prompts, wait for them, inspect output, and close panes;
 - implementation work is performed by **fresh worker agent processes**, normally one fresh context per task;
-- review is performed by a **fresh reviewer agent**, potentially Pi with dedicated skills/extensions;
+- review is performed by a **fresh reviewer agent** through the configured `code-review` skill;
 - deterministic validation (formatting, linting, typechecking, tests, build, browser checks, screenshots, etc.) is performed by scripts, not trusted to agent self-report;
 - if review or checks fail, the Orchestrator launches a **fresh fixer agent** with a bounded fix brief;
 - durable workflow state lives outside the agents' conversation contexts;
@@ -28,6 +30,12 @@ The intended model is:
 The core idea can be summarized as:
 
 > **Agents are ephemeral. The workflow is durable. Herdr hosts and controls terminal processes. Git carries code state. Artifacts carry semantic results. The Orchestrator decides what workflow transition happens next.**
+
+The engineering-method boundary is equally important:
+
+> **Skills define engineering methodology. The Orchestrator defines workflow semantics. Agent adapters define invocation syntax. Herdr defines process transport. Git and artifacts provide durable evidence.**
+
+Worker and reviewer prompts are skill-aware wrappers, not standalone engineering methodologies. The Orchestrator must not reimplement methodology owned by downstream engineering skills; it invokes the configured skill and adds only the minimum durable execution contract.
 
 ---
 
@@ -100,24 +108,20 @@ herdr pane split --current \
   --no-focus
 ```
 
-Then, depending on desired control level:
-
-```bash
-herdr pane run <pane-id> "codex"
-```
-
-or the higher-level agent API:
+Then use the higher-level agent API against the returned pane:
 
 ```bash
 herdr agent start <name> \
-  --cwd /path/to/worktree \
-  -- <agent-command-and-args>
+  --kind codex \
+  --pane <pane-id>
 ```
+
+`agent start` requires an existing available shell pane; it does not create layout or select cwd. Raw `pane run` remains a fallback only when a demonstrated agent-API limitation requires it.
 
 Communication can use:
 
 ```bash
-herdr agent prompt <target> "<prompt>"
+herdr agent prompt <target> "<prompt>" --wait --timeout <milliseconds>
 herdr agent wait <target> ...
 herdr agent read <target> ...
 ```
@@ -176,6 +180,8 @@ Workflow state:
 
 Herdr lifecycle state is an observation about a process. It is **not semantic proof that the ticket is done**.
 
+Herdr also treats prompts as opaque payloads. Phase 4 or Phase 6 constructs a logical skill invocation, the selected agent adapter renders it into a concrete prompt, and Herdr transports that prompt unchanged. Herdr does not know about `implement`, `code-review`, ticket semantics, review semantics, or result semantics.
+
 ---
 
 # 3. Relationship with Matt Pocock's skills
@@ -215,18 +221,7 @@ It should **not casually redesign or reinterpret an already-settled spec**.
 
 ## 3.2 `to-tickets`
 
-`to-tickets` turns a plan/spec into small **tracer-bullet vertical slices**.
-
-Tickets declare blocking edges.
-
-This matters because a machine-readable dependency graph gives the Orchestrator exactly what it needs to know:
-
-```text
-which tasks exist?
-which tasks block which?
-which tasks are currently ready?
-can anything run in parallel?
-```
+`to-tickets` turns a plan/spec into small **tracer-bullet vertical slices**. Its tickets may declare blocking edges, but the Phase 5 POC deliberately uses filename order and does not interpret a dependency graph. Blocking edges remain useful input for a future scheduler.
 
 Matt's design intentionally makes each ticket suitable for a fresh context window.
 
@@ -236,7 +231,7 @@ Important rule:
 
 > If good tickets already exist, the Orchestrator should normally consume them rather than inventing a new decomposition.
 
-The Orchestrator **may** break a spec into tasks when necessary, but task decomposition is not its primary reason for existing.
+Task decomposition or tracker import happens before the execution workflow and produces the local Workflow package.
 
 ## 3.3 `implement`
 
@@ -253,9 +248,9 @@ Important properties:
 - it commits to the current branch;
 - the documented intended rhythm is one ticket per fresh context/session.
 
-This matches the desired worker model.
+This matches the desired worker model. Worker execution must invoke the configured `implement` skill for the assigned ticket and wrap it only with the orchestration contract. It must not reproduce repository inspection, implementation, testing, or self-review methodology in its own prompt.
 
-A worker may therefore be launched with a prompt that causes it to invoke/use `implement` for the assigned ticket.
+The workflow stores the logical skill name `implement`. A Codex renderer emits `$implement`; another agent adapter may use different syntax without changing workflow semantics.
 
 However, our workflow should **not depend solely on the worker's internal review or self-report**. We still want an independent workflow-level reviewer and deterministic verification after the implementation phase.
 
@@ -266,9 +261,7 @@ Matt's `code-review` checks a diff against a fixed point along two deliberately 
 1. **Standards** — does the code follow repository conventions/standards?
 2. **Spec** — does the implementation match the originating issue/spec?
 
-This is especially valuable as a dedicated fresh reviewer stage.
-
-The Orchestrator can launch a fresh Pi/Claude/Codex reviewer and ask it to run the existing `code-review` skill against:
+This is especially valuable as a dedicated fresh reviewer stage. Reviewer execution must invoke the configured `code-review` skill against:
 
 ```text
 BASE_SHA ... HEAD
@@ -276,7 +269,7 @@ BASE_SHA ... HEAD
 
 with the known spec path/reference.
 
-The review process should not trust implementation-agent context.
+The Orchestrator supplies the fixed range, ticket/spec references, artifact paths, and review-only contract; it does not reproduce the Standards/Spec methodology. A Codex renderer emits `$code-review`. The review process should not trust implementation-agent context.
 
 ## 3.5 Other existing skills
 
@@ -293,6 +286,44 @@ existing skills = expertise/procedure for a stage
 
 orchestrator = routing + lifecycle + durable coordination
 ```
+
+The core concepts must remain separate:
+
+```text
+ROLE != AGENT != SKILL
+
+role: worker
+agent: codex
+skill: implement
+```
+
+Recommended V1 conceptual shape:
+
+```ts
+type ExecutionRole = "worker" | "reviewer" | "fixer";
+
+interface RoleExecution {
+  role: ExecutionRole;
+  agentProfile: string;
+  skill?: string;
+  input: string;
+  contract: ExecutionContract;
+}
+```
+
+A logical role execution becomes an agent-specific prompt only at the rendering boundary:
+
+```text
+RoleExecution
+    ↓
+agent renderer
+    ↓
+rendered prompt
+    ↓
+Herdr
+```
+
+Do not overbuild a generic plugin framework for V1.
 
 ---
 
@@ -336,6 +367,8 @@ The system has five conceptual layers.
                └──────────────────────│ Codex  │ Claude │  Pi    │
                                       └────────┴────────┴────────┘
 ```
+
+Before Herdr receives a prompt, workflow tooling constructs a logical role execution and the selected agent renderer converts its skill name to agent-specific syntax. Herdr sees only the resulting opaque text.
 
 ---
 
@@ -435,7 +468,7 @@ process can die
 
 Review
   ↓
-fresh Pi with review skills/extensions
+fresh configured agent + code-review skill
   ↓
 review artifact
   ↓
@@ -700,7 +733,7 @@ Workflow truth must not live only in the Orchestrator's context window, but V1 s
 
 The important simplification is:
 
-> **Matt `to-tickets` already owns the implementation task graph. The Orchestrator must not create a second task-planning model on top of it.**
+> **The prepared Workflow package owns the accepted implementation inputs. The Orchestrator records only their fixed order and execution evidence; it does not create another planning model.**
 
 The Orchestrator only stores **execution state for existing tickets** plus workflow-stage state for review, checks, fixes, and delivery.
 
@@ -712,8 +745,8 @@ Use the following responsibility split:
 spec
 → what is being built and why
 
-tickets produced by to-tickets
-→ implementation units + blocking edges / dependency graph
+immutable Workflow package copy
+→ accepted spec + filename-ordered implementation units
 
 Git/worktree
 → durable code state
@@ -735,11 +768,7 @@ There is intentionally **no separate `OrchestratorTask` entity** in V1.
 
 ## 10.2 Ticket execution state
 
-A ticket that has never been executed does not need an entry in `state.json`; it is implicitly `pending`.
-
-The Orchestrator reads the ticket graph and derives whether a pending ticket is currently `ready` or `blocked` from its blocking edges.
-
-Persist only facts that cannot be derived from the ticket files.
+A Workflow run freezes its ordered Ticket queue from the copied Workflow package. Persist only each ticket's snapshot reference, minimal status and accepted commit. The user may request only the first `pending` ticket.
 
 Example:
 
@@ -754,12 +783,12 @@ Example:
   "base": "abc123",
   "tickets": {
     "001-auth-model": {
-      "status": "done",
+      "status": "accepted",
       "commit": "def456",
       "attempt": 1
     },
     "002-auth-api": {
-      "status": "running",
+      "status": "active",
       "attempt": 1,
       "agent": "codex",
       "herdrPane": "pane-17"
@@ -774,22 +803,12 @@ Example:
 Ticket execution statuses can stay minimal:
 
 ```text
-missing entry = pending
-running
-finished       # worker settled; checkpoint not yet accepted
-done
-failed
+pending
+active
+accepted
 ```
 
-`ready` and `blocked` should normally be **derived**, not persisted.
-
-For example:
-
-```text
-001 done
-002 blocked by 001  → ready
-003 blocked by 002  → blocked
-```
+Worker `blocked` or `failed` outcomes remain attempt/run outcomes owned by the existing Phase 4 lifecycle; they do not make later queue entries eligible.
 
 This keeps the runtime model aligned with `to-tickets` instead of duplicating it.
 
@@ -880,7 +899,7 @@ This separation is intentional:
 
 ```text
 global skill installation
-→ workflow policy, reusable references, generic prompt templates, deterministic helper tooling
+→ workflow policy, reusable references, skill-aware wrapper templates, deterministic helper tooling
 
 application repository
 → project-specific config, project-specific checks/overrides, specs/tickets/context, runtime run state
@@ -909,21 +928,27 @@ project/
     └── runs/
 ```
 
-The reusable/default worker, reviewer, fixer, and blocked-resume prompt templates belong to the **global skill package**, not to every target repository. Repo-local prompt files are overrides only when a project needs them.
+The reusable/default worker, reviewer, fixer, and blocked-resume templates belong to the **global skill package**, not to every target repository. Worker and reviewer defaults are skill-aware wrappers; repo-local files are explicit orchestration-contract overrides, not replacements for downstream engineering methodology.
 
-The setup command can conceptually be:
+Phase 4 exposes `flow setup`. It creates missing `.orchestrator/config.yaml`, `.orchestrator/README.md`, and the runtime ignore rule idempotently. It validates but never overwrites an existing config, README, or user ignore content; conflicts require manual resolution.
 
-```text
-/orchestrate setup
+The initial config keeps role, agent, and skill distinct:
+
+```yaml
+version: 1
+agents:
+  codex:
+    kind: codex
+roles:
+  worker:
+    agent: codex
+    skill: implement
+workflow:
+  workerTimeoutSeconds: 1800
+  maxWorkerAttempts: 2
 ```
 
-or:
-
-```bash
-flow setup
-```
-
-The skill should be able to create/update the repo-local structure idempotently.
+Phase 4 does not accept arbitrary child-process arguments from repo config. Worker timeout is validated in the range 60–7200 seconds.
 
 ## 11.2 What should be committed in the application repository
 
@@ -1002,6 +1027,19 @@ project/
         └── feature-auth/
             ├── state.json
             ├── history.jsonl        # optional but recommended
+            ├── input/
+            │   ├── spec.md
+            │   └── issues/
+            │       ├── 001-auth-model.md
+            │       └── 002-auth-api.md
+            ├── workers/
+            │   └── 002-auth-api/
+            │       └── attempt-01/
+            │           ├── input/
+            │           │   └── ticket.md
+            │           ├── execution.json
+            │           └── output/
+            │               └── result.json
             ├── review/
             │   ├── attempt-01.md
             │   └── attempt-01.json
@@ -1015,107 +1053,73 @@ project/
                 └── logs/
 ```
 
-Notice what is **not** duplicated here:
+The Workflow package is copied once as immutable run input. What is **not** introduced is:
 
 ```text
-no copied spec
-no copied ticket graph
-no internal T01/T02 task definitions
+no live tracker mirror
+no parsed dependency graph
+no second internal task model
 ```
 
-The run state references the real spec/tickets where they already live.
+The run uses the immutable copy of the Workflow package captured at creation, not mutable tracker or source files.
 
 ---
 
-# 13. Tickets are the implementation task graph
+# 13. Workflow package and Ticket queue
 
-The Orchestrator should consume the tickets produced by Matt Pocock's `to-tickets` skill directly.
+The Orchestrator consumes one prepared local Workflow package:
 
-`to-tickets` already provides the properties needed by a workflow scheduler:
+```text
+<feature>/
+├── spec.md
+└── issues/
+    ├── 01-first-slice.md
+    └── 02-second-slice.md
+```
 
-- one ticket per implementation slice;
-- tracer-bullet vertical slices;
-- explicit blocking edges;
-- local files or native tracker records;
-- ticket sizes suitable for fresh context windows.
+Ticket IDs are filenames without `.md`; lexical filename order defines the fixed Ticket queue. Ticket bodies are opaque inputs to `implement`. Phase 5 does not parse status, priority or blocking edges.
 
 Therefore the intended relationship is:
 
 ```text
-approved spec
-    ↓
-to-tickets
-    ↓
-Ticket A ─────┐
-Ticket B      │ blocking graph
-Ticket C ◄────┘
-    ↓
-Orchestrator executes tickets
-    ↓
-fresh agent per ticket
+local tracker / GitHub / Linear
+            ↓
+preparation or import process
+            ↓
+local Workflow package
+            ↓
+Orchestrator executes one explicit ticket step
 ```
 
-Not:
+Workers receive one immutable Ticket input snapshot as their only implementation scope and the run-owned immutable `spec.md` as read-only feature context. They neither discover tickets nor know the upstream tracker; other tickets and internal Orchestrator documentation are not official Worker inputs. Target-repository guidance remains discoverable from the worktree, for example through `AGENTS.md`.
+
+## 13.1 User-driven execution
 
 ```text
-Matt ticket
+$orchestrate <workflow-package> <ticket-id>
     ↓
-new Orchestrator task
+create or resume run
     ↓
-agent
+validate that ticket-id is the first pending entry
+    ↓
+fresh Worker → commit → accepted checkpoint
+    ↓
+return control to user
 ```
 
-## 13.1 Ready-ticket calculation
+One Workflow run, Feature branch and Feature worktree span the whole package. Each ticket uses a fresh Worker. Repeating an accepted ticket is an idempotent no-op; requesting a later ticket early is rejected. Repeating the same blocked ticket is an explicit resume request and may launch one fresh bounded retry only after reconciliation proves a clean unchanged checkpoint, unambiguous artifacts, safe cleanup and remaining attempt budget.
 
-The Orchestrator reads the current ticket set and its blocking edges.
+## 13.2 Tracker boundary
 
-For each ticket:
-
-```text
-if ticket already recorded as done:
-    done
-else if every blocker is done:
-    ready
-else:
-    blocked
-```
-
-For V1, choose one ready ticket and execute sequentially.
-
-## 13.2 Tickets may come from different backends
-
-The task graph may be represented as:
-
-- local markdown ticket files created by `to-tickets`;
-- GitHub issues with blocking relationships represented by the skill;
-- another configured tracker.
-
-The Orchestrator only needs a small adapter that can answer:
-
-```text
-list tickets
-read ticket
-read blocking edges
-identify ticket reference/title
-```
-
-Do not copy full ticket content into `state.json`.
+Phase 5 has no GitHub/Linear API, tracker adapter or write-back. Future importers may normalize remote tracker data into the local Workflow package, and future exporters may publish results back. These remain outside the execution engine.
 
 ## 13.3 When no tickets exist
 
-If the user provides only a spec and explicitly wants the Orchestrator to decompose it, the Orchestrator may invoke/use the existing `to-tickets` skill first.
-
-The preferred flow is:
+The execution workflow fails clearly when the package lacks a regular `spec.md` or at least one regular `issues/*.md` ticket. Planning and ticket creation happen before Orchestrator execution:
 
 ```text
-spec
-  ↓
-to-tickets
-  ↓
-Orchestrator execution
+spec → to-tickets/importer → Workflow package → Orchestrator execution
 ```
-
-rather than introducing an internal planning format.
 
 ---
 
@@ -1126,28 +1130,26 @@ The Orchestrator skill should contain **judgment and policy**, not implementatio
 It should teach the main agent to:
 
 1. establish that it is running inside Herdr;
-2. identify the input spec/tickets;
-3. prefer already-existing approved specs/tickets;
+2. identify the prepared local Workflow package and explicit ticket ID;
+3. require the fixed `spec.md` + `issues/*.md` package layout;
 4. avoid reopening settled product/design decisions;
-5. read the existing ticket graph and blocking edges;
-6. invoke/use `to-tickets` first only when no suitable tickets exist;
-7. create/resume a minimal repo-local durable run;
-8. create one primary worktree for sequential work;
-9. derive the next ready ticket from ticket dependencies + execution state;
-10. choose an appropriate worker role;
-11. launch a fresh worker using Herdr;
-12. provide the ticket + bounded authoritative context;
-13. wait for completion/blocking;
-14. validate the Git checkpoint and any worker artifact;
-15. record ticket execution state;
-16. repeat until implementation is complete;
-17. launch a fresh reviewer;
-18. run deterministic checks;
-19. launch a fresh fixer when needed;
-20. limit retries;
-21. mark the run complete only when review/check policy is satisfied;
-22. surface meaningful blockers to the human;
-23. resume correctly after context/process restart by reading repo-local durable state.
+5. create or resume the one run associated with that package;
+6. use the immutable package copy owned by the run;
+7. create one Feature worktree shared by all tickets in the run;
+8. validate that the requested ticket is the first pending queue entry;
+9. construct a worker role execution using the configured `implement` skill;
+10. render the logical skill invocation for the selected agent;
+11. launch a fresh worker using Herdr and send the rendered wrapper prompt;
+12. wait for completion/blocking;
+13. validate the Git checkpoint and any worker artifact;
+14. record ticket execution state;
+15. return control after at most one ticket;
+16. make a repeated accepted-ticket request an idempotent no-op;
+17. stop on blocked, failed or ambiguous execution;
+18. treat a repeated request for the same blocked ticket as an explicit resume request, but launch a fresh bounded retry only after safe reconciliation;
+19. mark the run implementation-complete only after the final ticket is accepted;
+20. surface meaningful blockers to the human;
+21. resume correctly after context/process restart by reading repo-local durable state.
 
 The skill should explicitly say:
 
@@ -1160,6 +1162,8 @@ Do not reopen settled product decisions.
 
 Delegate implementation to fresh workers.
 Delegate semantic review to a fresh reviewer.
+Invoke configured downstream skills for implementation and review.
+Add orchestration contracts; do not restate downstream methodology.
 Use deterministic scripts for deterministic checks.
 
 Herdr is your terminal/process control layer.
@@ -1194,11 +1198,13 @@ One safe pattern:
 2. retain the returned pane ID;
 3. start the selected agent process;
 4. name/label the pane/agent with run/task identity;
-5. send the generated worker prompt;
+5. send the already-rendered worker prompt as an opaque payload;
 6. store Herdr identity in `execution.json`;
 7. wait for lifecycle state or inspect output;
 8. handle blocked/unknown cases deliberately;
-9. after checkpoint validation, optionally close the pane.
+9. validate result and Git without mutation;
+10. close only the owned pane;
+11. revalidate and atomically accept the attempt/checkpoint under the run lock.
 
 Conceptually:
 
@@ -1212,25 +1218,21 @@ PANE_JSON="$(
 
 PANE_ID="<parse .result.pane.pane_id>"
 
-herdr pane rename "$PANE_ID" "run42:T01:codex"
-herdr pane run "$PANE_ID" "codex"
-```
-
-The higher-level agent API may be preferable where supported:
-
-```bash
-herdr agent start "run42:T01" \
-  --cwd "$WORKTREE" \
-  -- codex
+AGENT_NAME="run42-t01-codex"
+herdr agent start "$AGENT_NAME" --kind codex --pane "$PANE_ID" -- \
+  -C "$WORKTREE" \
+  --add-dir "$ATTEMPT_OUTPUT" \
+  --sandbox workspace-write \
+  --approve-for-me
 ```
 
 Then:
 
 ```bash
-herdr agent prompt "run42:T01" "$(cat "$PROMPT_FILE")"
+herdr agent prompt "$AGENT_NAME" "$PROMPT" --wait --timeout 120000
 ```
 
-The implementation should prefer the highest-level reliable Herdr primitive for coding agents and keep raw pane operations as the escape hatch.
+The implementation should prefer the highest-level reliable Herdr primitive for coding agents and keep raw pane operations as the escape hatch. The Herdr adapter must neither construct nor interpret skill invocations.
 
 ## 15.3 Waiting
 
@@ -1247,7 +1249,7 @@ Examples include agent lifecycle waits and output waits.
 When the wait returns:
 
 - `done` / `idle` → inspect structured result and repository state;
-- `blocked` → inspect worker dialog/output, then either answer safely or surface a blocker;
+- `blocked` → capture bounded diagnostics, close the owned pane, and block the run; do not conduct an automatic dialogue;
 - `unknown` → treat as unknown, not success;
 - timeout/process disappearance → record execution failure and apply retry policy.
 
@@ -1266,56 +1268,69 @@ This keeps the system from having to parse natural-language scrollback to infer 
 
 ---
 
-# 16. Worker contract
+# 16. Skill-aware worker contract
 
-Every worker should get a bounded task and explicit completion protocol.
+Every worker invocation has exactly three conceptual parts:
 
-Example worker brief:
+1. the configured downstream skill invocation;
+2. its input, normally the assigned ticket reference;
+3. the orchestration contract.
 
-```markdown
-# Worker ticket 002-auth-api
+The logical workflow request is independent of agent syntax:
 
-You are implementing exactly one assigned ticket in an existing feature worktree.
-
-## Source of truth
-
-Ticket:
-<ticket reference/path from the configured `to-tickets` output>
-
-Spec:
-<spec path/ref>
-
-## Read before editing
-
-- CONTEXT.md
-- docs/adr/004-persistence.md
-- <other relevant docs>
-
-## Current Git context
-
-Branch: feat/preferences
-Base commit before this ticket: def456
-
-Previous completed ticket commits are already present in this worktree.
-
-## Instructions
-
-1. Implement only this ticket.
-2. Do not reopen settled design decisions from the spec/ADRs.
-3. Use the repository's existing engineering skills where appropriate.
-4. Run ticket-relevant tests/typechecks.
-5. Commit completed work to the current branch.
-6. Write the structured result to:
-   .orchestrator/runs/<run-id>/tickets/<ticket-id>/result.json
-7. Finish the session.
-
-Do not mark the overall workflow complete.
-Do not edit global workflow state.
+```text
+role: worker
+skill: implement
+input: /absolute/runtime/path/attempt-01/input/ticket.md
 ```
 
-If using Matt skills, the prompt can explicitly instruct the worker to use `/implement <ticket>`.
+The selected agent renderer converts this to a concrete wrapper. For Codex:
 
-## 16.1 Worker result
+```markdown
+$implement "/absolute/runtime/path/attempt-01/input/ticket.md"
+
+Orchestration contract:
+
+- Run: run_20260903_feature_x
+- Ticket: 002-auth-api
+- Worktree: /absolute/path/to/worktree
+- Write the structured execution result to:
+  /absolute/runtime/path/attempt-01/output/result.json
+- Commit required: true
+- Implement only the assigned ticket and work only in the provided worktree.
+- Global Orchestrator workflow state is read-only.
+- On a product, architecture, security, destructive-operation, credential, or human-decision blocker, do not guess. Write a `blocked` result with the smallest required decision, then stop.
+- On technical failure, write a `failed` result with relevant diagnostics, then stop.
+```
+
+This wrapper does not teach the worker how to inspect, design, implement, test, or self-review software; that methodology belongs to `implement`. `$implement` is Codex syntax and must not appear in workflow state-machine semantics.
+
+## 16.1 Worker attempt artifacts
+
+Phase 4 accepts one explicit local Markdown ticket. Its canonical ticket ID is the filename without `.md`. The source must be a regular file inside the Target repository. Every attempt copies and hashes the source into an immutable snapshot:
+
+```text
+.orchestrator/runs/<run-id>/workers/<ticket-id>/attempt-01/
+├── input/
+│   └── ticket.md
+├── execution.json
+└── output/
+    └── result.json
+```
+
+Only `output/` is writable by the worker. `execution.json` is Orchestrator-owned and stores the logical invocation, input and prompt hashes, artifact references, attempt status, Herdr identity, lifecycle observations, cleanup, timings, and at most the final 32 KiB of diagnostic output. It does not store the full prompt or transcript.
+
+Attempt status is separate from Herdr lifecycle:
+
+```text
+prepared → running → reconciling → accepted
+                              ├── blocked
+                              └── failed
+```
+
+The public operations are `flow worker execute`, `flow worker reconcile`, and `flow worker retry`. They require an explicit run in `implementing`, a ready Feature worktree, and an explicit ticket; a run still in `preparing` must finish Phase 2 Git preparation first. Scheduling remains a Phase 5 concern. A repeated command never launches a duplicate worker without first reconciling the active attempt.
+
+## 16.2 Worker result
 
 Example:
 
@@ -1325,7 +1340,7 @@ Example:
   "ticketId": "002-auth-api",
   "status": "completed",
   "summary": "Added authenticated preferences API endpoint",
-  "commit": "fed987",
+  "commit": "fed9870123456789fed9870123456789fed98701",
   "commands": [
     {
       "command": "pnpm test preferences-api",
@@ -1336,10 +1351,7 @@ Example:
       "exitCode": 0
     }
   ],
-  "filesChanged": [
-    "src/api/preferences.ts",
-    "tests/preferences-api.test.ts"
-  ],
+  "filesChanged": ["src/api/preferences.ts", "tests/preferences-api.test.ts"],
   "decisions": [],
   "notesForNextTask": [
     "Consumers should call UserPreferenceService; do not access repository directly."
@@ -1347,21 +1359,29 @@ Example:
 }
 ```
 
+A Worker result is a versioned discriminated union. `completed` requires the canonical commit and structured command results; `blocked` requires a structured blocker and smallest required decision; `failed` requires structured diagnostics. `filesChanged` and handoff notes are optional information rather than workflow truth. The worker publishes through a temporary file and atomic rename.
+
 A worker may also report a blocker:
 
 ```json
 {
+  "schemaVersion": 1,
+  "ticketId": "002-auth-api",
   "status": "blocked",
+  "summary": "A product decision is required",
   "blocker": {
-    "type": "decision",
+    "type": "product",
     "summary": "Spec is ambiguous about anonymous users.",
-    "options": [
-      "Return 401",
-      "Return default preferences"
-    ]
+    "requiredDecision": "Choose whether anonymous users receive 401 or default preferences."
   }
 }
 ```
+
+## 16.3 Retry and ticket refresh
+
+The default maximum is two attempts. A failed invocation never starts another Worker automatically, including failures before prompt delivery. A later explicit invocation may retry only after reconciliation proves that no side effects remain. After delivery, timeout, disappearance, malformed/missing result, or technical failure likewise requires explicit reconciliation. Any commit, dirty worktree, mismatched HEAD/branch, or other unknown side effect blocks rather than retries.
+
+Retry reuses the immutable Ticket input snapshot and the same run-owned Specification input snapshot. If a human intentionally changed the source ticket, `worker retry --refresh-ticket` records the old and new hashes and creates a fresh snapshot; task changes never enter a retry silently.
 
 ---
 
@@ -1369,7 +1389,7 @@ A worker may also report a blocker:
 
 The worker saying "done" is insufficient.
 
-Before setting `task.status = done`, the Orchestrator/helper should validate at minimum:
+Before accepting a Worker attempt, the Orchestrator/helper should validate at minimum:
 
 ```text
 ✓ expected worktree still exists
@@ -1379,9 +1399,11 @@ Before setting `task.status = done`, the Orchestrator/helper should validate at 
 ✓ result.json exists and parses
 ✓ result task ID matches assigned task
 ✓ reported commit exists
-✓ reported commit is reachable from current HEAD
+✓ reported commit is the canonical current HEAD and descends from the prior checkpoint
 ✓ there are no unexpected unresolved decisions
 ✓ worktree state satisfies configured cleanliness policy
+✓ Ticket input snapshot and Execution record still match State snapshot
+✓ Orchestrator-owned artifacts were not modified
 ```
 
 Optional checks:
@@ -1392,15 +1414,17 @@ Optional checks:
 ✓ commit message references task/ticket
 ```
 
-Then transition:
+Validation and acceptance are deliberately separated:
 
 ```text
-worker_done
-    ↓
-checkpoint_validating
-    ↓
-done
+inspect without mutation
+    → read bounded diagnostics
+    → close owned pane
+    → revalidate under run lock
+    → atomically accept checkpoint + Worker attempt
 ```
+
+If a failed or missing result accompanies no new commit and a clean worktree, the failure is conclusive and retry may be allowed. If invalid, missing, failed, or blocked output accompanies a commit or dirty worktree, the run blocks for reconciliation. The worker's declaration never overrides Git evidence.
 
 ---
 
@@ -1446,7 +1470,7 @@ This keeps new agents oriented without polluting their context with the previous
 
 ---
 
-# 19. Reviewer stage
+# 19. Skill-aware independent reviewer stage
 
 After all required implementation tasks are complete, launch a fresh reviewer.
 
@@ -1458,37 +1482,33 @@ Preferred reviewer properties:
 - knows fixed `BASE_SHA`;
 - knows current `HEAD`;
 - receives the originating spec;
-- receives project context/ADRs;
-- uses dedicated review skills/extensions.
+- invokes the configured `code-review` skill;
+- writes the required human-readable and machine-readable artifacts.
 
 Example review prompt:
 
 ```markdown
-# Review run run_20260903_feature_x
+$code-review
 
-Review the implementation from:
+Review the fixed implementation range:
 
-BASE: abc123
-HEAD: fed987
+BASE_SHA: abc123
+HEAD_SHA: fed987
 
-Source spec:
-docs/specs/feature-x.md
+Ticket: .scratch/feature/issues/002-auth-api.md
+Spec: docs/specs/feature-x.md
 
-Read:
-- CONTEXT.md
-- relevant ADRs
-- repository coding standards
+Orchestration contract:
 
-Use the installed code-review skill.
-
-Do not implement fixes in this session.
-
-Write findings to:
-<runtime>/review/attempt-01.md
-
-Also write machine-readable summary to:
-<runtime>/review/attempt-01.json
+- This is a review-only execution; do not modify implementation code.
+- Review exactly the fixed `BASE_SHA..HEAD_SHA` range.
+- Write the human-readable review to: <runtime>/review/attempt-01.md
+- Write the machine-readable result to: <runtime>/review/attempt-01.json
+- Return pass/fail with structured findings.
+- If required information is missing, write a `blocked` or `failed` artifact instead of guessing.
 ```
+
+The workflow stores logical `skill = code-review`; the Codex renderer emits `$code-review`. The wrapper must not restate the Standards/Spec review methodology owned by the skill.
 
 ## 19.1 Why fresh review matters
 
@@ -1508,13 +1528,15 @@ Can I justify the implementation I just wrote?
 
 ## 19.2 Matt `code-review`
 
-Where available, use Matt's code-review methodology:
+The configured downstream `code-review` skill owns:
 
 - fixed diff point;
 - Standards axis;
 - Spec axis;
 - keep findings separate;
 - do not let one axis hide the other.
+
+The Orchestrator owns only the fixed diff inputs, source references, read-only/no-fix rule, artifact paths, failure protocol, and artifact validation. It must also validate that the reviewer did not modify implementation code.
 
 ---
 
@@ -1645,9 +1667,7 @@ Example:
       "exitCode": 1,
       "durationMs": 43000,
       "log": "logs/browser.log",
-      "artifacts": [
-        "artifacts/screenshots/mobile-nav-failure.png"
-      ]
+      "artifacts": ["artifacts/screenshots/mobile-nav-failure.png"]
     }
   ]
 }
@@ -1742,14 +1762,17 @@ feat/feature-x
 ## Review findings
 
 ### HIGH
+
 - UserPreferenceService does not validate ownership.
 
 ### MEDIUM
+
 - Persistence mapping is duplicated.
 
 ## Deterministic failures
 
 ### browser
+
 Mobile navigation cannot open Settings.
 
 Artifact:
@@ -1856,10 +1879,7 @@ Example:
   "task": "T02",
   "status": "open",
   "question": "Should anonymous users receive defaults or 401?",
-  "options": [
-    "401",
-    "default preferences"
-  ],
+  "options": ["401", "default preferences"],
   "sourceExecution": "exec_002"
 }
 ```
@@ -2020,8 +2040,8 @@ coding-orchestrator/
 │   │   └── agent.ts
 │   │
 │   ├── tickets/
-│   │   ├── source.ts          # read configured to-tickets output/tracker
-│   │   ├── scheduler.ts       # derive ready tickets from blockers + state
+│   │   ├── source.ts          # read immutable local Workflow package
+│   │   ├── queue.ts           # validate fixed order + explicit next ticket
 │   │   └── validate.ts
 │   │
 │   ├── execution/
@@ -2150,24 +2170,25 @@ Example:
 agents:
   worker:
     executable: codex
+    skill: implement
     args: []
 
   workerLarge:
     executable: claude
+    skill: implement
     args: []
 
   reviewer:
-    executable: pi
-    args:
-      - "--profile"
-      - "reviewer"
+    executable: codex
+    skill: code-review
+    args: []
 
   fixer:
     executable: codex
     args: []
 ```
 
-The Orchestrator chooses a **role**:
+The Orchestrator chooses a **role**, resolves its agent profile and configured downstream skill, then creates a logical role execution:
 
 ```text
 worker
@@ -2175,7 +2196,17 @@ reviewer
 fixer
 ```
 
-The project config determines which executable currently implements that role.
+The project config determines which executable currently implements that role and which skill, if any, owns its engineering methodology.
+
+```text
+role != agent profile != skill
+
+worker + codex + implement
+reviewer + codex + code-review
+fixer + codex + no configured skill
+```
+
+The fixer does not automatically use `implement`. It retains a bounded fixer prompt unless a dedicated fixer skill is explicitly configured.
 
 Later, policies may select based on:
 
@@ -2369,13 +2400,16 @@ That idea is inspired by Firstmate's event-driven supervision but should be adde
 
 V1 should intentionally avoid a "swarm".
 
-Recommended V1 scheduler:
+Recommended Phase 5 POC:
 
 ```text
-while exists ready task:
-    choose first ready task
-    run fresh worker
-    validate checkpoint
+user selects exact next ticket
+    ↓
+run one fresh worker
+    ↓
+validate checkpoint
+    ↓
+return control to user
 ```
 
 Benefits:
@@ -2393,7 +2427,7 @@ Future scheduler:
 frontier = all tickets whose blockers are done
 ```
 
-Then the system can run multiple frontier tasks in isolated worktrees.
+Automatic queue draining, blocking graphs and parallel frontier execution remain future improvements.
 
 That is a separate architectural phase and should not complicate the initial implementation.
 
@@ -2603,11 +2637,13 @@ workflow:
 agents:
   worker:
     executable: codex
+    skill: implement
   workerLarge:
     executable: claude
+    skill: implement
   reviewer:
-    executable: pi
-    args: ["--profile", "reviewer"]
+    executable: codex
+    skill: code-review
   fixer:
     executable: codex
 
@@ -2645,9 +2681,17 @@ The setup skill should also ensure `.orchestrator/runs/` is gitignored by defaul
 
 ---
 
-# 44. Prompts should be generated from templates
+# 44. Skill-aware wrappers should be generated from templates
 
-Do not let the Orchestrator improvise the entire worker protocol each time.
+Do not let the Orchestrator improvise worker or reviewer methodology. Their templates are skill-aware wrappers:
+
+```text
+downstream skill invocation
++ task or fixed-review input
++ orchestration contract
+```
+
+Worker and reviewer templates must not duplicate methodology owned by `implement` or `code-review`. The fixer template remains a bounded role contract unless a dedicated fixer skill is configured.
 
 Use reusable templates populated with run data. The default templates belong to the global skill package, for example:
 
@@ -2663,14 +2707,14 @@ A target repository may optionally provide project-specific overrides under `.or
 
 Benefits:
 
-- consistent behavior across Claude/Codex/Pi;
+- explicit separation of logical skill names from agent syntax;
 - easier debugging;
 - easy prompt testing;
 - less orchestration-context token use;
-- explicit protocol evolution;
-- one reusable source of truth for the generic worker/reviewer/fixer contracts.
+- explicit contract evolution;
+- one reusable source of truth for orchestration contracts.
 
-The Orchestrator should still be able to add a short task-specific note.
+Agent-specific renderers supply invocation syntax. For Codex, `implement` becomes `$implement` and `code-review` becomes `$code-review`; workflow semantics must not hardcode those strings. The Orchestrator may still add a short task-specific orchestration note.
 
 ---
 
@@ -2779,7 +2823,7 @@ A successful V1 should support this scenario:
 
 ```text
 Given:
-- an approved spec + tickets produced by `to-tickets` (or an existing configured ticket set)
+- a prepared local Workflow package containing `spec.md` and ordered `issues/*.md`
 - a Git repository
 - Herdr running
 - Codex/Claude/Pi available
@@ -2790,20 +2834,21 @@ The Orchestrator can:
 1. run repo setup if `.orchestrator/` is not initialized;
 2. create a repo-local run state;
 3. create a feature worktree;
-4. read the ticket graph/blocking edges;
-5. derive the first ready ticket;
+4. copy the Workflow package into immutable run input;
+5. validate the exact ticket selected by the user as the first pending queue entry;
 6. launch fresh Worker 1 in a Herdr pane;
 7. send that ticket;
 8. wait and validate its commit/checkpoint;
 9. record the ticket as done in `state.json`;
-10. derive and launch the next ready ticket in a fresh agent context;
-11. launch a fresh reviewer after implementation tickets finish;
-12. ingest review result;
-13. run deterministic checks;
-14. if failure: launch one fresh fixer;
-15. rerun required verification;
-16. mark completed;
-17. recover from an Orchestrator restart at any phase.
+10. return control to the user after that one ticket;
+11. resume later in the same worktree with the next explicitly selected ticket and a fresh agent until implementation is complete;
+12. launch a fresh reviewer;
+13. ingest review result;
+14. run deterministic checks;
+15. if failure: launch one fresh fixer;
+16. rerun required verification;
+17. mark completed;
+18. recover from an Orchestrator restart at any phase.
 ```
 
 This is enough to validate the architecture.
@@ -2833,6 +2878,8 @@ Tests:
 
 ## Phase 2 — Git/worktree
 
+The skill-aware invocation correction does not change Phase 2. Finish repository identity, base, worktree, checkpoint, and cleanup safety normally; worker/reviewer prompt construction belongs to later phases.
+
 Implement:
 
 - detect repository;
@@ -2857,42 +2904,71 @@ read output
 close
 ```
 
-Mock the command runner for unit tests.
+Treat the rendered prompt as an opaque payload. Do not construct or interpret worker, reviewer, skill, ticket, or artifact semantics in this adapter.
+
+Phase 3 is a feasibility gate, not only an adapter unit. It is complete when:
+
+1. deterministic tests pass against a fake `herdr` executable; and
+2. `flow herdr smoke --agent codex` passes inside a Herdr-managed pane with `HERDR_ENV=1`.
+
+The internal TypeScript adapter exposes `launch`, `prompt`, `wait`, `read`, and `close` around an owned handle containing pane ID and agent name. It creates a sibling pane from the caller with explicit absolute cwd and `--no-focus`, uses deterministic Herdr-safe names, refuses collisions, and invokes the CLI through an injectable argv-based command runner rather than shell-built command strings.
+
+`wait` reports `settled`, `blocked`, `unknown`, `timed-out`, or `disappeared`. Invocation and protocol failures remain explicit errors. These are transport observations, never ticket-completion decisions.
+
+The smoke challenge uses a nonce, multiline content, literal `$implement`, and expected cwd. Passing requires successful agent detection, opaque prompt delivery, settled lifecycle, readable matching output, and closure of only the pane created by the command. `--keep-pane` is diagnostic and cannot produce a full passing gate. JSON is emitted to stdout and may optionally be copied to an output file without mutating workflow state.
+
+Mocked coverage includes launch success, blocked, done, unknown, timeout, process disappearance, malformed JSON, non-zero exits, partial-launch cleanup, name collision, byte-for-byte prompt forwarding, and bounded diagnostics. The real smoke is explicit and opt-in; `pnpm test` must not launch an interactive agent.
 
 Do not yet create a generic terminal abstraction unless needed.
 
-## Phase 4 — worker execution
+## Phase 4 — skill-aware worker execution
 
 Implement:
 
-- prompt generation;
+- logical worker role/skill invocation;
+- configured implementation skill (`implement`);
+- worker orchestration-contract generation;
+- agent-specific skill rendering, including Codex `$implement`;
+- skill-aware worker wrapper prompt;
 - execution record;
 - worker result schema;
+- blocker/failure result handling;
 - ticket checkpoint validation;
 - retry count.
 
 Use one sequential ticket first.
 
-## Phase 5 — ticket graph execution
+## Phase 5 — user-driven ticket steps
 
 Implement:
 
-- adapter for the configured `to-tickets` output/tracker;
-- ticket blocking-edge parsing;
-- ready-ticket calculation from ticket graph + `state.json`;
-- sequential loop;
-- same-worktree fresh agents.
+- strict local Workflow package validation (`spec.md` + `issues/*.md`): regular non-empty files, safe unique Ticket IDs and valid owned configuration, without parsing downstream implementation methodology from Markdown;
+- immutable package copy and fixed filename-ordered Ticket queue;
+- `$orchestrate <workflow-package> <ticket-id>` operator interface;
+- one explicit ticket per user-triggered Workflow step;
+- validation that the selected ticket is the first pending entry;
+- one shared Feature worktree with a fresh agent per ticket;
+- minimal `pending | active | accepted` state and accepted commit;
+- idempotent accepted-ticket replay and durable resume;
+- explicit same-ticket blocked resume with safe reconciliation and bounded fresh retry;
+- dispatch of the selected Ticket input snapshot to Phase 4.
 
-Do **not** introduce a second internal task graph.
+Do **not** add a dependency graph, automatic scheduler, queue-draining loop, tracker API or write-back in the POC.
 
-## Phase 6 — reviewer
+## Phase 6 — skill-aware independent reviewer
 
 Implement:
 
-- fixed base/head;
-- reviewer prompt;
-- review result schema;
-- pass/fail ingestion.
+- fixed `BASE_SHA`/`HEAD_SHA`;
+- logical reviewer role/skill invocation;
+- configured review skill (`code-review`);
+- agent-specific rendering, including Codex `$code-review`;
+- review orchestration contract and artifact paths;
+- skill-aware reviewer wrapper prompt;
+- review result schema with closed execution status and structured findings using `low | medium | high | critical` severity;
+- deterministic reducer that maps validated reviewer output and a declared blocking threshold to pass/fail/blocked without LLM interpretation;
+- artifact-only handoff from the fixed diff and spec/ticket references to `review.md` and `review.json`;
+- validation that reviewer did not modify implementation code.
 
 ## Phase 7 — deterministic checks
 
@@ -2906,12 +2982,13 @@ Implement:
 
 ## Phase 8 — fixer
 
-Implement:
+Implement later, after the manual Phase 6 failure policy proves insufficient:
 
 - fix brief synthesis from review/check artifacts;
 - fresh fixer launch;
 - result validation;
-- bounded retries.
+- bounded retries with an explicit stop condition;
+- a distinct numbered work unit and artifact set for every repair and re-review attempt; do not model iteration as a cyclic edge back to an ancestor stage.
 
 ## Phase 9 — browser check
 
@@ -2936,7 +3013,9 @@ The orchestration tooling needs strong tests because LLM agents will rely on its
 - retry policy;
 - config parsing;
 - schema validation;
-- prompt construction;
+- logical role/skill invocation construction;
+- Codex skill rendering (`implement` → `$implement`, `code-review` → `$code-review`);
+- skill-aware wrapper prompt construction;
 - event serialization.
 
 ## Integration tests
@@ -2958,6 +3037,8 @@ Fake Herdr CLI:
 - process disappears;
 - malformed output.
 
+Herdr tests remain unaware of skill semantics and assert that rendered prompts are transported unchanged.
+
 Fake worker artifacts:
 
 - good result;
@@ -2966,6 +3047,8 @@ Fake worker artifacts:
 - invalid JSON;
 - stale commit;
 - blocked decision.
+
+Worker prompt tests assert `$implement`, assigned ticket, result path, blocker protocol, and commit requirement, without a duplicated implementation methodology. Reviewer prompt tests assert `$code-review`, fixed base/head, ticket/spec references, output paths, and the no-code-modification contract, without a duplicated Standards/Spec methodology.
 
 ## End-to-end test
 
@@ -2999,6 +3082,7 @@ Example:
   "role": "worker",
   "ticketId": "002-auth-api",
   "agentProfile": "workerLarge",
+  "skill": "implement",
   "command": ["claude"],
   "cwd": "/.../worktree",
   "herdr": {
@@ -3178,6 +3262,12 @@ These should eventually appear verbatim or nearly verbatim in the skill/tooling 
 19. **Existing Matt Pocock skills remain specialized building blocks rather than being reimplemented.**
 20. **The Orchestrator implementation is installed globally; each application repository owns only its repo-local `.orchestrator/` contract and the skill bootstraps that contract idempotently.**
 21. **Active run state is repo-local under `.orchestrator/runs/` and gitignored by default.**
+22. **Skills define engineering methodology; the Orchestrator adds only workflow semantics and the minimum execution contract.**
+23. **Worker and reviewer prompts are skill-aware wrappers, not standalone engineering methodologies.**
+24. **Agent-specific skill invocation syntax belongs to the agent renderer, not workflow semantics.**
+25. **Herdr transports already-rendered prompts as opaque payloads.**
+26. **Execution role, agent profile, and downstream skill are distinct concepts.**
+27. **A fixer uses a bounded fixer contract unless a dedicated fixer skill is explicitly configured.**
 
 ---
 
@@ -3221,7 +3311,8 @@ Orchestrator pane (Claude)
   │               │
   │               ▼
   │           Codex Worker
-  │           T01 /implement
+  │           $implement T01
+  │           + orchestration contract
   │               │
   │               ▼
   │             commit A
@@ -3235,7 +3326,8 @@ Orchestrator pane (Claude)
   │               │
   │               ▼
   │           Claude Worker
-  │           T02 /implement
+  │           $implement T02
+  │           + orchestration contract
   │               │
   │               ▼
   │             commit B
@@ -3246,17 +3338,20 @@ Orchestrator pane (Claude)
   │               │
   │               ▼
   │           Codex Worker
-  │           T03 /implement
+  │           $implement T03
+  │           + orchestration contract
   │               │
   │               ▼
   │             commit C
   │
   ├── validate T03
   │
-  ├── Herdr → fresh Pi reviewer
+  ├── Herdr → fresh configured reviewer
   │               │
   │               ▼
-  │         /code-review BASE...HEAD
+  │         $code-review
+  │         + fixed BASE_SHA..HEAD_SHA
+  │         + review contract
   │               │
   │               ▼
   │          review passes
@@ -3299,17 +3394,11 @@ These do not block initial prototyping but should be resolved explicitly.
 
 Current recommendation: TypeScript if Playwright/XState integration is expected; otherwise Python is equally valid.
 
-## 59.2 Task source adapter
+## 59.2 Workflow package boundary
 
-Initial V1 can accept local markdown task files.
+Phase 5 accepts only a prepared local Workflow package with `spec.md` and filename-ordered `issues/*.md`. A preparation process may use Matt local tickets, GitHub or Linear as its source, but the execution engine has no tracker API dependency.
 
-Later adapters can normalize:
-
-- Matt local tickets;
-- GitHub issues;
-- Linear issues.
-
-Avoid coupling state machine internals to one tracker.
+Future importers may normalize remote sources into this package, and separate exporters may perform status write-back. Workers remain unaware of both directions.
 
 ## 59.3 Commit responsibility
 
@@ -3350,7 +3439,7 @@ one worktree
 sequential workers
 Herdr
 Codex worker
-Pi reviewer
+Codex reviewer using code-review
 one check command
 one fixer retry
 JSON state
@@ -3387,12 +3476,12 @@ and then observe:
 3. it identifies the first task;
 4. it opens a new Herdr pane at the worktree path;
 5. it launches the configured worker agent;
-6. it sends the worker a bounded task prompt;
+6. it renders the configured `implement` skill for the selected agent and sends the ticket plus orchestration contract;
 7. worker completes and leaves commit + structured result;
 8. Orchestrator validates the checkpoint;
 9. the next fresh worker is launched for the next task;
 10. implementation finishes;
-11. a fresh reviewer is launched;
+11. a fresh reviewer is launched with the configured `code-review` skill against fixed `BASE_SHA..HEAD_SHA`;
 12. review findings become a durable artifact;
 13. deterministic checks run with captured logs/artifacts;
 14. failures produce a bounded fixer brief;
@@ -3463,27 +3552,27 @@ You normally do not implement project code yourself.
 
 ## Core loop
 
-1. Create or resume a durable workflow run.
-2. Ensure the run has a safe Git worktree.
-3. Read the configured ticket graph and select the next ready ticket.
-4. Launch a fresh worker inside Herdr at that worktree.
-5. Give it only the bounded ticket + authoritative context.
+1. Accept a prepared local Workflow package and exact ticket ID.
+2. Create or resume its durable workflow run and safe shared Feature worktree.
+3. Validate that the requested ticket is the first pending entry in the immutable Ticket queue.
+4. Build a logical worker invocation using the configured `implement` skill and that ticket's snapshot.
+5. Render the invocation for the selected agent, add only the orchestration contract, and launch a fresh worker inside Herdr at that worktree.
 6. Wait for it to settle or block.
 7. Validate its structured result and Git checkpoint.
-8. Mark the ticket done only after validation.
-9. Repeat for remaining tasks.
-10. Launch an independent fresh reviewer.
-11. Run deterministic checks.
-12. If findings/failures exist, generate a bounded fix brief and launch a fresh fixer.
-13. Enforce retry limits.
-14. Mark the run complete only when completion invariants pass.
+8. Mark the ticket accepted only after validation.
+9. Return control to the user after this one ticket; a later invocation advances the same run.
+10. After implementation is complete, later phases launch an independent reviewer and deterministic validation stages.
 
 ## Rules
 
 - Herdr state is process state, not workflow truth.
+- Herdr transports already-rendered prompts without interpreting skill semantics.
 - Workers do not modify global workflow state.
 - Fresh agent context is preferred per ticket.
 - Sequential tasks use the same feature worktree.
+- Skills own engineering methodology; orchestration wrappers contain only task inputs and workflow contracts.
+- Agent-specific invocation syntax belongs to the agent renderer, not workflow semantics.
+- Do not automatically use `implement` for fixing unless a dedicated fixer skill is configured.
 - Do not reopen settled spec/ADR decisions.
 - Do not infer success from terminal prose alone.
 - Do not delete worktrees when preservation cannot be proven.
@@ -3569,7 +3658,7 @@ This project intentionally does **not** aim to reproduce Firstmate as an agent d
 If you remember only one diagram, remember this one:
 
 ```text
-                  approved SPEC / TICKETS
+                 prepared Workflow package
                            │
                            ▼
                 ORCHESTRATOR AGENT
@@ -3577,15 +3666,24 @@ If you remember only one diagram, remember this one:
                            │
              owns durable state machine
                            │
-                           │ uses Herdr
                            ▼
-                  fresh agent panes
+                 logical RoleExecution
              ┌─────────────┼─────────────┐
              ▼             ▼             ▼
           Worker        Reviewer        Fixer
-       Claude/Codex     Pi/etc.      Claude/Codex
-             │             │             │
-             └─────── same Git worktree ─┘
+       implement      code-review   bounded contract
+             └─────────────┼─────────────┘
+                           │
+                    agent renderer
+                           │
+                           ▼
+                   rendered prompt
+                           │
+                           ▼
+                Herdr → fresh agent pane
+                           │
+                           ▼
+                  same Git worktree
                            │
                            ▼
                  deterministic checks
@@ -3598,16 +3696,19 @@ And remember the responsibility split:
 
 ```text
 Matt Pocock skills
-    → create the spec/ticket graph and define/execute specialized engineering procedures
+    → define specialized engineering methodology, including implement and code-review
 
 Orchestrator skill
-    → decides workflow routing and next stage
+    → decides workflow routing and next stage; supplies task inputs and execution contracts
+
+Agent renderers
+    → convert logical skill names to agent-specific invocation syntax
 
 Herdr
-    → creates and controls terminal/agent processes
+    → transports opaque rendered prompts and controls terminal/agent processes
 
-Tickets from `to-tickets`
-    → implementation units + dependency graph
+Workflow package
+    → accepted spec + filename-ordered implementation units
 
 Git/worktree
     → durable implementation state

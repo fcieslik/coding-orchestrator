@@ -77,6 +77,10 @@
       ],
       "additionalProperties": {}
     },
+    "specification": {
+      "type": "string",
+      "minLength": 1
+    },
     "worktree": {
       "type": "string",
       "minLength": 1

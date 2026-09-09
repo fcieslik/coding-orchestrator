@@ -36,7 +36,7 @@ interface PackageTicket {
   hash: string;
 }
 
-interface ValidatedPackage {
+export interface ValidatedPackage {
   directory: string;
   source: string;
   specification: PackageTicket;
@@ -77,7 +77,7 @@ export interface WorkflowStepReport {
   nextTicket?: string;
   snapshot: StateSnapshot;
   execution?: WorkerExecutionReport;
-  /** Phase 6 review and system validation are intentionally outside this step. */
+  /** Phase 6 deterministic validation is intentionally outside this step. */
   phase6?: "not-run";
 }
 
@@ -130,7 +130,8 @@ function packageSource(repository: string, directory: string): string {
   return reference.split(sep).join("/");
 }
 
-async function validatePackage(
+/** Validate one local Workflow package (spec.md + issues/*.md) owned by the Target repository. */
+export async function validatePackage(
   repository: string,
   requested: string,
 ): Promise<ValidatedPackage> {
@@ -285,10 +286,11 @@ async function readOwnedPackageFile(
 }
 
 /** Refuse source-package changes while an existing run still owns the work. */
-async function assertPackageUnchanged(
-  state: WorkflowSnapshot,
+export async function assertWorkflowPackageUnchanged(
+  snapshot: StateSnapshot,
   packageData: ValidatedPackage,
 ): Promise<void> {
+  const state = workflowState(snapshot);
   const captured = state.workflowPackage;
   const queue = state.tickets;
   if (!captured || !queue)
@@ -430,7 +432,7 @@ export async function executeWorkflowStep(
     state = workflowState(initialized.snapshot);
   }
   if (!terminalPhases.has(state.phase))
-    await assertPackageUnchanged(state, packageData);
+    await assertWorkflowPackageUnchanged(state, packageData);
   if (state.git?.worktreeStatus !== "ready") {
     const prepared = await prepareWorktree(
       { repository, runId: state.runId },
@@ -449,6 +451,13 @@ export async function executeWorkflowStep(
   if (!tickets)
     throw new FlowError(
       "Workflow run has no durable Ticket queue",
+      4,
+      "CORRUPT_RUN",
+    );
+  const specification = state.workflowPackage?.specification;
+  if (!specification)
+    throw new FlowError(
+      "Workflow run has no immutable specification snapshot",
       4,
       "CORRUPT_RUN",
     );
@@ -539,6 +548,24 @@ export async function executeWorkflowStep(
       ...(next === undefined ? { phase6: "not-run" as const } : {}),
     };
   }
+  if (selected.status === "active" && activeTicket === options.ticket)
+    throw new FlowError(
+      `Workflow ticket ${options.ticket} is already active; wait for the owning invocation to finish`,
+      5,
+      "WORKFLOW_STEP_IN_PROGRESS",
+      {
+        runId: state.runId,
+        ticketId: options.ticket,
+        ...(state.activeExecution === undefined
+          ? {}
+          : {
+              executionId: state.activeExecution.executionId,
+              attemptId: state.activeExecution.attemptId,
+            }),
+        requiredAction:
+          "Wait for the existing Workflow step to finish; do not invoke the ticket again while it is active.",
+      },
+    );
   if (expected !== options.ticket)
     throw new FlowError(
       `Ticket ${options.ticket} is not the first pending ticket; expected ${expected ?? "none"}`,
@@ -574,6 +601,7 @@ export async function executeWorkflowStep(
       repository,
       runId: state.runId,
       ticket: selected.input,
+      specification,
       ...(options.dependencies === undefined
         ? {}
         : { dependencies: options.dependencies }),

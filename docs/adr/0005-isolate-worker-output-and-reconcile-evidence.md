@@ -1,0 +1,3 @@
+# Isolate worker output and reconcile evidence before acceptance
+
+The Orchestrator gives each Worker attempt an immutable input snapshot, an Orchestrator-owned Execution record, and a separate worker-writable output directory. A worker may report an outcome only through its structured result; the Orchestrator independently reconciles that result with Git, durable run state, Herdr ownership, and cleanup before accepting a checkpoint or permitting a retry. This costs an additional artifact boundary and explicit reconciliation commands, but prevents a worker from rewriting workflow truth and prevents timeouts, malformed results, or unknown side effects from producing duplicate execution or false success.

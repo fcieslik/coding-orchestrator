@@ -51,7 +51,7 @@ export type RunPhase = z.infer<typeof runPhaseSchema>;
 
 const utcTimestampSchema = z.iso.datetime({ precision: 3 });
 
-const objectIdSchema = z.string().regex(/^[0-9a-f]{40,64}$/);
+export const objectIdSchema = z.string().regex(/^[0-9a-f]{40,64}$/);
 
 export const gitWorktreeStatusSchema = z.enum(["planned", "ready", "removed"]);
 
@@ -76,9 +76,19 @@ const rolesSchema = z
   })
   .catchall(z.never());
 
+const validationConfigSchema = z.strictObject({
+  test: z.string().min(1),
+  lint: z.string().min(1),
+  typecheck: z.string().min(1),
+  formatCheck: z.string().min(1),
+  build: z.string().min(1),
+  timeoutSeconds: z.int().min(1).max(7_200),
+});
+
 const workflowConfigSchema = z.strictObject({
   workerTimeoutSeconds: z.int().min(60).max(7_200),
   maxWorkerAttempts: z.int().min(1).max(10),
+  validation: validationConfigSchema.optional(),
 });
 
 export const orchestrationConfigSchema = z
@@ -122,6 +132,56 @@ const workflowTicketSchema = z.looseObject({
   commit: objectIdSchema.optional(),
 });
 
+export const validationStatusSchema = z.enum(["passed", "failed"]);
+
+export const validationCheckStatusSchema = z.enum([
+  "passed",
+  "failed",
+  "timed_out",
+]);
+
+function validationCheckOutcomeSchema(
+  name: "test" | "lint" | "typecheck" | "formatCheck" | "build",
+) {
+  return z.looseObject({
+    name: z.literal(name),
+    command: z.string().min(1),
+    status: validationCheckStatusSchema,
+    exitCode: z.int().nullable(),
+    durationMs: z.int().nonnegative(),
+    stdout: z.string().optional(),
+    stderr: z.string().optional(),
+  });
+}
+
+export const validationResultSchema = z.looseObject({
+  schemaVersion: z.literal(1),
+  runId: runIdSchema,
+  validatedHead: objectIdSchema,
+  status: validationStatusSchema,
+  startedAt: utcTimestampSchema,
+  finishedAt: utcTimestampSchema,
+  checks: z.tuple([
+    validationCheckOutcomeSchema("test"),
+    validationCheckOutcomeSchema("lint"),
+    validationCheckOutcomeSchema("typecheck"),
+    validationCheckOutcomeSchema("formatCheck"),
+    validationCheckOutcomeSchema("build"),
+  ]),
+  git: z.looseObject({
+    headAfterValidation: objectIdSchema.optional(),
+    cleanAfterValidation: z.boolean(),
+    reason: z.string().min(1).optional(),
+  }),
+});
+
+export const validationStateSchema = z.looseObject({
+  status: validationStatusSchema,
+  validatedHead: objectIdSchema,
+  result: z.string().min(1),
+  at: utcTimestampSchema,
+});
+
 export const stateSnapshotSchema = z.looseObject({
   schemaVersion: z.literal(1),
   runId: runIdSchema,
@@ -151,6 +211,7 @@ export const stateSnapshotSchema = z.looseObject({
       path: z.string().min(1),
     })
     .optional(),
+  validation: validationStateSchema.optional(),
 });
 
 export const runEventSchema = z.looseObject({
@@ -217,6 +278,7 @@ export const executionRecordSchema = z.looseObject({
     input: z.string().min(1),
     hash: z.string().regex(/^[0-9a-f]{64}$/),
   }),
+  specification: z.string().min(1).optional(),
   worktree: z.string().min(1),
   artifacts: executionArtifactSchema,
   promptHash: z.string().regex(/^[0-9a-f]{64}$/),
@@ -298,6 +360,19 @@ export const workerResultSchema = z.discriminatedUnion("status", [
 ]);
 
 export type StateSnapshot = z.infer<typeof stateSnapshotSchema>;
+
+export type ValidationStatus = z.infer<typeof validationStatusSchema>;
+
+export type ValidationCheckStatus = z.infer<typeof validationCheckStatusSchema>;
+
+export type ValidationCheckOutcome = z.infer<
+  ReturnType<typeof validationCheckOutcomeSchema>
+>;
+
+export type ValidationResult = z.infer<typeof validationResultSchema>;
+
+export type ValidationState = z.infer<typeof validationStateSchema>;
+
 export type RunEvent = z.infer<typeof runEventSchema>;
 export type ExecutionRecord = z.infer<typeof executionRecordSchema>;
 export type WorkerResult = z.infer<typeof workerResultSchema>;
@@ -337,6 +412,9 @@ export function generateJsonSchemas() {
   const workerResult = z.toJSONSchema(workerResultSchema, {
     target: "draft-2020-12",
   });
+  const validationResult = z.toJSONSchema(validationResultSchema, {
+    target: "draft-2020-12",
+  });
   addCalendarAwareRunId(stateSnapshot);
   addCalendarAwareRunId(runEvent);
   return {
@@ -345,5 +423,6 @@ export function generateJsonSchemas() {
     orchestrationConfig,
     executionRecord,
     workerResult,
+    validationResult,
   };
 }

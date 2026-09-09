@@ -168,6 +168,106 @@ else process.exit(2);
   );
 });
 
+test("flow orchestrate retries a launch failure only after another explicit invocation", async () => {
+  const repository = await createCommittedTargetRepository();
+  const packageDirectory = join(repository, "feature");
+  await mkdir(join(packageDirectory, "issues"), { recursive: true });
+  await writeFile(join(packageDirectory, "spec.md"), "# Feature\n");
+  await writeFile(join(packageDirectory, "issues", "01-first.md"), "# First\n");
+  const fakeDirectory = await temporaryDirectory();
+  const fake = join(fakeDirectory, "herdr");
+  const state = join(fakeDirectory, "state.json");
+  const promptPath = join(fakeDirectory, "prompt.txt");
+  const splits = join(fakeDirectory, "splits");
+  await writeFile(splits, "0");
+  await writeFile(
+    fake,
+    `#!/usr/bin/env node
+import { execFileSync } from "node:child_process";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+if (args[0] === "--version") console.log("fake-herdr 1.0.0");
+else if (args[0] === "pane" && args[1] === "split") {
+  const count = Number(readFileSync(process.env.FAKE_SPLITS, "utf8")) + 1;
+  writeFileSync(process.env.FAKE_SPLITS, String(count));
+  if (count === 1) process.exit(1);
+  console.log(JSON.stringify({result:{pane:{pane_id:"fake:worker"}}}));
+} else if (args[0] === "agent" && args[1] === "start") {
+  const child = args.slice(args.indexOf("--") + 1);
+  const worktree = child[child.indexOf("-C") + 1];
+  writeFileSync(process.env.FAKE_STATE, JSON.stringify({worktree}));
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"idle"}}}));
+} else if (args[0] === "agent" && args[1] === "prompt") {
+  const current = JSON.parse(readFileSync(process.env.FAKE_STATE, "utf8"));
+  const prompt = args[3];
+  writeFileSync(process.env.FAKE_PROMPT, prompt);
+  const ticket = prompt.match(/- Ticket: ([^\\n]+)/)[1];
+  const resultPath = prompt.match(/Write the structured execution result to: "([^"]+)"/)[1];
+  writeFileSync(current.worktree + "/first-change.txt", "done\\n");
+  execFileSync("git", ["-C", current.worktree, "add", "first-change.txt"]);
+  execFileSync("git", ["-C", current.worktree, "commit", "--quiet", "-m", "first ticket"]);
+  const commit = execFileSync("git", ["-C", current.worktree, "rev-parse", "HEAD"], {encoding:"utf8"}).trim();
+  writeFileSync(resultPath + ".tmp", JSON.stringify({schemaVersion:1,ticketId:ticket,status:"completed",summary:"done",commit,commands:[]}));
+  renameSync(resultPath + ".tmp", resultPath);
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"done"}}}));
+} else if (args[0] === "agent" && args[1] === "read") process.stdout.write("done\\n");
+else if (args[0] === "pane" && args[1] === "close") console.log("{}");
+else process.exit(2);
+`,
+    "utf8",
+  );
+  await chmod(fake, 0o755);
+
+  const arguments_ = [
+    "orchestrate",
+    "feature",
+    "01-first",
+    "--repo",
+    repository,
+    "--json",
+  ];
+  const environment = {
+    ...process.env,
+    HERDR_ENV: "1",
+    HERDR_PANE_ID: "caller",
+    HERDR_BIN_PATH: fake,
+    FAKE_STATE: state,
+    FAKE_PROMPT: promptPath,
+    FAKE_SPLITS: splits,
+  };
+
+  await expect(
+    run(executable, arguments_, { cwd: repository, env: environment }),
+  ).rejects.toMatchObject({ code: 1 });
+  expect(await readFile(splits, "utf8")).toBe("1");
+  await expect(readFile(promptPath, "utf8")).rejects.toMatchObject({
+    code: "ENOENT",
+  });
+
+  const { stdout } = await run(executable, arguments_, {
+    cwd: repository,
+    env: environment,
+  });
+  const report = JSON.parse(stdout) as { runId: string; status: string };
+  const expectedSpecification = await realpath(
+    join(
+      repository,
+      ".orchestrator",
+      "runs",
+      report.runId,
+      "input",
+      "package",
+      "spec.md",
+    ),
+  );
+
+  expect(report.status).toBe("accepted");
+  expect(await readFile(splits, "utf8")).toBe("2");
+  expect(await readFile(promptPath, "utf8")).toContain(
+    `- Specification: "${expectedSpecification}"`,
+  );
+});
+
 test("flow orchestrate resumes a two-ticket queue across processes", async () => {
   const repository = await createCommittedTargetRepository();
   const packageDirectory = join(repository, "feature");
@@ -182,6 +282,7 @@ test("flow orchestrate resumes a two-ticket queue across processes", async () =>
   const fake = join(fakeDirectory, "herdr");
   const state = join(fakeDirectory, "state.json");
   const workers = join(fakeDirectory, "workers.log");
+  const prompts = join(fakeDirectory, "prompts.jsonl");
   await writeFile(
     fake,
     `#!/usr/bin/env node
@@ -199,6 +300,7 @@ else if (args[0] === "agent" && args[1] === "start") {
 } else if (args[0] === "agent" && args[1] === "prompt") {
   const current = JSON.parse(readFileSync(process.env.FAKE_STATE, "utf8"));
   const prompt = args[3];
+  appendFileSync(process.env.FAKE_PROMPTS, JSON.stringify(prompt) + "\\n");
   const ticket = prompt.match(/- Ticket: ([^\\n]+)/)[1];
   const resultPath = prompt.match(/Write the structured execution result to: "([^"]+)"/)[1];
   const file = ticket.replace(/[^A-Za-z0-9_-]/g, "_") + ".txt";
@@ -223,6 +325,7 @@ else process.exit(2);
     HERDR_BIN_PATH: fake,
     FAKE_STATE: state,
     FAKE_WORKERS: workers,
+    FAKE_PROMPTS: prompts,
   };
   const initialHead = await gitOutput(repository, ["rev-parse", "HEAD"]);
   const first = JSON.parse(
@@ -281,6 +384,35 @@ else process.exit(2);
   expect(second.snapshot.tickets["02-second"]!.commit).toBe(
     second.acceptedCommit,
   );
+  const expectedSpecification = await realpath(
+    join(
+      repository,
+      ".orchestrator",
+      "runs",
+      first.runId,
+      "input",
+      "package",
+      "spec.md",
+    ),
+  );
+  const renderedPrompts = (await readFile(prompts, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as string);
+  expect(renderedPrompts).toHaveLength(2);
+  expect(renderedPrompts).toEqual(
+    expect.arrayContaining([
+      expect.stringContaining(`- Specification: "${expectedSpecification}"`),
+    ]),
+  );
+  expect(renderedPrompts[0]).not.toContain("02-second");
+  expect(renderedPrompts[0]).not.toContain(join(packageDirectory, "spec.md"));
+  expect(
+    JSON.parse(await readFile(first.execution.artifacts.record, "utf8")),
+  ).toMatchObject({ specification: expectedSpecification });
+  expect(
+    JSON.parse(await readFile(second.execution.artifacts.record, "utf8")),
+  ).toMatchObject({ specification: expectedSpecification });
   await expect(
     gitOutput(second.snapshot.git.featureWorktree, [
       "merge-base",
@@ -314,6 +446,140 @@ else process.exit(2);
   expect((await readFile(workers, "utf8")).trim().split("\n")).toHaveLength(2);
 });
 
+test("flow orchestrate refuses a duplicate invocation while the ticket is active", async () => {
+  const repository = await createCommittedTargetRepository();
+  const packageDirectory = join(repository, "feature");
+  await mkdir(join(packageDirectory, "issues"), { recursive: true });
+  await writeFile(join(packageDirectory, "spec.md"), "# Feature\n");
+  await writeFile(join(packageDirectory, "issues", "01-first.md"), "# First\n");
+  await writeFile(
+    join(packageDirectory, "issues", "02-second.md"),
+    "# Second\n",
+  );
+  const fakeDirectory = await temporaryDirectory();
+  const fake = join(fakeDirectory, "herdr");
+  const state = join(fakeDirectory, "state.json");
+  const started = join(fakeDirectory, "started");
+  const release = join(fakeDirectory, "release");
+  const workers = join(fakeDirectory, "workers.log");
+  await writeFile(
+    fake,
+    `#!/usr/bin/env node
+import { appendFileSync, existsSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+const args = process.argv.slice(2);
+if (args[0] === "--version") console.log("fake-herdr 1.0.0");
+else if (args[0] === "pane" && args[1] === "split") console.log(JSON.stringify({result:{pane:{pane_id:"fake:worker"}}}));
+else if (args[0] === "agent" && args[1] === "start") {
+  const child = args.slice(args.indexOf("--") + 1);
+  const worktree = child[child.indexOf("-C") + 1];
+  appendFileSync(process.env.FAKE_WORKERS, args[2] + "\\n");
+  writeFileSync(process.env.FAKE_STATE, JSON.stringify({worktree}));
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"idle"}}}));
+} else if (args[0] === "agent" && args[1] === "prompt") {
+  writeFileSync(process.env.FAKE_STARTED, "started\\n");
+  while (!existsSync(process.env.FAKE_RELEASE)) await new Promise((resolve) => setTimeout(resolve, 20));
+  const current = JSON.parse(readFileSync(process.env.FAKE_STATE, "utf8"));
+  const prompt = args[3];
+  const ticket = prompt.match(/- Ticket: ([^\\n]+)/)[1];
+  const resultPath = prompt.match(/Write the structured execution result to: "([^"]+)"/)[1];
+  writeFileSync(current.worktree + "/first-change.txt", "done\\n");
+  execFileSync("git", ["-C", current.worktree, "add", "first-change.txt"]);
+  execFileSync("git", ["-C", current.worktree, "commit", "--quiet", "-m", "first ticket"]);
+  const commit = execFileSync("git", ["-C", current.worktree, "rev-parse", "HEAD"], {encoding:"utf8"}).trim();
+  writeFileSync(resultPath + ".tmp", JSON.stringify({schemaVersion:1,ticketId:ticket,status:"completed",summary:"done",commit,commands:[]}));
+  renameSync(resultPath + ".tmp", resultPath);
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"done"}}}));
+} else if (args[0] === "agent" && args[1] === "read") process.stdout.write("done\\n");
+else if (args[0] === "pane" && args[1] === "close") console.log("{}");
+else process.exit(2);
+`,
+    "utf8",
+  );
+  await chmod(fake, 0o755);
+  const environment = {
+    ...process.env,
+    HERDR_ENV: "1",
+    HERDR_PANE_ID: "caller",
+    HERDR_BIN_PATH: fake,
+    FAKE_STATE: state,
+    FAKE_STARTED: started,
+    FAKE_RELEASE: release,
+    FAKE_WORKERS: workers,
+  };
+  const invocation = [
+    "orchestrate",
+    "feature",
+    "01-first",
+    "--repo",
+    repository,
+    "--json",
+  ];
+  const first = run(executable, invocation, {
+    cwd: repository,
+    env: environment,
+  });
+  for (let attempts = 0; attempts < 200; attempts += 1) {
+    if (await readFile(started, "utf8").catch(() => undefined)) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  await expect(readFile(started, "utf8")).resolves.toBe("started\n");
+  const runId = (await readdir(join(repository, ".orchestrator", "runs"))).find(
+    (entry) => entry.startsWith("run_"),
+  )!;
+  const statePath = join(
+    repository,
+    ".orchestrator",
+    "runs",
+    runId,
+    "state.json",
+  );
+  const historyPath = join(
+    repository,
+    ".orchestrator",
+    "runs",
+    runId,
+    "history.jsonl",
+  );
+  const stateBeforeDuplicate = await readFile(statePath, "utf8");
+  const activeExecution = JSON.parse(stateBeforeDuplicate).activeExecution as {
+    executionId: string;
+    attemptId: string;
+  };
+  const historyBeforeDuplicate = await readFile(historyPath, "utf8");
+
+  const duplicate = await run(executable, invocation, {
+    cwd: repository,
+    env: environment,
+  })
+    .then((value) => ({ ...value, code: 0 }))
+    .catch(
+      (error: unknown) =>
+        error as { stdout: string; stderr: string; code: number },
+    );
+  expect(duplicate.code).toBe(5);
+  expect(JSON.parse(duplicate.stderr)).toMatchObject({
+    code: "WORKFLOW_STEP_IN_PROGRESS",
+    details: {
+      runId,
+      ticketId: "01-first",
+      executionId: activeExecution.executionId,
+      attemptId: activeExecution.attemptId,
+    },
+  });
+  expect(await readFile(statePath, "utf8")).toBe(stateBeforeDuplicate);
+  expect(await readFile(historyPath, "utf8")).toBe(historyBeforeDuplicate);
+  expect((await readFile(workers, "utf8")).trim().split("\n")).toHaveLength(1);
+
+  await writeFile(release, "release\n");
+  const completed = JSON.parse((await first).stdout);
+  expect(completed).toMatchObject({
+    status: "accepted",
+    ticketId: "01-first",
+    nextTicket: "02-second",
+  });
+});
+
 test("flow orchestrate safely retries a blocked ticket before advancing the queue", async () => {
   const repository = await createCommittedTargetRepository();
   const packageDirectory = join(repository, "feature");
@@ -328,12 +594,13 @@ test("flow orchestrate safely retries a blocked ticket before advancing the queu
   const fake = join(fakeDirectory, "herdr");
   const state = join(fakeDirectory, "state.json");
   const attempts = join(fakeDirectory, "attempts");
+  const prompts = join(fakeDirectory, "prompts.jsonl");
   await writeFile(attempts, "0");
   await writeFile(
     fake,
     `#!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync, renameSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 const args = process.argv.slice(2);
 if (args[0] === "--version") console.log("fake-herdr 1.0.0");
 else if (args[0] === "pane" && args[1] === "split") console.log(JSON.stringify({result:{pane:{pane_id:"fake:worker"}}}));
@@ -344,6 +611,7 @@ else if (args[0] === "agent" && args[1] === "start") {
 } else if (args[0] === "agent" && args[1] === "prompt") {
   const current = JSON.parse(readFileSync(process.env.FAKE_STATE, "utf8"));
   const prompt = args[3];
+  appendFileSync(process.env.FAKE_PROMPTS, JSON.stringify(prompt) + "\\n");
   const ticket = prompt.match(/- Ticket: ([^\\n]+)/)[1];
   const resultPath = prompt.match(/Write the structured execution result to: "([^"]+)"/)[1];
   const count = Number(readFileSync(process.env.FAKE_ATTEMPTS, "utf8")) + 1;
@@ -374,6 +642,7 @@ else process.exit(2);
     HERDR_BIN_PATH: fake,
     FAKE_STATE: state,
     FAKE_ATTEMPTS: attempts,
+    FAKE_PROMPTS: prompts,
   };
   const first = await run(
     executable,
@@ -456,6 +725,29 @@ else process.exit(2);
     },
   });
   expect(Number(await readFile(attempts, "utf8"))).toBe(2);
+  const specification = await realpath(
+    join(
+      repository,
+      ".orchestrator",
+      "runs",
+      runs[0]!,
+      "input",
+      "package",
+      "spec.md",
+    ),
+  );
+  const renderedPrompts = (await readFile(prompts, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as string);
+  expect(renderedPrompts).toHaveLength(2);
+  expect(renderedPrompts).toEqual(
+    expect.arrayContaining([
+      expect.stringContaining(`- Specification: "${specification}"`),
+    ]),
+  );
+  expect(renderedPrompts[0]).toContain(`- Specification: "${specification}"`);
+  expect(renderedPrompts[1]).toContain(`- Specification: "${specification}"`);
 });
 
 test("flow orchestrate refuses a blocked retry after an unaccepted worktree change", async () => {
@@ -2890,3 +3182,954 @@ async function gitOutput(repository: string, args: string[]): Promise<string> {
   const { stdout } = await run("git", ["-C", repository, ...args]);
   return stdout.trim();
 }
+
+// --- Phase 6: deterministic Workflow package validation ---
+
+async function writeValidationConfiguration(
+  repository: string,
+  commands: {
+    test: string;
+    lint: string;
+    typecheck: string;
+    formatCheck?: string;
+    build?: string;
+    timeoutSeconds?: number;
+  },
+): Promise<void> {
+  await mkdir(join(repository, ".orchestrator"), { recursive: true });
+  await writeFile(
+    join(repository, ".orchestrator", "config.yaml"),
+    `version: 1\n\nagents:\n  codex:\n    kind: codex\n\nroles:\n  worker:\n    agent: codex\n    skill: implement\n\nworkflow:\n  workerTimeoutSeconds: 1800\n  maxWorkerAttempts: 2\n  validation:\n    test: ${JSON.stringify(commands.test)}\n    lint: ${JSON.stringify(commands.lint)}\n    typecheck: ${JSON.stringify(commands.typecheck)}\n    formatCheck: ${JSON.stringify(commands.formatCheck ?? "exit 0")}\n    build: ${JSON.stringify(commands.build ?? "exit 0")}\n    timeoutSeconds: ${commands.timeoutSeconds ?? 60}\n`,
+    "utf8",
+  );
+}
+
+async function writeWorkflowPackage(
+  repository: string,
+  tickets: string[],
+): Promise<string> {
+  const packageDirectory = join(repository, "feature");
+  await mkdir(join(packageDirectory, "issues"), { recursive: true });
+  await writeFile(join(packageDirectory, "spec.md"), "# Feature\n");
+  for (const ticket of tickets)
+    await writeFile(
+      join(packageDirectory, "issues", `${ticket}.md`),
+      `# ${ticket}\n`,
+    );
+  return packageDirectory;
+}
+
+async function writeFakeHerdrWorker(): Promise<{
+  directory: string;
+  environment: NodeJS.ProcessEnv;
+}> {
+  const directory = await temporaryDirectory();
+  const fake = join(directory, "herdr");
+  const state = join(directory, "state.json");
+  await writeFile(
+    fake,
+    `#!/usr/bin/env node
+import { execFileSync } from "node:child_process";
+import { readFileSync, writeFileSync, renameSync } from "node:fs";
+const args = process.argv.slice(2);
+if (args[0] === "--version") console.log("fake-herdr 1.0.0");
+else if (args[0] === "pane" && args[1] === "split") console.log(JSON.stringify({result:{pane:{pane_id:"fake:worker"}}}));
+else if (args[0] === "agent" && args[1] === "start") {
+  const child = args.slice(args.indexOf("--") + 1);
+  const worktree = child[child.indexOf("-C") + 1];
+  writeFileSync(process.env.FAKE_STATE, JSON.stringify({worktree}));
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"idle"}}}));
+} else if (args[0] === "agent" && args[1] === "prompt") {
+  const current = JSON.parse(readFileSync(process.env.FAKE_STATE, "utf8"));
+  const prompt = args[3];
+  const ticket = prompt.match(/- Ticket: ([^\\n]+)/)[1];
+  const resultPath = prompt.match(/Write the structured execution result to: "([^"]+)"/)[1];
+  const file = ticket.replace(/[^A-Za-z0-9_-]/g, "_") + ".txt";
+  writeFileSync(current.worktree + "/" + file, ticket + "\\n");
+  execFileSync("git", ["-C", current.worktree, "add", file]);
+  execFileSync("git", ["-C", current.worktree, "commit", "--quiet", "-m", ticket]);
+  const commit = execFileSync("git", ["-C", current.worktree, "rev-parse", "HEAD"], {encoding:"utf8"}).trim();
+  writeFileSync(resultPath + ".tmp", JSON.stringify({schemaVersion:1,ticketId:ticket,status:"completed",summary:ticket,commit,commands:[]}));
+  renameSync(resultPath + ".tmp", resultPath);
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"done"}}}));
+} else if (args[0] === "agent" && args[1] === "read") process.stdout.write("done\\n");
+else if (args[0] === "pane" && args[1] === "close") console.log("{}");
+else process.exit(2);
+`,
+    "utf8",
+  );
+  await chmod(fake, 0o755);
+  return {
+    directory,
+    environment: {
+      ...process.env,
+      HERDR_ENV: "1",
+      HERDR_PANE_ID: "caller",
+      HERDR_BIN_PATH: fake,
+      FAKE_STATE: state,
+    },
+  };
+}
+
+/** Run one orchestrate step per ticket until the package queue completes. */
+async function completeWorkflowRun(
+  repository: string,
+  tickets: string[],
+  environment: NodeJS.ProcessEnv,
+  newRun = false,
+): Promise<{
+  runId: string;
+  validatedHead: string;
+  featureWorktree: string;
+}> {
+  let report:
+    | {
+        runId: string;
+        acceptedCommit: string;
+        snapshot: { git: { featureWorktree: string } };
+      }
+    | undefined;
+  for (const ticket of tickets) {
+    const arguments_ = [
+      "orchestrate",
+      "feature",
+      ticket,
+      "--repo",
+      repository,
+      "--json",
+      ...(newRun ? ["--new-run"] : []),
+    ];
+    report = JSON.parse(
+      (await run(executable, arguments_, { cwd: repository, env: environment }))
+        .stdout,
+    );
+  }
+  if (!report) throw new Error("no orchestrate step was executed");
+  return {
+    runId: report.runId,
+    validatedHead: report.acceptedCommit,
+    featureWorktree: report.snapshot.git.featureWorktree,
+  };
+}
+
+async function writeRecordingCheck(
+  directory: string,
+  name: string,
+  body = "",
+): Promise<string> {
+  const script = join(directory, name);
+  await writeFile(
+    script,
+    `#!/usr/bin/env sh\nprintf '%s cwd=%s\\n' "$1" "$PWD" | tee -a "$FAKE_LOG"\n${body}\n`,
+    "utf8",
+  );
+  await chmod(script, 0o755);
+  return script;
+}
+
+interface ValidationInvocation {
+  exitCode: number | undefined;
+  stdout: string;
+  stderr: string;
+}
+
+async function invokeValidation(
+  packageReference: string,
+  repository: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<ValidationInvocation> {
+  return run(
+    executable,
+    ["validate", packageReference, "--repo", repository, "--json"],
+    {
+      cwd: repository,
+      env: environment,
+    },
+  ).then(
+    ({ stdout }) => ({ exitCode: 0, stdout, stderr: "" }),
+    (error: Error & { code?: number; stdout?: string; stderr?: string }) => ({
+      exitCode: error.code,
+      stdout: error.stdout ?? "",
+      stderr: error.stderr ?? "",
+    }),
+  );
+}
+
+test("flow validate runs the configured checks in the Feature worktree and publishes one passed result", async () => {
+  const repository = await createCommittedTargetRepository();
+  await writeWorkflowPackage(repository, ["01-first", "02-second"]);
+  const fakeDirectory = await temporaryDirectory();
+  const check = await writeRecordingCheck(fakeDirectory, "check");
+  const log = join(fakeDirectory, "checks.log");
+  await writeValidationConfiguration(repository, {
+    test: `${check} test`,
+    lint: `${check} lint`,
+    typecheck: `${check} typecheck`,
+    formatCheck: `${check} formatCheck`,
+    build: `${check} build`,
+  });
+  const { environment } = await writeFakeHerdrWorker();
+  const completed = await completeWorkflowRun(
+    repository,
+    ["01-first", "02-second"],
+    { ...environment, FAKE_LOG: log },
+  );
+  // Commit the package and configuration so the primary checkout is clean
+  // before validation; only .orchestrator/runs/ stays ignored.
+  await run("git", ["-C", repository, "add", "."]);
+  await run("git", [
+    "-C",
+    repository,
+    "commit",
+    "--quiet",
+    "-m",
+    "package and validation configuration",
+  ]);
+  const primaryHeadBefore = await gitOutput(repository, ["rev-parse", "HEAD"]);
+
+  const invocation = await invokeValidation("feature", repository, {
+    ...environment,
+    FAKE_LOG: log,
+  });
+
+  expect(invocation.exitCode).toBe(0);
+  const report = JSON.parse(invocation.stdout) as {
+    runId: string;
+    repository: string;
+    validatedHead: string;
+    status: string;
+    result: string;
+    checks: Array<{
+      name: string;
+      command: string;
+      status: string;
+      exitCode: number | null;
+      durationMs: number;
+    }>;
+  };
+  expect(report).toMatchObject({
+    schemaVersion: 1,
+    runId: completed.runId,
+    repository: await realpath(repository),
+    validatedHead: completed.validatedHead,
+    status: "passed",
+    startedAt: expect.any(String),
+    finishedAt: expect.any(String),
+    git: {
+      headAfterValidation: completed.validatedHead,
+      cleanAfterValidation: true,
+    },
+  });
+  expect(report.checks.map((check) => check.name)).toEqual([
+    "test",
+    "lint",
+    "typecheck",
+    "formatCheck",
+    "build",
+  ]);
+  for (const check of report.checks) {
+    expect(check.status).toBe("passed");
+    expect(check.exitCode).toBe(0);
+    expect(check.durationMs).toBeGreaterThanOrEqual(0);
+  }
+  expect(report.checks.map((check) => check.command)).toEqual([
+    `${check} test`,
+    `${check} lint`,
+    `${check} typecheck`,
+    `${check} formatCheck`,
+    `${check} build`,
+  ]);
+  // All five commands executed sequentially in the Feature worktree.
+  expect((await readFile(log, "utf8")).split("\n").filter(Boolean)).toEqual([
+    `test cwd=${completed.featureWorktree}`,
+    `lint cwd=${completed.featureWorktree}`,
+    `typecheck cwd=${completed.featureWorktree}`,
+    `formatCheck cwd=${completed.featureWorktree}`,
+    `build cwd=${completed.featureWorktree}`,
+  ]);
+
+  const result = JSON.parse(
+    await readFile(
+      join(
+        repository,
+        ".orchestrator",
+        "runs",
+        completed.runId,
+        "validation.json",
+      ),
+      "utf8",
+    ),
+  ) as {
+    schemaVersion: number;
+    runId: string;
+    validatedHead: string;
+    status: string;
+    checks: Array<{ name: string; stdout?: string; stderr?: string }>;
+    git: { headAfterValidation: string; cleanAfterValidation: boolean };
+  };
+  expect(result).toMatchObject({
+    schemaVersion: 1,
+    runId: completed.runId,
+    validatedHead: completed.validatedHead,
+    status: "passed",
+  });
+  // Structured CLI output includes the complete canonical artifact.
+  expect(report).toMatchObject(result);
+  expect(result.checks.map((check) => check.name)).toEqual([
+    "test",
+    "lint",
+    "typecheck",
+    "formatCheck",
+    "build",
+  ]);
+  expect(result.checks[0]?.stdout).toContain("cwd=");
+  expect(result.git).toMatchObject({
+    headAfterValidation: completed.validatedHead,
+    cleanAfterValidation: true,
+  });
+
+  const snapshot = JSON.parse(
+    await readFile(
+      join(repository, ".orchestrator", "runs", completed.runId, "state.json"),
+      "utf8",
+    ),
+  ) as {
+    phase: string;
+    tickets: Record<string, { status: string; commit?: string }>;
+    validation?: { status: string; validatedHead: string; result: string };
+  };
+  expect(snapshot.phase).toBe("completed");
+  expect(snapshot.tickets["02-second"]?.commit).toBe(completed.validatedHead);
+  expect(snapshot.validation).toEqual({
+    status: "passed",
+    validatedHead: completed.validatedHead,
+    result: "validation.json",
+    at: expect.any(String),
+  });
+
+  const history = (
+    await readFile(
+      join(
+        repository,
+        ".orchestrator",
+        "runs",
+        completed.runId,
+        "history.jsonl",
+      ),
+      "utf8",
+    )
+  )
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as { type: string });
+  expect(history.at(-1)?.type).toBe("workflow.validation.completed");
+  expect(
+    history.filter((event) => event.type === "workflow.validation.completed"),
+  ).toHaveLength(1);
+
+  // The primary checkout stays untouched.
+  expect(await gitOutput(repository, ["rev-parse", "HEAD"])).toBe(
+    primaryHeadBefore,
+  );
+  expect(await gitOutput(repository, ["status", "--porcelain"])).toBe("");
+}, 30_000);
+
+test("flow validate fails closed across the deterministic failure matrix", async () => {
+  const scenarios: Array<{
+    name: string;
+    commands: {
+      test: string;
+      lint: string;
+      typecheck: string;
+      formatCheck?: string;
+      build?: string;
+    };
+    timeoutSeconds?: number;
+    assert: (
+      invocation: ValidationInvocation,
+      context: {
+        featureWorktree: string;
+      },
+    ) => Promise<void>;
+  }> = [];
+
+  // Non-zero exit: all five checks are still attempted.
+  scenarios.push({
+    name: "non-zero exit",
+    commands: {
+      test: "exit 3",
+      lint: "exit 0",
+      typecheck: "exit 0",
+    },
+    assert: async (invocation) => {
+      expect(invocation.exitCode).toBe(1);
+      const report = JSON.parse(invocation.stdout) as {
+        status: string;
+        checks: Array<{ status: string; exitCode: number | null }>;
+      };
+      expect(report.status).toBe("failed");
+      expect(report.checks.map((check) => check.status)).toEqual([
+        "failed",
+        "passed",
+        "passed",
+        "passed",
+        "passed",
+      ]);
+      expect(report.checks[0]?.exitCode).toBe(3);
+    },
+  });
+
+  // Missing executable: recorded as a failed check, never a pass.
+  scenarios.push({
+    name: "missing executable",
+    commands: {
+      test: "definitely-missing-executable-xyz",
+      lint: "exit 0",
+      typecheck: "exit 0",
+    },
+    assert: async (invocation) => {
+      expect(invocation.exitCode).toBe(1);
+      const report = JSON.parse(invocation.stdout) as {
+        status: string;
+        checks: Array<{ status: string; exitCode: number | null }>;
+      };
+      expect(report.status).toBe("failed");
+      expect(report.checks[0]?.status).toBe("failed");
+      expect(report.checks[0]?.exitCode).not.toBe(0);
+      expect(report.checks.slice(1).map((check) => check.status)).toEqual([
+        "passed",
+        "passed",
+        "passed",
+        "passed",
+      ]);
+    },
+  });
+
+  // Timeout: the shell and its descendants are terminated as one owned group.
+  scenarios.push({
+    name: "timeout",
+    timeoutSeconds: 1,
+    commands: {
+      test: "sh -c 'sleep 5 & wait'",
+      lint: "exit 0",
+      typecheck: "exit 0",
+    },
+    assert: async (invocation) => {
+      expect(invocation.exitCode).toBe(1);
+      const report = JSON.parse(invocation.stdout) as {
+        status: string;
+        checks: Array<{
+          status: string;
+          exitCode: number | null;
+          durationMs: number;
+        }>;
+      };
+      expect(report.status).toBe("failed");
+      expect(report.checks[0]).toMatchObject({
+        status: "timed_out",
+        exitCode: null,
+      });
+      expect(report.checks[0]?.durationMs).toBeGreaterThanOrEqual(1_000);
+      expect(report.checks[0]?.durationMs).toBeLessThan(3_000);
+      expect(report.checks.slice(1).map((check) => check.status)).toEqual([
+        "passed",
+        "passed",
+        "passed",
+        "passed",
+      ]);
+    },
+  });
+
+  // The final two checks have the same failure contract as the earlier gates.
+  for (const focused of [
+    {
+      name: "formatCheck non-zero exit",
+      commands: { formatCheck: "exit 7" },
+      index: 3,
+      status: "failed",
+      exitCode: 7,
+    },
+    {
+      name: "formatCheck launch failure",
+      commands: { formatCheck: "definitely-missing-format-check-xyz" },
+      index: 3,
+      status: "failed",
+    },
+    {
+      name: "formatCheck timeout",
+      commands: { formatCheck: "sh -c 'sleep 5 & wait'" },
+      index: 3,
+      status: "timed_out",
+    },
+    {
+      name: "build non-zero exit",
+      commands: { build: "exit 8" },
+      index: 4,
+      status: "failed",
+      exitCode: 8,
+    },
+    {
+      name: "build launch failure",
+      commands: { build: "definitely-missing-build-xyz" },
+      index: 4,
+      status: "failed",
+    },
+    {
+      name: "build timeout",
+      commands: { build: "sh -c 'sleep 5 & wait'" },
+      index: 4,
+      status: "timed_out",
+    },
+  ] as const)
+    scenarios.push({
+      name: focused.name,
+      commands: {
+        test: "exit 0",
+        lint: "exit 0",
+        typecheck: "exit 0",
+        ...focused.commands,
+      },
+      ...(focused.status === "timed_out" ? { timeoutSeconds: 1 } : {}),
+      assert: async (invocation) => {
+        expect(invocation.exitCode).toBe(1);
+        const report = JSON.parse(invocation.stdout) as {
+          status: string;
+          checks: Array<{ status: string; exitCode: number | null }>;
+        };
+        expect(report.status).toBe("failed");
+        expect(report.checks).toHaveLength(5);
+        expect(report.checks[focused.index]?.status).toBe(focused.status);
+        if (focused.exitCode !== undefined)
+          expect(report.checks[focused.index]?.exitCode).toBe(focused.exitCode);
+        expect(
+          report.checks
+            .filter((_, index) => index !== focused.index)
+            .every((check) => check.status === "passed"),
+        ).toBe(true);
+      },
+    });
+
+  // A successful formatCheck that changes files fails validation and is never
+  // cleaned; the mutation remains available for explicit recovery.
+  scenarios.push({
+    name: "dirty worktree after formatCheck",
+    commands: {
+      test: "exit 0",
+      lint: "exit 0",
+      typecheck: "exit 0",
+      formatCheck: `touch ${join("validation-dirty.txt")}`,
+    },
+    assert: async (invocation, context) => {
+      expect(invocation.exitCode).toBe(1);
+      const report = JSON.parse(invocation.stdout);
+      expect(report.status).toBe("failed");
+      const result = JSON.parse(await readFile(report.result, "utf8"));
+      expect(result.git.cleanAfterValidation).toBe(false);
+      expect(result.git.reason).toContain("not clean after validation");
+      await expect(
+        lstat(join(context.featureWorktree, "validation-dirty.txt")),
+      ).resolves.toBeTruthy();
+      expect(
+        await gitOutput(context.featureWorktree, ["status", "--porcelain"]),
+      ).toContain("validation-dirty.txt");
+    },
+  });
+
+  // A command that creates a commit cannot produce a passing result.
+  scenarios.push({
+    name: "changed HEAD",
+    commands: {
+      test: "git commit --quiet --allow-empty -m sneaky",
+      lint: "exit 0",
+      typecheck: "exit 0",
+    },
+    assert: async (invocation, context) => {
+      expect(invocation.exitCode).toBe(1);
+      const report = JSON.parse(invocation.stdout);
+      expect(report.status).toBe("failed");
+      const actualHead = await gitOutput(context.featureWorktree, [
+        "rev-parse",
+        "HEAD",
+      ]);
+      const result = JSON.parse(await readFile(report.result, "utf8"));
+      expect(result.validatedHead).not.toBe(actualHead);
+      expect(result.git.headAfterValidation).toBe(actualHead);
+      expect(result.git.reason).toContain("HEAD changed during validation");
+    },
+  });
+
+  for (const scenario of scenarios) {
+    const repository = await createCommittedTargetRepository();
+    await writeWorkflowPackage(repository, ["01-first"]);
+    const recordingCheck = await writeRecordingCheck(
+      await temporaryDirectory(),
+      "unused",
+    );
+    await writeValidationConfiguration(repository, {
+      test: scenario.commands.test,
+      lint: `${recordingCheck} lint`,
+      typecheck: `${recordingCheck} typecheck`,
+      formatCheck:
+        scenario.commands.formatCheck ?? `${recordingCheck} formatCheck`,
+      build: scenario.commands.build ?? `${recordingCheck} build`,
+      ...(scenario.timeoutSeconds === undefined
+        ? {}
+        : { timeoutSeconds: scenario.timeoutSeconds }),
+    });
+    const { environment } = await writeFakeHerdrWorker();
+    const completed = await completeWorkflowRun(
+      repository,
+      ["01-first"],
+      environment,
+    );
+    const matrixLog = join(await temporaryDirectory(), "checks.log");
+
+    const invocation = await invokeValidation("feature", repository, {
+      ...environment,
+      FAKE_LOG: matrixLog,
+    });
+
+    await scenario.assert(invocation, {
+      featureWorktree: completed.featureWorktree,
+    });
+
+    const snapshot = JSON.parse(
+      await readFile(
+        join(
+          repository,
+          ".orchestrator",
+          "runs",
+          completed.runId,
+          "state.json",
+        ),
+        "utf8",
+      ),
+    );
+    expect(snapshot.validation.status).toBe("failed");
+    expect(snapshot.phase).toBe("completed");
+  }
+}, 45_000);
+
+test("flow validate refuses before running any command when preconditions fail", async () => {
+  const fakeDirectory = await temporaryDirectory();
+  const check = await writeRecordingCheck(fakeDirectory, "check");
+  const log = join(fakeDirectory, "checks.log");
+  const commands = {
+    test: `${check} test`,
+    lint: `${check} lint`,
+    typecheck: `${check} typecheck`,
+  };
+  const { environment } = await writeFakeHerdrWorker();
+  const validationEnvironment = { ...environment, FAKE_LOG: log };
+
+  async function assertRefused(
+    invocation: ValidationInvocation,
+    code: number,
+    errorToken: string,
+  ): Promise<void> {
+    expect(invocation.exitCode).toBe(code);
+    expect(invocation.stderr).toContain(errorToken);
+    await expect(lstat(log)).rejects.toMatchObject({ code: "ENOENT" });
+  }
+
+  // Missing package match.
+  const missingRepository = await createCommittedTargetRepository();
+  await writeWorkflowPackage(missingRepository, ["01-first"]);
+  await writeValidationConfiguration(missingRepository, commands);
+  await assertRefused(
+    await invokeValidation("feature", missingRepository, validationEnvironment),
+    3,
+    "RUN_NOT_FOUND",
+  );
+
+  // Incomplete Ticket queue.
+  const incompleteRepository = await createCommittedTargetRepository();
+  await writeWorkflowPackage(incompleteRepository, ["01-first", "02-second"]);
+  await writeValidationConfiguration(incompleteRepository, commands);
+  const incompleteWorker = await writeFakeHerdrWorker();
+  await completeWorkflowRun(incompleteRepository, ["01-first"], {
+    ...incompleteWorker.environment,
+    FAKE_LOG: log,
+  });
+  await assertRefused(
+    await invokeValidation(
+      "feature",
+      incompleteRepository,
+      validationEnvironment,
+    ),
+    4,
+    "WORKFLOW_NOT_COMPLETED",
+  );
+
+  // The package path still matches, but its contents no longer match the
+  // immutable input captured by the completed run.
+  const changedPackageRepository = await createCommittedTargetRepository();
+  await writeWorkflowPackage(changedPackageRepository, ["01-first"]);
+  await writeValidationConfiguration(changedPackageRepository, commands);
+  const changedPackageWorker = await writeFakeHerdrWorker();
+  await completeWorkflowRun(
+    changedPackageRepository,
+    ["01-first"],
+    changedPackageWorker.environment,
+  );
+  await writeFile(
+    join(changedPackageRepository, "feature", "spec.md"),
+    "# Changed feature\n",
+  );
+  await assertRefused(
+    await invokeValidation(
+      "feature",
+      changedPackageRepository,
+      validationEnvironment,
+    ),
+    3,
+    "WORKFLOW_PACKAGE_CHANGED",
+  );
+
+  // Dirty Feature worktree before execution.
+  const dirtyRepository = await createCommittedTargetRepository();
+  await writeWorkflowPackage(dirtyRepository, ["01-first"]);
+  await writeValidationConfiguration(dirtyRepository, commands);
+  const dirtyWorker = await writeFakeHerdrWorker();
+  const dirtyRun = await completeWorkflowRun(
+    dirtyRepository,
+    ["01-first"],
+    dirtyWorker.environment,
+  );
+  await writeFile(join(dirtyRun.featureWorktree, "untracked.txt"), "x\n");
+  await assertRefused(
+    await invokeValidation("feature", dirtyRepository, validationEnvironment),
+    4,
+    "UNTRACKED_WORKTREE",
+  );
+
+  // Feature worktree HEAD differs from the final accepted Git checkpoint.
+  const staleRepository = await createCommittedTargetRepository();
+  await writeWorkflowPackage(staleRepository, ["01-first"]);
+  await writeValidationConfiguration(staleRepository, commands);
+  const staleWorker = await writeFakeHerdrWorker();
+  const staleRun = await completeWorkflowRun(
+    staleRepository,
+    ["01-first"],
+    staleWorker.environment,
+  );
+  await run("git", [
+    "-C",
+    staleRun.featureWorktree,
+    "commit",
+    "--quiet",
+    "--allow-empty",
+    "-m",
+    "external",
+  ]);
+  await assertRefused(
+    await invokeValidation("feature", staleRepository, validationEnvironment),
+    4,
+    "WORKTREE_INVARIANT_VIOLATION",
+  );
+
+  // Ambiguous completed runs for the same package.
+  const ambiguousRepository = await createCommittedTargetRepository();
+  await writeWorkflowPackage(ambiguousRepository, ["01-first"]);
+  await writeValidationConfiguration(ambiguousRepository, commands);
+  const ambiguousWorker = await writeFakeHerdrWorker();
+  await completeWorkflowRun(
+    ambiguousRepository,
+    ["01-first"],
+    ambiguousWorker.environment,
+  );
+  await completeWorkflowRun(
+    ambiguousRepository,
+    ["01-first"],
+    ambiguousWorker.environment,
+    true,
+  );
+  await assertRefused(
+    await invokeValidation(
+      "feature",
+      ambiguousRepository,
+      validationEnvironment,
+    ),
+    3,
+    "AMBIGUOUS_WORKFLOW_RUN",
+  );
+
+  // A completed and an unfinished run are still ambiguous. Validation must
+  // not silently prefer the completed one.
+  const mixedRepository = await createCommittedTargetRepository();
+  await writeWorkflowPackage(mixedRepository, ["01-first", "02-second"]);
+  await writeValidationConfiguration(mixedRepository, commands);
+  const mixedWorker = await writeFakeHerdrWorker();
+  await completeWorkflowRun(
+    mixedRepository,
+    ["01-first", "02-second"],
+    mixedWorker.environment,
+  );
+  await completeWorkflowRun(
+    mixedRepository,
+    ["01-first"],
+    mixedWorker.environment,
+    true,
+  );
+  await assertRefused(
+    await invokeValidation("feature", mixedRepository, validationEnvironment),
+    3,
+    "AMBIGUOUS_WORKFLOW_RUN",
+  );
+
+  // A legacy three-command validation block is rejected before commands run,
+  // with both newly required names in the actionable schema error.
+  const legacyRepository = await createCommittedTargetRepository();
+  await writeWorkflowPackage(legacyRepository, ["01-first"]);
+  await writeValidationConfiguration(legacyRepository, {
+    test: "exit 0",
+    lint: "exit 0",
+    typecheck: "exit 0",
+  });
+  const legacyWorker = await writeFakeHerdrWorker();
+  await completeWorkflowRun(
+    legacyRepository,
+    ["01-first"],
+    legacyWorker.environment,
+  );
+  await mkdir(join(legacyRepository, ".orchestrator"), { recursive: true });
+  await writeFile(
+    join(legacyRepository, ".orchestrator", "config.yaml"),
+    "version: 1\n\nagents:\n  codex:\n    kind: codex\n\nroles:\n  worker:\n    agent: codex\n    skill: implement\n\nworkflow:\n  workerTimeoutSeconds: 1800\n  maxWorkerAttempts: 2\n  validation:\n    test: 'exit 0'\n    lint: 'exit 0'\n    typecheck: 'exit 0'\n    timeoutSeconds: 60\n",
+    "utf8",
+  );
+  const legacyInvocation = await invokeValidation(
+    "feature",
+    legacyRepository,
+    validationEnvironment,
+  );
+  expect(legacyInvocation.exitCode).toBe(2);
+  expect(legacyInvocation.stderr).toContain("formatCheck");
+  expect(legacyInvocation.stderr).toContain("build");
+  await expect(readFile(log, "utf8")).rejects.toMatchObject({
+    code: "ENOENT",
+  });
+
+  // Missing validation configuration (a preserved config without the block).
+  const unconfiguredRepository = await createCommittedTargetRepository();
+  await writeWorkflowPackage(unconfiguredRepository, ["01-first"]);
+  await mkdir(join(unconfiguredRepository, ".orchestrator"), {
+    recursive: true,
+  });
+  await writeFile(
+    join(unconfiguredRepository, ".orchestrator", "config.yaml"),
+    "version: 1\n\nagents:\n  codex:\n    kind: codex\n\nroles:\n  worker:\n    agent: codex\n    skill: implement\n\nworkflow:\n  workerTimeoutSeconds: 1800\n  maxWorkerAttempts: 2\n",
+    "utf8",
+  );
+  const unconfiguredWorker = await writeFakeHerdrWorker();
+  await completeWorkflowRun(
+    unconfiguredRepository,
+    ["01-first"],
+    unconfiguredWorker.environment,
+  );
+  await assertRefused(
+    await invokeValidation(
+      "feature",
+      unconfiguredRepository,
+      validationEnvironment,
+    ),
+    2,
+    "VALIDATION_NOT_CONFIGURED",
+  );
+}, 45_000);
+
+test("flow validate rerun after an explicit correction replaces the failed decision", async () => {
+  const repository = await createCommittedTargetRepository();
+  await writeWorkflowPackage(repository, ["01-first"]);
+  const fakeDirectory = await temporaryDirectory();
+  const check = await writeRecordingCheck(fakeDirectory, "check");
+  const log = join(fakeDirectory, "checks.log");
+  const flag = join(fakeDirectory, "fixed.flag");
+  const conditional = join(fakeDirectory, "conditional");
+  await writeFile(
+    conditional,
+    `#!/usr/bin/env sh\nprintf '%s cwd=%s\\n' "$1" "$PWD" >> "$FAKE_LOG"\nif [ -f "$FIXED_FLAG" ]; then exit 0; else exit 1; fi\n`,
+    "utf8",
+  );
+  await chmod(conditional, 0o755);
+  await writeValidationConfiguration(repository, {
+    test: `${conditional} test`,
+    lint: `${check} lint`,
+    typecheck: `${check} typecheck`,
+    formatCheck: `${check} formatCheck`,
+    build: `${check} build`,
+  });
+  const { environment } = await writeFakeHerdrWorker();
+  const validationEnvironment = {
+    ...environment,
+    FAKE_LOG: log,
+    FIXED_FLAG: flag,
+  };
+  const completed = await completeWorkflowRun(
+    repository,
+    ["01-first"],
+    environment,
+  );
+
+  const failed = await invokeValidation(
+    "feature",
+    repository,
+    validationEnvironment,
+  );
+  expect(failed.exitCode).toBe(1);
+  expect(JSON.parse(failed.stdout).status).toBe("failed");
+  expect(JSON.parse(failed.stdout).checks[0].status).toBe("failed");
+
+  // An explicit user correction without changing the accepted HEAD.
+  await writeFile(flag, "fixed\n");
+  expect(
+    await gitOutput(completed.featureWorktree, ["rev-parse", "HEAD"]),
+  ).toBe(completed.validatedHead);
+
+  const passed = await invokeValidation(
+    "feature",
+    repository,
+    validationEnvironment,
+  );
+  expect(passed.exitCode).toBe(0);
+  const report = JSON.parse(passed.stdout);
+  expect(report).toMatchObject({
+    runId: completed.runId,
+    validatedHead: completed.validatedHead,
+    status: "passed",
+  });
+
+  const snapshot = JSON.parse(
+    await readFile(
+      join(repository, ".orchestrator", "runs", completed.runId, "state.json"),
+      "utf8",
+    ),
+  );
+  expect(snapshot.validation.status).toBe("passed");
+  expect(snapshot.validation.validatedHead).toBe(completed.validatedHead);
+  const history = (
+    await readFile(
+      join(
+        repository,
+        ".orchestrator",
+        "runs",
+        completed.runId,
+        "history.jsonl",
+      ),
+      "utf8",
+    )
+  )
+    .trim()
+    .split("\n")
+    .map(
+      (line) => JSON.parse(line) as { type: string; data: { status?: string } },
+    );
+  const validationEvents = history.filter(
+    (event) => event.type === "workflow.validation.completed",
+  );
+  // Exactly two explicit invocations happened; no automatic retry appeared.
+  expect(validationEvents.map((event) => event.data.status)).toEqual([
+    "failed",
+    "passed",
+  ]);
+}, 45_000);

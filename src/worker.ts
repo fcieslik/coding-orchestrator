@@ -21,6 +21,7 @@ export interface LogicalWorkerExecution {
   agentKind: WorkerAgentKind;
   skill: string;
   input: string;
+  specification?: string;
   runId: string;
   ticketId: string;
   worktree: string;
@@ -112,6 +113,8 @@ export function validateLogicalWorkerExecution(
   if (!execution.ticketId || !ticketPattern.test(execution.ticketId))
     throw invalid("ticketId must be a single path component");
   validatePath(execution.input, "input");
+  if (execution.specification !== undefined)
+    validatePath(execution.specification, "specification");
   validatePath(execution.worktree, "worktree");
   validatePath(execution.resultPath, "resultPath");
   if (typeof execution.commitRequired !== "boolean")
@@ -162,6 +165,33 @@ export function renderWorkerPrompt(
     checked.input,
     checked.agentKind,
   );
+  const completedResult = JSON.stringify({
+    schemaVersion: 1,
+    ticketId: checked.ticketId,
+    status: "completed",
+    commit: "<full commit SHA>",
+    summary: "<concise summary>",
+    commands: [
+      { command: "git status --short", status: "passed", exitCode: 0 },
+    ],
+  });
+  const blockedResult = JSON.stringify({
+    schemaVersion: 1,
+    ticketId: checked.ticketId,
+    status: "blocked",
+    summary: "<concise summary>",
+    blocker: {
+      type: "<type>",
+      requiredDecision: "<smallest required decision>",
+    },
+  });
+  const failedResult = JSON.stringify({
+    schemaVersion: 1,
+    ticketId: checked.ticketId,
+    status: "failed",
+    summary: "<concise summary>",
+    diagnostics: { message: "<failure message>" },
+  });
   const prompt = [
     `${skillInvocation}`,
     "",
@@ -169,14 +199,22 @@ export function renderWorkerPrompt(
     "",
     `- Run: ${checked.runId}`,
     `- Ticket: ${checked.ticketId}`,
+    ...(checked.specification === undefined
+      ? []
+      : [
+          `- Specification: ${quotePromptPath(checked.specification)}`,
+          "- Use the specification as read-only context and common constraints; the assigned ticket remains the only implementation scope.",
+        ]),
     `- Worktree: ${quotePromptPath(checked.worktree)}`,
     `- Write the structured execution result to: ${quotePromptPath(checked.resultPath)}`,
     `- Commit required: ${checked.commitRequired}`,
     "- Implement only the assigned ticket and work only in the provided worktree.",
     "- The assigned ticket input is immutable; do not modify it.",
     "- Global Orchestrator workflow state is read-only.",
-    "- Status must be completed, blocked, or failed.",
-    "- The result must contain the ticket ID, status, commit SHA when completed, a concise summary, and commands/checks executed.",
+    "- Write exactly one JSON object using the camelCase fields in one of the following shapes; do not use snake_case aliases.",
+    `- Completed: ${completedResult}`,
+    `- Blocked: ${blockedResult}`,
+    `- Failed: ${failedResult}`,
     "- Publish the result atomically by writing a temporary file in the output directory, then renaming it to the result path.",
     "- On a product, architecture, security, destructive-operation, credential, or human-decision blocker, do not guess. Write a blocked result with the smallest required decision, then stop.",
     "- On technical failure, write a failed result with relevant diagnostics, then stop.",
@@ -206,8 +244,6 @@ export function codexWorkerArguments(
     worktree,
     "--add-dir",
     outputDirectory,
-    "--sandbox",
-    "workspace-write",
     "--approve-for-me",
   ]);
 }
@@ -222,6 +258,9 @@ export async function launchSkillAwareWorker(
     agentKind: options.agentKind ?? "codex",
     skill: options.skill,
     input: options.input,
+    ...(options.specification === undefined
+      ? {}
+      : { specification: options.specification }),
     runId: options.runId,
     ticketId: options.ticketId,
     worktree: options.worktree,

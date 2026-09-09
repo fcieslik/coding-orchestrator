@@ -269,17 +269,6 @@ function stringField(value: unknown, ...paths: string[][]): string | undefined {
   return undefined;
 }
 
-function stringFieldAllowEmpty(
-  value: unknown,
-  ...paths: string[][]
-): string | undefined {
-  for (const path of paths) {
-    const candidate = nested(value, ...path);
-    if (typeof candidate === "string") return candidate;
-  }
-  return undefined;
-}
-
 function validateAgentIdentity(
   operation: string,
   response: Record<string, unknown>,
@@ -306,6 +295,7 @@ function validateAgentIdentity(
 function lifecycleField(value: unknown): HerdrObservedState | undefined {
   const state = stringField(
     value,
+    ["result", "agent", "agent_status"],
     ["result", "agent", "state"],
     ["result", "agent", "status"],
     ["result", "state"],
@@ -468,9 +458,7 @@ export class HerdrAdapter {
   }
 
   /** Create and start one owned agent without inferring either identity. */
-  async launch(
-    options: HerdrLaunchOptions,
-  ): Promise<HerdrExecutionHandle>;
+  async launch(options: HerdrLaunchOptions): Promise<HerdrExecutionHandle>;
   async launch(
     callerPaneId: string,
     cwd: string,
@@ -606,17 +594,7 @@ export class HerdrAdapter {
       ],
       timeoutMs,
     );
-    const parsed = parseJson("agent read", result.stdout.trim());
-    validateAgentIdentity("agent read", parsed, handle);
-    const text = stringFieldAllowEmpty(
-      parsed,
-      ["result", "read", "text"],
-      ["result", "text"],
-      ["text"],
-    );
-    if (text === undefined)
-      throw protocolError("agent read", "missing diagnostic text");
-    return text;
+    return result.stdout;
   }
 
   async close(

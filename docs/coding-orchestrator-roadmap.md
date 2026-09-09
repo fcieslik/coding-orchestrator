@@ -1,5 +1,7 @@
 # Coding Workflow Orchestrator — Roadmap
 
+Phase 5 i dalsze fazy są rozwijane w uproszczonym roadmapie POC: `docs/coding-orchestrator-roadmap-phase-5-onward.md`. W razie różnicy ten dokument jest rozstrzygający dla Phase 0–4, a uproszczony roadmap dla Phase 5+.
+
 ## Cel projektu
 
 Zbudować lokalny, trwały orchestrator workflow dla developmentu opartego na:
@@ -9,7 +11,7 @@ Zbudować lokalny, trwały orchestrator workflow dla developmentu opartego na:
 - **Git + worktrees** jako trwałym stanie kodu,
 - **repo-local runtime state** w `.orchestrator/`,
 - **structured artifacts** jako protokole między agentami a Orchestratorem,
-- **niezależnym reviewerze**,
+- **niezależnym reviewerze uruchamianym przez istniejący skill `code-review`**,
 - **deterministycznych checkach**,
 - **bounded fixer loop**,
 - **restart/resume** bez utraty workflow.
@@ -20,6 +22,10 @@ Kluczowa zasada:
 
 Herdr nie jest workflow engine. Herdr zarządza procesami, pane'ami, cwd i agent lifecycle.  
 Workflow semantics, transitions i decyzja „co dalej” należą do Orchestratora.
+
+Skills definiują engineering methodology. Orchestrator definiuje workflow semantics i minimalny execution contract. Agent adapters renderują agent-specific skill invocation syntax, a Herdr transportuje gotowy prompt bez interpretowania jego semantyki.
+
+> Orchestrator nie reimplementuje metodologii należącej do downstream engineering skills. Worker i reviewer prompts są skill-aware wrappers, nie samodzielnymi metodologiami.
 
 ---
 
@@ -39,7 +45,7 @@ System powinien obsłużyć:
 - świeży worker per ticket,
 - Herdr,
 - Codex jako worker,
-- Pi jako reviewer,
+- Codex jako domyślny reviewer V1,
 - jeden deterministic check,
 - maksymalnie jeden fixer retry,
 - `state.json`,
@@ -121,7 +127,7 @@ MVP powinien również przetrwać restart głównego Orchestratora w trakcie wor
 Odpowiada za:
 
 - routing workflow,
-- wybór następnego ready ticketu,
+- walidację jawnie wskazanego następnego ticketu,
 - uruchamianie workerów,
 - walidację rezultatów,
 - przejścia state machine,
@@ -129,6 +135,8 @@ Odpowiada za:
 - retry policy,
 - recovery,
 - completion decision.
+
+Orchestrator buduje logiczne wywołania ról i skills oraz dodaje wyłącznie kontekst i kontrakt potrzebny do trwałego wykonania workflow. Nie opisuje własnej metodologii implementacji ani code review.
 
 ### Herdr
 
@@ -142,6 +150,17 @@ Odpowiada za:
 - output,
 - wait,
 - process termination.
+
+Herdr traktuje prompt jako opaque payload: wysyła już wyrenderowaną treść bez znajomości `implement`, `code-review`, ticketów, review ani artifact semantics.
+
+### Downstream engineering skills
+
+Odpowiadają za sposób wykonania pracy:
+
+- `implement` — implementation methodology,
+- `code-review` — review methodology względem fixed diff.
+
+Rola, agent i skill są odrębnymi pojęciami. Workflow przechowuje logiczną nazwę skill; agent renderer tłumaczy ją na składnię wybranego agenta, np. Codex `$implement` lub `$code-review`.
 
 ### Git / worktree
 
@@ -234,7 +253,7 @@ coding-orchestrator/
 │   │
 │   ├── tickets/
 │   │   ├── source.ts
-│   │   ├── scheduler.ts
+│   │   ├── queue.ts
 │   │   └── validate.ts
 │   │
 │   ├── execution/
@@ -358,6 +377,8 @@ Nie trzeba używać XState w V1.
 
 Uczynić Git częścią protokołu workflow.
 
+Skill-aware worker/reviewer correction nie zmienia Phase 2. Prompt i invocation semantics należą do późniejszych faz; repo identity, base, worktree, checkpoint i cleanup pozostają bez zmian.
+
 ## Implementacja
 
 Zbudować:
@@ -400,7 +421,12 @@ Scenariusze:
 
 ## Cel
 
-Zbudować minimalną warstwę potrzebną do sterowania agentami.
+Zbudować minimalną warstwę potrzebną do sterowania agentami i zamknąć **Herdr feasibility gate**: udowodnić na żywym Codexie, że automatyzacja Herdr działa end to end, zanim Phase 4 oprze na niej worker execution.
+
+Phase 3 jest ukończona dopiero, gdy przechodzą oba poziomy dowodu:
+
+1. deterministyczne testy adaptera z fake `herdr` executable;
+2. jawnie uruchomiony `flow herdr smoke --agent codex` wewnątrz Herdr (`HERDR_ENV=1`).
 
 ## V1 primitives
 
@@ -412,9 +438,27 @@ read output
 close
 ```
 
+Publiczny CLI V1 dodaje tylko gate command:
+
+```text
+flow herdr smoke --agent codex [--json] [--output <file>] [--keep-pane]
+```
+
+Pozostałe primitives są wewnętrznym TypeScript API. Adapter:
+
+- tworzy sibling pane względem caller pane z explicit absolute cwd i `--no-focus`;
+- przechowuje owned handle zawierający pane ID i agent name;
+- używa deterministycznej, znormalizowanej nazwy zgodnej z `[a-z][a-z0-9_-]{0,31}` i odmawia kolizji;
+- wywołuje `herdr` przez injectable argv-based command runner, nigdy przez shell-built command;
+- przyjmuje caller-supplied timeouts; smoke używa 30 sekund dla startu i 120 sekund dla prompt settlement;
+- rozpoznaje kompatybilność po wymaganym zachowaniu i polach JSON, zapisując zaobserwowaną wersję wyłącznie diagnostycznie;
+- ogranicza przechwycony output i nie zapisuje pełnego promptu w diagnostyce.
+
 Preferować wysokopoziomowe Herdr agent API tam, gdzie jest niezawodne.
 
 Raw pane operations traktować jako fallback.
+
+Adapter przyjmuje już wyrenderowany prompt jako opaque payload i przekazuje go bez zmian. Nie konstruuje ani nie interpretuje downstream skill invocation, ticket semantics, review semantics ani result semantics.
 
 ## Ważna zasada
 
@@ -432,6 +476,32 @@ Nie oznacza:
 ticket done
 ```
 
+`wait` zwraca jawny wynik transportowy:
+
+```text
+settled     # Herdr idle lub done
+blocked
+unknown
+timed-out
+disappeared
+```
+
+Invocation/protocol failures, takie jak brak executable, non-zero CLI exit lub malformed JSON, pozostają błędami adaptera. Żaden wynik transportowy sam nie kończy ticketu.
+
+## Live feasibility gate
+
+Smoke test musi potwierdzić:
+
+- wykonanie wewnątrz Herdr i dostępność caller context;
+- utworzenie owned pane z żądanym cwd bez zmiany focusu;
+- start i detekcję świeżego, jednoznacznie nazwanego Codexa;
+- dostarczenie multiline opaque prompt zawierającego nonce i literalne `$implement`;
+- odczyt odpowiedzi zawierającej nonce i oczekiwany cwd;
+- settled lifecycle observation;
+- zamknięcie wyłącznie utworzonego pane.
+
+`blocked`, `unknown`, timeout, process disappearance oraz close failure odróżniają się w raporcie, ale wszystkie failują gate. `--keep-pane` jest trybem diagnostycznym, raportuje `cleanup: skipped` i nie stanowi pełnego passing gate. Przy close failure raport eksponuje owned pane ID, lecz nie kończy innych panes ani serwera. JSON report trafia na stdout; `--output` opcjonalnie utrwala ten sam raport bez mutowania workflow state.
+
 ## Testy
 
 Mockować command runner.
@@ -446,176 +516,263 @@ Scenariusze:
 - process disappearance,
 - malformed CLI output.
 
+Test command runnera musi również potwierdzić byte-for-byte opaque prompt forwarding, cleanup po częściowym launchu, collision refusal i bounded diagnostics. Real-agent smoke jest jawny i opt-in; `pnpm test` nie uruchamia interaktywnych ani płatnych agentów.
+
 ---
 
-# 9. Phase 4 — pierwszy Worker vertical slice
+# 9. Phase 4 — skill-aware Worker vertical slice
 
-To powinien być pierwszy realny proof-of-concept.
+To jest pierwszy realny coding-workflow proof-of-concept: jeden jawnie wskazany local Markdown ticket jest wykonywany w przygotowanym Workflow runie. Phase 5 dodaje przygotowany Workflow package, trwałą Ticket queue oraz user-triggered Workflow steps.
 
 ## Flow
 
 ```text
-flow run create
+flow run create + Git preparation
       ↓
-state.json
+flow worker execute --run <run-id> --ticket <path> [--repo <path>]
       ↓
-create worktree
+immutable Ticket input snapshot
       ↓
-Herdr
+RoleExecution(worker, configured agent, skill = implement)
       ↓
-Codex Worker
+agent renderer
       ↓
-commit
+$implement "<absolute-snapshot-path>"       # Codex
+/implement "<absolute-snapshot-path>"       # Claude/Pi rendering only in Phase 4
++ orchestration contract
       ↓
-result.json
+Herdr → fresh Codex Worker
       ↓
-checkpoint validation
+one or more commits + output/result.json
       ↓
-ticket done
+reconciliation + owned-pane cleanup
+      ↓
+atomic checkpoint/attempt acceptance
 ```
+
+Publiczne operacje V1:
+
+```text
+flow worker execute
+flow worker reconcile
+flow worker retry
+```
+
+Ponowne `execute` nie tworzy duplikatu. `reconcile` bada interrupted lub ambiguous attempt, a `retry` tworzy kolejny attempt dopiero po udowodnieniu, że jest to bezpieczne. Komendy wymagają runu w `implementing` z gotowym Feature worktree; run pozostający w `preparing` musi najpierw dokończyć Phase 2 Git preparation. Run lock obejmuje tylko krótkie claim/finalization mutations, nigdy czas pracy agenta.
 
 ## Worker contract
 
-Worker powinien dostać:
+Worker invocation ma dokładnie trzy części:
 
-- jeden bounded ticket,
-- spec reference,
-- `CONTEXT.md`,
-- relevant ADRs,
-- branch/worktree context,
-- output path dla `result.json`.
+1. logical skill invocation: role `worker`, configured skill `implement`, input = immutable Ticket input snapshot;
+2. absolute snapshot reference jako skill input;
+3. minimalny orchestration contract.
 
-Worker:
+Orchestration contract zawiera tylko:
 
-1. implementuje tylko ticket,
-2. nie modyfikuje global workflow state,
-3. uruchamia focused checks,
-4. commituje,
-5. zapisuje structured result,
-6. kończy sesję.
+- run/ticket/worktree identity,
+- result artifact path,
+- scope i commit requirement,
+- global workflow state jako read-only,
+- blocker/failure protocol.
+
+Worker może zapisywać kod w Feature worktree oraz własny prealokowany output directory. State snapshot, Operational history, Ticket input snapshot i Execution record pozostają Orchestrator-owned. Dla Codex agent launch używa Feature worktree jako `-C`, dokładnego output directory jako `--add-dir`, `workspace-write` i automatic approval review; Phase 4 nie wymaga `danger-full-access`.
+
+Nie powtarza instrukcji dotyczących repo inspection, implementacji, testowania ani self-review — ich właścicielem jest `implement`.
+
+Agent renderer zamienia logiczne `implement` na składnię agenta:
+
+```text
+skill = implement
+Codex    → $implement "<absolute-snapshot-path>"
+Claude   → /implement "<absolute-snapshot-path>"
+Pi       → /implement "<absolute-snapshot-path>"
+```
+
+Phase 4 uruchamia live tylko Codex; renderery Claude/Pi są czystą, testowaną logiką tekstową. Nie hardcodować agent-specific syntax w state machine ani workflow semantics i nie pozwalać rendererowi budować shell commands.
+
+## Repo config i setup
+
+Phase 4 dodaje idempotentne `flow setup`. Tworzy brakujące `.orchestrator/config.yaml`, `.orchestrator/README.md` i ignore rule dla `.orchestrator/runs/`, lecz nie nadpisuje istniejących plików ani nie naprawia konfliktów automatycznie.
+
+Minimalna konfiguracja:
+
+```yaml
+version: 1
+
+agents:
+  codex:
+    kind: codex
+
+roles:
+  worker:
+    agent: codex
+    skill: implement
+
+workflow:
+  workerTimeoutSeconds: 1800
+  maxWorkerAttempts: 2
+```
+
+Timeout musi należeć do zakresu 60–7200 sekund. V1 nie przyjmuje dowolnych agent process arguments z repo config.
+
+## Attempt artifacts i lifecycle
+
+Canonical ticket ID dla local Markdown adaptera jest nazwą pliku bez `.md`. Ticket musi być zwykłym plikiem wewnątrz Target repository. Każdy attempt kopiuje i hashuje jego treść:
+
+```text
+.orchestrator/runs/<run-id>/workers/<ticket-id>/attempt-01/
+├── input/
+│   └── ticket.md
+├── execution.json
+└── output/
+    └── result.json
+```
+
+Tylko `output/` jest dodatkowym writable rootem workera. `execution.json` jest Orchestrator-owned i utrwala logical invocation, input hash, prompt hash, worktree/result references, attempt status, Herdr identity, lifecycle observations, cleanup, timings oraz maksymalnie ostatnie 32 KiB diagnostyki. Pełny prompt i transcript nie są utrwalane.
+
+Attempt lifecycle:
+
+```text
+prepared → running → reconciling → accepted
+                              ├── blocked
+                              └── failed
+```
+
+Herdr state jest osobną obserwacją. State snapshot przechowuje tylko minimalną referencję do active/last execution; pełna ticket map należy do Phase 5. Operational history zapisuje semantic milestones `worker.attempt.prepared`, `started`, `accepted`, `blocked` i `failed`, nie każdy detal transportu.
 
 ## `result.json`
 
-Minimalnie:
+`result.json` jest wersjonowaną discriminated union z `status = completed | blocked | failed`. Wspólne pola to `schemaVersion`, `ticketId`, `status` i `summary`. `completed` wymaga canonical commit SHA oraz structured command results; `blocked` wymaga structured blocker i najmniejszej wymaganej decyzji; `failed` wymaga structured diagnostics. `filesChanged` i `notesForNextTask` są opcjonalne i nie są workflow truth.
+
+Przykład `completed`:
 
 ```json
 {
   "schemaVersion": 1,
-  "ticketId": "T01",
+  "ticketId": "01-add-worker-execution",
   "status": "completed",
-  "commit": "abc123",
+  "commit": "0123456789abcdef0123456789abcdef01234567",
   "summary": "Implemented ticket",
-  "commands": [],
+  "commands": [{ "command": "pnpm test", "exitCode": 0 }],
   "filesChanged": []
 }
 ```
 
+Worker publikuje wynik przez temporary file + atomic rename. Orchestrator akceptuje tylko zwykły, niesymlinkowany plik zgodny ze schematem. Unknown object fields pozostają dozwolone dla forward compatibility.
+
+## Retry i reconciliation
+
+`workerTimeoutSeconds` uruchamia reconciliation, nie oznacza automatycznie failure. Maksymalnie dwa attempty są dozwolone. Automatyczny retry jest bezpieczny wyłącznie przed potwierdzonym prompt delivery i przy udowodnionym braku efektów ubocznych. Po delivery nowy attempt wymaga jawnego reconciliation/retry.
+
+- valid `completed` + matching current HEAD + clean worktree może zostać zaakceptowany;
+- `failed` albo missing result + brak nowego commita + clean worktree jest jednoznacznym failure i może dopuścić retry;
+- invalid/missing/blocked result przy commicie lub dirty worktree blokuje run;
+- mismatched HEAD, branch lub nieznane zmiany blokują run;
+- explicit blocker, ambiguity oraz cleanup failure blokują run z `interruptedPhase = implementing`;
+- exhausted conclusive technical failure kończy run jako `failed`.
+
+Retry domyślnie używa poprzedniego Ticket input snapshot. Jawne `--refresh-ticket` tworzy nowy snapshot i zapisuje old/new input hashes w lineage.
+
 ## Checkpoint validation
 
-Orchestrator przed oznaczeniem ticketu jako done sprawdza:
+Orchestrator przed akceptacją attemptu sprawdza bez mutacji:
 
 - worktree istnieje,
 - branch jest poprawny,
-- nowy commit istnieje,
+- co najmniej jeden nowy commit istnieje,
 - `result.json` parsuje się,
 - ticket ID jest poprawny,
 - commit istnieje,
-- commit jest reachable z HEAD,
-- cleanliness policy jest spełniona.
+- zgłoszony commit jest canonical current HEAD i potomkiem poprzedniego checkpointu,
+- cleanliness policy jest spełniona,
+- Ticket input snapshot i Execution record zgadzają się ze State snapshot,
+- Orchestrator-owned artifacts nie zostały zmienione,
+- owned pane został bezpiecznie zamknięty.
+
+Walidacja przebiega w kolejności: inspect bez mutacji → bounded diagnostic read → close owned pane → revalidate pod run lockiem → atomowo zaakceptuj Git checkpoint i Worker attempt. Herdr `blocked` bez poprawnego Worker result nie inicjuje automatycznej rozmowy: diagnostyka jest utrwalana, pane zamykany, a run blokowany do decyzji zapisanej w trwałym źródle.
 
 Kluczowy invariant:
 
 > `worker_done` is not `task_done`.
 
+## Testy i exit gate
+
+Primary seam to publiczny `scripts/flow` z fake `herdr` w `PATH`; niższe injected seams służą crash/timing cases. Testy obejmują interruption przed pane, przed delivery, podczas pracy, po commit/result, po cleanup oraz snapshot-first history gap. Human output ma odpowiednik `--json`; exit `6` oznacza blocked/reconciliation required, a `7` conclusive/exhausted execution failure.
+
+Kolejność gate'u:
+
+1. minimalny deterministic fake-worker happy path;
+2. wczesny manual live Codex probe z globalnym `$implement`;
+3. negative, retry, reconciliation i crash tests;
+4. pełny quality/schema/build suite oraz command help checks;
+5. końcowy manual live Codex gate w disposable repo.
+
+Real-agent test jest opt-in i nie należy do `pnpm test`. Phase 4 nie obejmuje ticket scheduling, reviewer, deterministic project checks, fixer, automatic blocker answers ani live Claude/Pi.
+
 ---
 
-# 10. Phase 5 — ticket graph execution
+# 10. Phase 5 — user-driven ticket steps
 
 ## Cel
 
-Obsłużyć więcej niż jeden ticket.
+Obsłużyć kilka przygotowanych ticketów w jednym Workflow runie bez budowania schedulera ani grafu zależności.
 
-Orchestrator nie tworzy własnego drugiego task graph.
-
-Źródłem prawdy są istniejące tickety.
-
-## Ticket adapter
-
-Minimalny interfejs:
+Wejściem jest lokalny Workflow package o stałym układzie:
 
 ```text
-list tickets
-read ticket
-read blockers
-read ticket id/title
+<feature>/
+├── spec.md
+└── issues/
+    ├── 01-first.md
+    └── 02-second.md
 ```
 
-Na początku można obsłużyć lokalne markdown tickety.
-
-Później:
-
-- GitHub issues,
-- Linear,
-- inne trackery.
-
-## Ready calculation
-
-```text
-if ticket is recorded done:
-    done
-else if all blockers are done:
-    ready
-else:
-    blocked
-```
+Pakiet jest walidowany przed startem runu i kopiowany do immutable run input. Orchestrator sprawdza wyłącznie format, który posiada: regularne, niepuste pliki, bezpieczne i jednoznaczne Ticket IDs oraz konfigurację. Nie interpretuje struktury Markdown należącej do downstream `implement`. Nazwa pliku bez `.md` jest canonical ticket ID, a kolejność wynika z sortowania nazw. GitHub, Linear lub lokalny tracker mogą przygotować taki pakiet przed uruchomieniem workflow, ale Phase 5 nie komunikuje się z trackerem i nie wykonuje write-backu.
 
 ## V1 execution
 
-Sekwencyjnie:
+Jedno wywołanie użytkownika wykonuje najwyżej jeden jawnie wskazany ticket:
 
 ```text
-T01 → fresh worker → commit
-T02 → fresh worker → commit
-T03 → fresh worker → commit
+$orchestrate <workflow-package> <ticket-id>
+    ↓
+create/resume run → validate next pending ticket
+    ↓
+fresh Worker → commit → accepted checkpoint
+    ↓
+return control to user
 ```
 
-Wszystkie w tym samym feature worktree.
+Wszystkie tickety jednego runu używają tej samej Feature branch i Feature worktree, lecz każdy ticket otrzymuje świeżego Workera. Orchestrator nie pozwala pominąć pending ticketu, nie powtarza accepted ticketu i zatrzymuje kolejkę po `blocked`, `failed` lub niejednoznacznym wyniku. Ponowne jawne wskazanie tego samego blocked ticketu może uruchomić fresh bounded retry dopiero po reconciliation potwierdzającej brak niezaakceptowanych efektów.
+
+Pełny zakres, minimalne testy, live exit gate oraz świadomie odłożone usprawnienia opisuje uproszczony roadmap Phase 5+.
 
 ---
 
-# 11. Phase 6 — Reviewer
+# 11. Phase 6 — deterministic project validation
 
 ## Cel
 
-Oddzielić authoring od semantic review.
+Po zakończeniu wszystkich implementation tickets użytkownik uruchamia jawnie
+deterministyczną walidację końcowego Feature worktree. Etap nie uruchamia
+agenta ani Herdr pane i nie wykonuje semantic review, HTTP, browser,
+screenshots, security scanów ani automatycznej naprawy.
 
-Po zakończeniu implementation tickets uruchomić świeżego reviewera.
+Target repository definiuje dokładnie pięć komend w
+`.orchestrator/config.yaml`: `test`, `lint`, `typecheck`, `formatCheck` i
+`build`, ze wspólnym timeoutem na komendę. `flow validate <workflow-package>` wykonuje je kolejno
+w Feature worktree, zachowuje ograniczone diagnostyki i publikuje wynik tylko
+dla niezmienionego, czystego, ostatniego accepted Git checkpoint.
 
-Reviewer dostaje:
+Każdy niezerowy exit, błąd uruchomienia, timeout albo mutacja Git powoduje
+`failed`; Orchestrator nie czyści ani nie resetuje zaobserwowanych zmian.
+Jawne ponowienie po korekcie zastępuje poprzednią kompletną decyzję dla tego
+samego HEAD. Szczegółowy kontrakt i exit gate opisuje roadmap Phase 5+.
 
-- fixed `BASE_SHA`,
-- current `HEAD`,
-- spec,
-- relevant ADRs,
-- coding standards.
-
-Reviewer nie powinien naprawiać kodu.
-
-## Output
-
-Przykładowe:
-
-```text
-.orchestrator/runs/<run-id>/review/attempt-01.md
-.orchestrator/runs/<run-id>/review/attempt-01.json
-```
-
-JSON powinien zawierać co najmniej:
-
-- pass/fail,
-- severity,
-- findings,
-- references.
+Semantic review, HTTP i browser validation, screenshots, security-specific
+scanners oraz automatyczny Fixer pozostają możliwymi przyszłymi rozszerzeniami,
+a nie częścią Phase 6.
 
 ---
 
@@ -872,7 +1029,9 @@ Orchestrator tooling wymaga mocnych testów, ponieważ agenci będą polegać na
 - retry policy,
 - config parsing,
 - schema validation,
-- prompt construction,
+- logical role/skill invocation construction,
+- Codex rendering: `implement` → `$implement`, `code-review` → `$code-review`,
+- worker/reviewer wrapper prompt construction,
 - event serialization.
 
 ## Integration tests
@@ -893,6 +1052,10 @@ Orchestrator tooling wymaga mocnych testów, ponieważ agenci będą polegać na
 - unknown,
 - process vanished,
 - malformed output.
+
+Testy Herdr pozostają nieświadome skill semantics i sprawdzają, że wyrenderowany prompt jest transportowany bez zmian.
+
+Prompt tests sprawdzają, że worker wrapper zawiera `$implement`, assigned ticket, result path, blocker protocol i commit requirement, a reviewer wrapper zawiera `$code-review`, fixed `BASE_SHA`/`HEAD_SHA`, ticket/spec, artifact paths i no-code-modification contract. Oba templates nie mogą duplikować downstream engineering methodology.
 
 ### Fake worker artifacts
 
@@ -944,6 +1107,12 @@ Dopiero po przejściu E2E uruchomić realny smoke test z Codex/Claude/Pi wewnąt
 19. Orchestrator komponuje się z istniejącymi engineering skills zamiast je zastępować.
 20. Global skill i target repo są osobnymi rootami.
 21. Runtime state jest repo-local pod `.orchestrator/runs/`.
+22. Skills definiują engineering methodology; Orchestrator dodaje tylko workflow semantics i execution contract.
+23. Worker i reviewer prompts są skill-aware wrappers, nie samodzielnymi metodologiami.
+24. Agent-specific skill invocation syntax należy do agent renderer, nie do workflow semantics.
+25. Herdr transportuje już wyrenderowany prompt jako opaque payload.
+26. Rola, agent profile i downstream skill są odrębnymi pojęciami.
+27. Fixer nie używa automatycznie `implement`; pozostaje bounded contract, chyba że jawnie skonfigurowano dedykowany skill.
 
 ---
 
@@ -981,7 +1150,7 @@ durable run
       ↓
 isolated feature worktree
       ↓
-fresh Codex worker via Herdr
+RoleExecution(worker) → Codex `$implement` wrapper → Herdr
       ↓
 commit
       ↓
@@ -1005,9 +1174,9 @@ Phase 0   Project bootstrap
 Phase 1   Durable state
 Phase 2   Git/worktree
 Phase 3   Herdr adapter
-Phase 4   Single-worker vertical slice
-Phase 5   Ticket graph execution
-Phase 6   Reviewer
+Phase 4   Skill-aware worker vertical slice
+Phase 5   User-driven ticket steps
+Phase 6   Skill-aware independent reviewer
 Phase 7   Deterministic checks
 Phase 8   Fixer
 Phase 9   Browser verification

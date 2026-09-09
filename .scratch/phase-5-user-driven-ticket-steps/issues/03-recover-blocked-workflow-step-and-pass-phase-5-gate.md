@@ -4,7 +4,7 @@
 
 **Blocked by:** 02
 
-**Status:** implemented; live gate pending
+**Status:** complete
 
 - [x] A blocked or failed ticket prevents later tickets from executing and reports the smallest action needed from the user.
 - [x] Invoking the same blocked ticket again is treated as an explicit resume request; the Orchestrator never retries it autonomously.
@@ -14,7 +14,7 @@
 - [x] If resolving the blocker changes the accepted spec or ticket requirements, the workflow requires a new package and run instead of mutating the active run's input.
 - [x] Minimal automated coverage at the public executable boundary proves blocked stop, safe same-ticket recovery, and refusal to advance after unsafe or conclusive failure without duplicating broad Phase 4 tests.
 - [x] The installed global skill exposes the simple operator interface of Workflow package plus ticket ID and does not require setup commands, run IDs, worktree paths, or direct Worker commands.
-- [ ] The manual live gate runs two prepared tickets through two real fresh Codex Workers, with an Orchestrator restart between invocations, one shared feature worktree, two ordered accepted commits, cleaned-up panes, no duplicate execution, and an unchanged primary checkout.
-- [ ] Tests, build, installed-skill validation, command help, durable artifacts, and the manual live evidence satisfy the Phase 5 exit gate.
+- [x] The manual live gate runs two prepared tickets through two real fresh Codex Workers, with an Orchestrator restart between invocations, one shared feature worktree, two ordered accepted commits, cleaned-up panes, no duplicate execution, and an unchanged primary checkout.
+- [x] Tests, build, installed-skill validation, command help, durable artifacts, and the manual live evidence satisfy the Phase 5 exit gate.
 
-Deterministic evidence passes: 133 automated tests, typecheck, lint, formatting, schema drift, build, installed-skill coverage, and public command help. The manual live gate remains pending because it requires an operator-started real Codex/Herdr run.
+Current deterministic evidence: 136 automated tests, typecheck, lint, formatting, schema drift, and build. Installed-skill coverage and public command help passed before the live gate. The operator-run live gate accepted `01-add-multiply` at `0b3e18f` and `02-add-safe-divide` at `4aa88c5` in `/Users/fc47/workspace/trash/herdr-testing`, using two fresh Codex Workers and the shared Feature worktree while leaving the primary checkout unchanged.

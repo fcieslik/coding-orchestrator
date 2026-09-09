@@ -8,9 +8,9 @@
   },
   "packageManager": "pnpm@11.25.0",
   "scripts": {
-    "build": "pnpm schema:generate && tsup src/cli.ts --format esm --clean",
-    "format": "prettier --write package.json pnpm-workspace.yaml tsconfig.json eslint.config.js scripts/generate-schemas.ts src tests",
-    "format:check": "prettier --check package.json pnpm-workspace.yaml tsconfig.json eslint.config.js scripts/generate-schemas.ts src tests",
+    "build": "pnpm schema:generate && tsup --config tsup.config.ts",
+    "format": "prettier --write package.json pnpm-workspace.yaml tsconfig.json eslint.config.js tsup.config.ts scripts/generate-schemas.ts src tests",
+    "format:check": "prettier --check package.json pnpm-workspace.yaml tsconfig.json eslint.config.js tsup.config.ts scripts/generate-schemas.ts src tests",
     "lint": "eslint .",
     "schema:check": "node --experimental-strip-types scripts/generate-schemas.ts --check",
     "schema:generate": "node --experimental-strip-types scripts/generate-schemas.ts",

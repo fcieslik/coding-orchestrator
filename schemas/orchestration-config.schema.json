@@ -65,6 +65,45 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 10
+        },
+        "validation": {
+          "type": "object",
+          "properties": {
+            "test": {
+              "type": "string",
+              "minLength": 1
+            },
+            "lint": {
+              "type": "string",
+              "minLength": 1
+            },
+            "typecheck": {
+              "type": "string",
+              "minLength": 1
+            },
+            "formatCheck": {
+              "type": "string",
+              "minLength": 1
+            },
+            "build": {
+              "type": "string",
+              "minLength": 1
+            },
+            "timeoutSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 7200
+            }
+          },
+          "required": [
+            "test",
+            "lint",
+            "typecheck",
+            "formatCheck",
+            "build",
+            "timeoutSeconds"
+          ],
+          "additionalProperties": false
         }
       },
       "required": [

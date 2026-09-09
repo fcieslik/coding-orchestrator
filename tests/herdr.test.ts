@@ -15,6 +15,7 @@ import { promisify } from "node:util";
 import { afterEach, expect, test } from "vitest";
 
 import {
+  HerdrAdapter,
   normalizeAgentName,
   runHerdrSmoke,
   type HerdrCommandRunner,
@@ -40,6 +41,53 @@ test("agent names are deterministic and Herdr-safe", () => {
   expect(normalizeAgentName("Run/42 — Codex")).toMatch(
     /^[a-z][a-z0-9_-]{0,31}$/,
   );
+});
+
+test("agent prompt reads the Herdr 0.8.2 agent_status field", async () => {
+  const runner: HerdrCommandRunner = async () => ({
+    stdout: JSON.stringify({
+      result: {
+        agent: {
+          name: "smoke-worker",
+          pane_id: "w1:p2",
+          agent_status: "done",
+        },
+      },
+    }),
+    stderr: "",
+    exitCode: 0,
+  });
+  const adapter = new HerdrAdapter({ runner });
+
+  await expect(
+    adapter.prompt(
+      {
+        paneId: "w1:p2",
+        agentName: "smoke-worker",
+        agentKind: "codex",
+        cwd: "/target",
+      },
+      "smoke prompt",
+    ),
+  ).resolves.toBe("done");
+});
+
+test("agent read returns the Herdr CLI text response", async () => {
+  const runner: HerdrCommandRunner = async () => ({
+    stdout: "HERDR_PHASE3_SMOKE_OK\n/target\n",
+    stderr: "",
+    exitCode: 0,
+  });
+  const adapter = new HerdrAdapter({ runner });
+
+  await expect(
+    adapter.read({
+      paneId: "w1:p2",
+      agentName: "smoke-worker",
+      agentKind: "codex",
+      cwd: "/target",
+    }),
+  ).resolves.toBe("HERDR_PHASE3_SMOKE_OK\n/target\n");
 });
 
 test("smoke forwards the multiline prompt byte-for-byte and cleans its pane", async () => {
@@ -69,14 +117,16 @@ test("smoke forwards the multiline prompt byte-for-byte and cleans its pane", as
     if (args[0] === "agent" && args[1] === "prompt") {
       submittedPrompt = args[3] ?? "";
       return {
-        stdout: JSON.stringify({ result: { agent: { state: "done" } } }),
+        stdout: JSON.stringify({
+          result: { agent: { agent_status: "done" } },
+        }),
         stderr: "",
         exitCode: 0,
       };
     }
     if (args[0] === "agent" && args[1] === "read")
       return {
-        stdout: JSON.stringify({ result: { read: { text: submittedPrompt } } }),
+        stdout: submittedPrompt,
         stderr: "",
         exitCode: 0,
       };
@@ -146,14 +196,16 @@ test("reports output-file failures without losing lifecycle evidence", async () 
     if (args[0] === "agent" && args[1] === "prompt") {
       submittedPrompt = args[3] ?? "";
       return {
-        stdout: JSON.stringify({ result: { agent: { state: "done" } } }),
+        stdout: JSON.stringify({
+          result: { agent: { agent_status: "done" } },
+        }),
         stderr: "",
         exitCode: 0,
       };
     }
     if (args[0] === "agent" && args[1] === "read")
       return {
-        stdout: JSON.stringify({ result: { read: { text: submittedPrompt } } }),
+        stdout: submittedPrompt,
         stderr: "",
         exitCode: 0,
       };
@@ -216,14 +268,16 @@ test("keep-pane is an explicitly non-passing diagnostic result", async () => {
     if (args[0] === "agent" && args[1] === "prompt") {
       submittedPrompt = args[3] ?? "";
       return {
-        stdout: JSON.stringify({ result: { agent: { state: "done" } } }),
+        stdout: JSON.stringify({
+          result: { agent: { agent_status: "done" } },
+        }),
         stderr: "",
         exitCode: 0,
       };
     }
     if (args[0] === "agent" && args[1] === "read")
       return {
-        stdout: JSON.stringify({ result: { read: { text: submittedPrompt } } }),
+        stdout: submittedPrompt,
         stderr: "",
         exitCode: 0,
       };
@@ -281,14 +335,16 @@ test("close failure remains non-passing and identifies the owned pane", async ()
     if (args[0] === "agent" && args[1] === "prompt") {
       submittedPrompt = args[3] ?? "";
       return {
-        stdout: JSON.stringify({ result: { agent: { state: "done" } } }),
+        stdout: JSON.stringify({
+          result: { agent: { agent_status: "done" } },
+        }),
         stderr: "",
         exitCode: 0,
       };
     }
     if (args[0] === "agent" && args[1] === "read")
       return {
-        stdout: JSON.stringify({ result: { read: { text: submittedPrompt } } }),
+        stdout: submittedPrompt,
         stderr: "",
         exitCode: 0,
       };
@@ -332,9 +388,9 @@ const args = process.argv.slice(2);
 appendFileSync(process.env.FAKE_LOG, JSON.stringify(args) + "\\n");
 if (args[0] === "--version") console.log("0.8.2");
 else if (args[0] === "pane" && args[1] === "split") console.log(JSON.stringify({result:{pane:{pane_id:"fake:p2"}}}));
-else if (args[0] === "agent" && args[1] === "start") console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:p2",state:"idle"}}}));
-else if (args[0] === "agent" && args[1] === "prompt") { writeFileSync(process.env.FAKE_PROMPT, args[3]); console.log(JSON.stringify({result:{agent:{state:"done"}}})); }
-else if (args[0] === "agent" && args[1] === "read") console.log(JSON.stringify({result:{read:{text:readFileSync(process.env.FAKE_PROMPT,"utf8")}}}));
+else if (args[0] === "agent" && args[1] === "start") console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:p2",agent_status:"idle"}}}));
+else if (args[0] === "agent" && args[1] === "prompt") { writeFileSync(process.env.FAKE_PROMPT, args[3]); console.log(JSON.stringify({result:{agent:{agent_status:"done"}}})); }
+else if (args[0] === "agent" && args[1] === "read") process.stdout.write(readFileSync(process.env.FAKE_PROMPT,"utf8"));
 else if (args[0] === "pane" && args[1] === "close") { if (process.env.FAKE_CLOSE_FAILURE === "1") { console.error("pane close denied"); process.exit(9); } console.log("{}"); }
 else process.exit(2);
 `,
@@ -547,7 +603,7 @@ function lifecycleRunner(
     exitCode: 0,
   },
   readResult: { stdout: string; stderr: string; exitCode: number } = {
-    stdout: JSON.stringify({ result: { read: { text: "diagnostic" } } }),
+    stdout: "diagnostic",
     stderr: "",
     exitCode: 0,
   },
@@ -576,7 +632,9 @@ function lifecycleRunner(
       if (outcome === "timed-out")
         return { stdout: "", stderr: "wait timed out", exitCode: 124 };
       return {
-        stdout: JSON.stringify({ result: { agent: { state: outcome } } }),
+        stdout: JSON.stringify({
+          result: { agent: { agent_status: outcome } },
+        }),
         stderr: "",
         exitCode: 0,
       };
@@ -783,13 +841,13 @@ test("preserves both primary and cleanup failures without retrying close", async
       "done",
       calls,
       { stdout: "", stderr: "pane close denied", exitCode: 9 },
-      { stdout: "not json", stderr: "", exitCode: 0 },
+      { stdout: "", stderr: "agent read denied", exitCode: 7 },
     ),
     randomBytes: () => Buffer.from("cleanup1"),
   });
 
   expect(report.error?.operation).toBe("agent read");
-  expect(report.error?.message).toContain("Unexpected token");
+  expect(report.error?.message).toContain("exited with 7");
   expect(report.cleanup).toMatchObject({
     status: "failed",
     paneId: "owned:p2",

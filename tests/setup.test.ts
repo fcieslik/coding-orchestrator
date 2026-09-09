@@ -40,7 +40,18 @@ test("setup creates the contract and repeats as an exact no-op", async () => {
     version: 1,
     agents: { codex: { kind: "codex" } },
     roles: { worker: { agent: "codex", skill: "implement" } },
-    workflow: { workerTimeoutSeconds: 1800, maxWorkerAttempts: 2 },
+    workflow: {
+      workerTimeoutSeconds: 1800,
+      maxWorkerAttempts: 2,
+      validation: {
+        test: "pnpm test",
+        lint: "pnpm lint",
+        typecheck: "pnpm typecheck",
+        formatCheck: "pnpm format:check",
+        build: "pnpm build",
+        timeoutSeconds: 900,
+      },
+    },
   });
   const paths = [
     join(repository, ".orchestrator/config.yaml"),

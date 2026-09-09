@@ -1,0 +1,3 @@
+# Compose downstream engineering skills at the agent boundary
+
+The Orchestrator will represent worker and reviewer work as logical skill invocations and add only the durable execution contract. Agent renderers translate `implement` and `code-review` into agent-specific syntax such as Codex `$implement` and `$code-review`, while Herdr transports the rendered prompt unchanged. This keeps engineering methodology owned by the established downstream skills, prevents competing prompt methodologies, and preserves the distinction between workflow role, agent profile, and skill. Fixers remain governed by a bounded fixer contract unless a dedicated fixer skill is explicitly configured.

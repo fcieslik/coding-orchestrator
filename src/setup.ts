@@ -27,6 +27,13 @@ roles:
 workflow:
   workerTimeoutSeconds: 1800
   maxWorkerAttempts: 2
+  validation:
+    test: "pnpm test"
+    lint: "pnpm lint"
+    typecheck: "pnpm typecheck"
+    formatCheck: "pnpm format:check"
+    build: "pnpm build"
+    timeoutSeconds: 900
 `;
 
 export const orchestrationReadme = `# Orchestration contract
@@ -35,6 +42,7 @@ This directory contains the repository-local contract used by the Coding Workflo
 
 - \`.orchestrator/config.yaml\` is shared project policy. It selects the Worker role, Agent profile, downstream engineering skill, timeout, and attempt budget.
 - \`.orchestrator/runs/\` contains ephemeral Workflow state and is intentionally ignored by Git.
+- \`workflow.validation\` in \`.orchestrator/config.yaml\` defines exactly five validation commands (\`test\`, \`lint\`, \`typecheck\`, \`formatCheck\`, \`build\`) plus one \`timeoutSeconds\` applied independently to each command. \`flow validate\` runs them sequentially in that fixed order in the final Feature worktree. The default commands assume a pnpm project; adapt them to this repository before validating a completed Workflow run.
 - Workers may write only their assigned Feature worktree and their preallocated result output directory. They must not modify Workflow state or the execution record.
 
 The version 1 default Worker uses the Codex Agent profile and the \`implement\` skill. Timeout values are limited to 60–7,200 seconds and the attempt budget is bounded. Agent process arguments are deliberately not configurable in version 1.
@@ -87,7 +95,16 @@ function stripComment(value: string): string {
   return value.trimEnd();
 }
 
-function parseScalar(value: string, line: number): unknown {
+export type OrchestrationYamlScalar = string | number | boolean | null;
+
+export interface OrchestrationYamlMapping {
+  [key: string]: OrchestrationYamlValue;
+}
+
+export type OrchestrationYamlValue =
+  OrchestrationYamlScalar | OrchestrationYamlMapping;
+
+function parseScalar(value: string, line: number): OrchestrationYamlValue {
   if (value.length === 0) return {};
   if (value.startsWith("[") || value.startsWith("{"))
     throw new Error(
@@ -113,9 +130,11 @@ function parseScalar(value: string, line: number): unknown {
   throw new Error(`line ${line}: unsupported scalar`);
 }
 
-export function parseOrchestrationYaml(contents: string): unknown {
-  const root: Record<string, unknown> = {};
-  const stack: Array<{ indent: number; object: Record<string, unknown> }> = [
+export function parseOrchestrationYaml(
+  contents: string,
+): OrchestrationYamlMapping {
+  const root: OrchestrationYamlMapping = {};
+  const stack: Array<{ indent: number; object: OrchestrationYamlMapping }> = [
     { indent: -1, object: root },
   ];
   const lines = contents.replace(/^\uFEFF/, "").split(/\r?\n/);
@@ -145,7 +164,7 @@ export function parseOrchestrationYaml(contents: string): unknown {
     const value = parseScalar(valueText, lineIndex + 1);
     parent[key] = value;
     if (valueText.length === 0)
-      stack.push({ indent, object: value as Record<string, unknown> });
+      stack.push({ indent, object: value as OrchestrationYamlMapping });
   }
   return root;
 }

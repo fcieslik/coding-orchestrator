@@ -60,6 +60,8 @@ export interface ExecuteWorkerOptions {
   repository?: string;
   runId: string;
   ticket: string;
+  /** Optional immutable feature context supplied by a Workflow package. */
+  specification?: string;
   dependencies?: RunDependencies;
   adapter?: HerdrAdapter;
   /** Internal retry seam: use a previously persisted immutable input. */
@@ -71,7 +73,6 @@ export interface ExecuteWorkerOptions {
     refreshed: boolean;
   };
   forceNewAttempt?: boolean;
-  automaticRetry?: boolean;
 }
 
 export interface WorkerExecutionReport {
@@ -186,6 +187,7 @@ interface ExecutionRecordData {
   agentKind: "codex";
   skill: "implement";
   ticket: { source: string; input: string; hash: string };
+  specification?: string;
   worktree: string;
   artifacts: {
     directory: string;
@@ -255,8 +257,20 @@ function isNodeError(error: unknown, code: string): boolean {
   );
 }
 
-function stableJson(value: unknown): string {
-  return JSON.stringify(value);
+export function stableJson(value: unknown): string {
+  const canonicalize = (candidate: unknown): unknown => {
+    if (Array.isArray(candidate)) return candidate.map(canonicalize);
+    if (candidate === null || typeof candidate !== "object") return candidate;
+
+    return Object.fromEntries(
+      Object.entries(candidate)
+        .filter(([, entry]) => entry !== undefined)
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([key, entry]) => [key, canonicalize(entry)]),
+    );
+  };
+
+  return JSON.stringify(canonicalize(value));
 }
 
 function ownershipFingerprint(record: ExecutionRecordData): string {
@@ -271,6 +285,7 @@ function ownershipFingerprint(record: ExecutionRecordData): string {
     agentKind: record.agentKind,
     skill: record.skill,
     ticket: record.ticket,
+    specification: record.specification,
     worktree: record.worktree,
     artifacts: record.artifacts,
     retry: record.retry,
@@ -693,38 +708,6 @@ async function git(repository: string, args: string[]): Promise<string> {
   }
 }
 
-async function hasNoWorkerEffects(
-  worktree: string,
-  baseline: string | undefined,
-  resultPath: string,
-): Promise<boolean> {
-  if (!baseline) return false;
-  try {
-    const currentHead = await git(worktree, ["rev-parse", "HEAD"]);
-    if (currentHead !== baseline) return false;
-    const dirty = await git(worktree, [
-      "status",
-      "--porcelain=v1",
-      "--untracked-files=all",
-    ]);
-    if (dirty.length > 0) return false;
-    const resultEntry = await lstat(resultPath).catch((error: unknown) => {
-      if (isNodeError(error, "ENOENT")) return undefined;
-      throw error;
-    });
-    return resultEntry === undefined;
-  } catch {
-    return false;
-  }
-}
-
-function promptWasAttempted(error: unknown): boolean {
-  if (!(error instanceof FlowError)) return true;
-  const operation = error.details?.operation;
-  if (typeof operation !== "string") return true;
-  return operation === "agent prompt";
-}
-
 async function mutateExecutionState(
   repository: string,
   runId: string,
@@ -1014,6 +997,9 @@ function validatePromptHash(record: ExecutionRecord): string | undefined {
       agentKind: record.agentKind,
       skill: record.skill,
       input: record.ticket.input,
+      ...(record.specification === undefined
+        ? {}
+        : { specification: record.specification }),
       runId: record.runId,
       ticketId: record.ticketId,
       worktree: record.worktree,
@@ -1841,6 +1827,12 @@ export async function executeWorker(
       if (recovered) {
         attempt = recovered;
         execution = recovered.execution as ExecutionRecordData;
+        if (execution.specification !== options.specification)
+          throw executionError(
+            "Previously prepared Worker attempt uses a different specification context",
+            "SPECIFICATION_MISMATCH",
+            4,
+          );
       } else {
         attempt = await nextAttempt(repository, options.runId, ticket.id);
         await atomicWrite(attempt.artifacts.input, ticket.contents, 0o600);
@@ -1861,6 +1853,9 @@ export async function executeWorker(
             input: attempt.artifacts.input,
             hash: ticket.hash,
           },
+          ...(options.specification === undefined
+            ? {}
+            : { specification: options.specification }),
           worktree: resolve(worktree),
           artifacts: {
             directory: attempt.artifacts.directory,
@@ -1981,6 +1976,9 @@ export async function executeWorker(
       agentKind: "codex",
       skill: config.roles.worker.skill,
       input: attempt!.artifacts.input,
+      ...(execution.specification === undefined
+        ? {}
+        : { specification: execution.specification }),
       runId: options.runId,
       ticketId: ticket.id,
       worktree: resolve(worktree),
@@ -2144,20 +2142,6 @@ export async function executeWorker(
         };
       }
     }
-    const maxAttempts = (await readOrchestrationConfig(repository)).config
-      .workflow.maxWorkerAttempts;
-    const automaticRetry =
-      options.automaticRetry !== false &&
-      attempt!.number < maxAttempts &&
-      execution!.promptDelivery !== "confirmed" &&
-      !promptWasAttempted(error) &&
-      execution!.cleanup?.status !== "failed" &&
-      (await hasNoWorkerEffects(
-        execution!.worktree,
-        (await inspectRun(repository, options.runId)).snapshot.git
-          ?.validatedHead,
-        attempt!.artifacts.output,
-      ));
     await recordFailure(
       repository,
       options.runId,
@@ -2166,24 +2150,6 @@ export async function executeWorker(
       error,
       dependencies,
     );
-    if (automaticRetry) {
-      return executeWorker({
-        repository,
-        runId: options.runId,
-        ticket: ticket.source,
-        ticketSnapshot: ticket,
-        forceNewAttempt: true,
-        automaticRetry: false,
-        retryLineage: {
-          previousAttemptId: attempt!.id,
-          previousExecutionId: execution!.executionId,
-          previousInputHash: ticket.hash,
-          refreshed: false,
-        },
-        dependencies,
-        ...(options.adapter === undefined ? {} : { adapter: options.adapter }),
-      });
-    }
     throw error;
   } finally {
     await releaseAttemptClaim(attempt!.artifacts.claim, attemptClaim);
@@ -2350,6 +2316,9 @@ export async function retryWorker(
     runId: options.runId,
     ticket: snapshot.source,
     ticketSnapshot: snapshot,
+    ...(prior.specification === undefined
+      ? {}
+      : { specification: prior.specification }),
     forceNewAttempt: true,
     retryLineage: {
       previousAttemptId: prior.attemptId,
