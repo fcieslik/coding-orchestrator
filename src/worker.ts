@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   HerdrAdapter,
@@ -57,6 +59,9 @@ export interface LaunchedWorker {
 
 const identifierPattern = /^[a-z][a-z0-9_-]{0,63}$/;
 const ticketPattern = /^[^/\\]+$/;
+const workerSafeguardsAssetPath = fileURLToPath(
+  new URL("../assets/prompts/worker-safeguards.md", import.meta.url),
+);
 
 function invalid(
   message: string,
@@ -131,10 +136,27 @@ export function renderSkillInvocation(
   return `${prefix}${skill} ${quotePromptPath(input)}`;
 }
 
+function readWorkerSafeguards(): string {
+  try {
+    const safeguards = readFileSync(workerSafeguardsAssetPath, "utf8");
+    if (safeguards.trim().length === 0) throw new Error("the file is empty");
+    return safeguards;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new FlowError(
+      `Worker safeguards policy is missing or unreadable at ${workerSafeguardsAssetPath}; reinstall the Orchestrator skill (${reason})`,
+      4,
+      "RUNTIME_ASSET_UNAVAILABLE",
+      { path: workerSafeguardsAssetPath },
+    );
+  }
+}
+
 export function renderWorkerPrompt(
   execution: LogicalWorkerExecution,
 ): RenderedWorkerPrompt {
   const checked = validateLogicalWorkerExecution(execution);
+  const safeguards = readWorkerSafeguards();
   const skillInvocation = renderSkillInvocation(
     checked.skill,
     checked.input,
@@ -158,6 +180,10 @@ export function renderWorkerPrompt(
     "- Publish the result atomically by writing a temporary file in the output directory, then renaming it to the result path.",
     "- On a product, architecture, security, destructive-operation, credential, or human-decision blocker, do not guess. Write a blocked result with the smallest required decision, then stop.",
     "- On technical failure, write a failed result with relevant diagnostics, then stop.",
+    "",
+    "Worker safeguards (canonical policy):",
+    "",
+    safeguards,
   ].join("\n");
   return {
     prompt,
