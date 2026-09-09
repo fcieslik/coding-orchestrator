@@ -50,6 +50,18 @@ The helper persists local Delivery intent before the fast-forward and reconciles
 
 For natural requests such as “validate and integrate locally”, select this local operation explicitly. If the user requests final validation without choosing local integration or Pull Request preparation, ask once which Delivery channel they want instead of inferring one.
 
+## GitHub Pull Request handoff
+
+When the user explicitly asks to “validate and prepare a PR” (or an equivalent unambiguous request), invoke the deterministic helper once:
+
+```text
+flow pr <workflow-package> [--repo <path>] [--json]
+```
+
+It resolves the same one completed Workflow run as local delivery, reuses or performs deterministic validation for the exact Feature HEAD, then performs its own read-only GitHub preflight before recording GitHub Delivery intent. It can make only an ordinary push of the existing Feature branch to `origin`, look up or create one Pull Request against the saved Integration target branch, and read checks once. It never force-pushes, rebases, merges a Pull Request, changes branches, or removes Feature resources.
+
+The helper persists intent before its first external mutation and reconciles repeats from remote branch and Pull Request facts. Report its URL, delivered commit, and checks observation; a pending or failed checks observation still means the PR handoff is complete. Do not reproduce the GitHub procedure conversationally or invoke `gh-axi`/`gh` directly.
+
 ## Downstream engineering skills
 
 Compose existing engineering skills instead of recreating their methodology.

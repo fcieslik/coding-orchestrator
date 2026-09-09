@@ -10,6 +10,7 @@ import { runHerdrSmoke } from "./herdr.js";
 import { setupRepository } from "./setup.js";
 import { validateWorkflowRun } from "./validation.js";
 import { integrateWorkflowRun } from "./integration.js";
+import { preparePullRequest } from "./github.js";
 import { executeWorkflowStep } from "./workflow-step.js";
 import {
   executeWorker,
@@ -31,6 +32,7 @@ const structuredRequest =
     argument === "history" ||
     argument === "validate" ||
     argument === "integrate" ||
+    argument === "pr" ||
     (argument === "worktree" &&
       (arguments_[1] === "prepare" ||
         arguments_[1] === "validate" ||
@@ -296,6 +298,63 @@ try {
       console.log(`Validated HEAD: ${report.validatedHead}`);
       if (report.delivery.integratedCommit)
         console.log(`Integrated commit: ${report.delivery.integratedCommit}`);
+      if (report.delivery.reason)
+        console.log(`Reason: ${report.delivery.reason}`);
+    }
+    if (report.status !== "completed") process.exitCode = 1;
+  } else if (argument === "pr" && arguments_.includes("--help")) {
+    console.log("Usage: flow pr <workflow-package> [--repo <path>] [--json]");
+    console.log(
+      "Validate the completed Workflow run when needed, then push its Feature branch and create or reuse one GitHub Pull Request.",
+    );
+  } else if (argument === "pr") {
+    const values = new Map<string, string>();
+    const flags = new Set<string>();
+    const positional: string[] = [];
+    const valueOptions = new Set(["--repo", "--package"]);
+    for (let index = 1; index < arguments_.length; index += 1) {
+      const token = arguments_[index];
+      if (!token) continue;
+      if (token === "--json") {
+        if (flags.has(token))
+          throw new FlowError(`Duplicate option: ${token}`, 2);
+        flags.add(token);
+      } else if (valueOptions.has(token)) {
+        if (values.has(token))
+          throw new FlowError(`Duplicate option: ${token}`, 2);
+        const value = arguments_[index + 1];
+        if (!value || value.startsWith("--"))
+          throw new FlowError(`Option requires a value: ${token}`, 2);
+        values.set(token, value);
+        index += 1;
+      } else if (token.startsWith("--"))
+        throw new FlowError(`Invalid option: ${token}`, 2);
+      else positional.push(token);
+    }
+    const packageReference = values.get("--package") ?? positional[0];
+    if (!packageReference || positional.length > 1)
+      throw new FlowError(
+        "Usage: flow pr <workflow-package> [--repo <path>] [--json]",
+        2,
+      );
+    const repository = values.get("--repo");
+    const report = await preparePullRequest(
+      repository === undefined
+        ? { package: packageReference }
+        : { package: packageReference, repository },
+    );
+    if (flags.has("--json")) console.log(JSON.stringify(report));
+    else {
+      console.log(`GitHub Pull Request delivery: ${report.status}`);
+      console.log(`Run: ${report.runId}`);
+      console.log(`Target branch: ${report.integrationTargetBranch}`);
+      console.log(`Validated HEAD: ${report.validatedHead}`);
+      if (report.delivery.pullRequest)
+        console.log(
+          `Pull Request: ${report.delivery.pullRequest.url} (${report.delivery.pullRequest.state})`,
+        );
+      if (report.delivery.checks)
+        console.log(`Checks: ${report.delivery.checks}`);
       if (report.delivery.reason)
         console.log(`Reason: ${report.delivery.reason}`);
     }

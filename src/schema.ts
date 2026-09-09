@@ -199,6 +199,16 @@ export const deliveryResultSchema = z.looseObject({
   at: utcTimestampSchema,
   reason: z.string().min(1).optional(),
   integratedCommit: objectIdSchema.optional(),
+  remoteFeatureBranch: z.string().min(1).optional(),
+  pullRequest: z
+    .looseObject({
+      number: z.int().positive(),
+      url: z.string().url(),
+      state: z.enum(["open", "merged", "closed"]),
+    })
+    .optional(),
+  checks: z.enum(["passed", "failed", "pending", "unavailable"]).optional(),
+  externallyMerged: z.boolean().optional(),
 });
 
 export type DeliveryResult = z.infer<typeof deliveryResultSchema>;
