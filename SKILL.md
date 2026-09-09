@@ -36,6 +36,20 @@ The helper resolves the single completed Workflow run that owns the package, ver
 
 In this mode do not launch a coding agent, open a Herdr pane, or run project commands yourself: the configured checks belong to the helper. If the helper refuses (no matching completed run, ambiguous runs, incomplete Ticket queue, unavailable or dirty Feature worktree, missing validation configuration), stop and report the smallest required operator action instead of attempting recovery. A failed validation is rerun by invoking the same operation again after the user has fixed the code or project environment; never retry automatically.
 
+## Final local integration
+
+When the user explicitly asks to validate and integrate a completed Workflow run locally, invoke the deterministic helper once:
+
+```text
+flow integrate <workflow-package> [--repo <path>] [--json]
+```
+
+It resolves exactly one completed run from the Workflow package, reuses a passing validation for the exact Feature HEAD when available, otherwise runs the configured five-check validation, and then fast-forwards the saved Integration target branch only when the primary checkout and Feature worktree satisfy the durable Git preflight. It never creates a merge commit, switches branches, rebases, resets, force-updates, or removes the Feature branch/worktree.
+
+The helper persists local Delivery intent before the fast-forward and reconciles an interrupted operation from Git facts. A completed repeat returns the same Delivery result without another mutation; a moved, dirty, divergent, or ambiguous target is refused or recorded as blocked without guessing. Do not pass a Run ID or reproduce this protocol conversationally.
+
+For natural requests such as “validate and integrate locally”, select this local operation explicitly. If the user requests final validation without choosing local integration or Pull Request preparation, ask once which Delivery channel they want instead of inferring one.
+
 ## Downstream engineering skills
 
 Compose existing engineering skills instead of recreating their methodology.

@@ -26,6 +26,7 @@ import {
   releaseRunLock,
   writeSynchronizedFile,
   type RunDependencies,
+  type RunLock,
 } from "./workflow-run.js";
 
 const run = promisify(execFile);
@@ -53,6 +54,8 @@ export interface ValidateRunOptions {
   package: string;
   repository?: string;
   dependencies?: RunDependencies;
+  /** Internal seam for finalization to serialize validation and delivery. */
+  lock?: RunLock;
 }
 
 export type ValidationReport = ValidationResult & {
@@ -315,7 +318,9 @@ export async function validateWorkflowRun(
     );
   const runId = selectedRun.runId;
 
-  const lock = await acquireRunLock(repository, runId, options.dependencies);
+  const lock =
+    options.lock ??
+    (await acquireRunLock(repository, runId, options.dependencies));
   try {
     const current = await inspectRun(repository, runId);
     if (!current.audit.synchronized)
@@ -462,6 +467,6 @@ export async function validateWorkflowRun(
       result: resultPath,
     };
   } finally {
-    await releaseRunLock(lock);
+    if (options.lock === undefined) await releaseRunLock(lock);
   }
 }

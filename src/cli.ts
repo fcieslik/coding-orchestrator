@@ -9,6 +9,7 @@ import {
 import { runHerdrSmoke } from "./herdr.js";
 import { setupRepository } from "./setup.js";
 import { validateWorkflowRun } from "./validation.js";
+import { integrateWorkflowRun } from "./integration.js";
 import { executeWorkflowStep } from "./workflow-step.js";
 import {
   executeWorker,
@@ -29,6 +30,7 @@ const structuredRequest =
   ((argument === "status" ||
     argument === "history" ||
     argument === "validate" ||
+    argument === "integrate" ||
     (argument === "worktree" &&
       (arguments_[1] === "prepare" ||
         arguments_[1] === "validate" ||
@@ -241,6 +243,63 @@ try {
       console.log(`Result: ${report.result}`);
     }
     if (report.status !== "passed") process.exitCode = 1;
+  } else if (argument === "integrate" && arguments_.includes("--help")) {
+    console.log(
+      "Usage: flow integrate <workflow-package> [--repo <path>] [--json]",
+    );
+    console.log(
+      "Validate the completed Workflow run when needed and fast-forward its saved local Integration target branch.",
+    );
+  } else if (argument === "integrate") {
+    const values = new Map<string, string>();
+    const flags = new Set<string>();
+    const positional: string[] = [];
+    const valueOptions = new Set(["--repo", "--package"]);
+    for (let index = 1; index < arguments_.length; index += 1) {
+      const token = arguments_[index];
+      if (!token) continue;
+      if (token === "--json") {
+        if (flags.has(token))
+          throw new FlowError(`Duplicate option: ${token}`, 2);
+        flags.add(token);
+      } else if (valueOptions.has(token)) {
+        if (values.has(token))
+          throw new FlowError(`Duplicate option: ${token}`, 2);
+        const value = arguments_[index + 1];
+        if (!value || value.startsWith("--"))
+          throw new FlowError(`Option requires a value: ${token}`, 2);
+        values.set(token, value);
+        index += 1;
+      } else if (token.startsWith("--")) {
+        throw new FlowError(`Invalid option: ${token}`, 2);
+      } else positional.push(token);
+    }
+    const packageReference = values.get("--package") ?? positional[0];
+    if (!packageReference || positional.length > 1)
+      throw new FlowError(
+        "Usage: flow integrate <workflow-package> [--repo <path>] [--json]",
+        2,
+      );
+    const repository = values.get("--repo");
+    const report = await integrateWorkflowRun(
+      repository === undefined
+        ? { package: packageReference }
+        : { package: packageReference, repository },
+    );
+    if (flags.has("--json")) console.log(JSON.stringify(report));
+    else {
+      console.log(`Local integration: ${report.status}`);
+      console.log(`Run: ${report.runId}`);
+      console.log("Implementation: complete");
+      console.log(`V1: ${report.v1Complete ? "complete" : "incomplete"}`);
+      console.log(`Target branch: ${report.integrationTargetBranch}`);
+      console.log(`Validated HEAD: ${report.validatedHead}`);
+      if (report.delivery.integratedCommit)
+        console.log(`Integrated commit: ${report.delivery.integratedCommit}`);
+      if (report.delivery.reason)
+        console.log(`Reason: ${report.delivery.reason}`);
+    }
+    if (report.status !== "completed") process.exitCode = 1;
   } else if (argument === "run" && arguments_[1] === "create") {
     const { values } = parseOptions(arguments_.slice(2), [
       "--repo",

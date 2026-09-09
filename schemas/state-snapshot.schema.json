@@ -83,6 +83,10 @@
       "format": "date-time",
       "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
     },
+    "integrationTargetBranch": {
+      "type": "string",
+      "minLength": 1
+    },
     "git": {
       "type": "object",
       "properties": {
@@ -93,6 +97,10 @@
         "runBase": {
           "type": "string",
           "pattern": "^[0-9a-f]{40,64}$"
+        },
+        "integrationTargetBranch": {
+          "type": "string",
+          "minLength": 1
         },
         "featureBranch": {
           "type": "string",
@@ -264,6 +272,60 @@
         "status",
         "validatedHead",
         "result",
+        "at"
+      ],
+      "additionalProperties": {}
+    },
+    "delivery": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "type": "number",
+          "const": 1
+        },
+        "channel": {
+          "type": "string",
+          "enum": [
+            "local",
+            "github"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "prepared",
+            "completed",
+            "blocked"
+          ]
+        },
+        "validatedHead": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40,64}$"
+        },
+        "integrationTargetBranch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "integratedCommit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40,64}$"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "channel",
+        "status",
+        "validatedHead",
+        "integrationTargetBranch",
         "at"
       ],
       "additionalProperties": {}

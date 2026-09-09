@@ -114,6 +114,7 @@ export type OrchestrationConfig = z.infer<typeof orchestrationConfigSchema>;
 export const gitStateSchema = z.looseObject({
   schemaVersion: z.literal(1),
   runBase: objectIdSchema,
+  integrationTargetBranch: z.string().min(1).optional(),
   featureBranch: z.string().min(1),
   featureWorktree: z.string().min(1),
   worktreeStatus: gitWorktreeStatusSchema,
@@ -182,6 +183,26 @@ export const validationStateSchema = z.looseObject({
   at: utcTimestampSchema,
 });
 
+export const deliveryChannelSchema = z.enum(["local", "github"]);
+export const deliveryStatusSchema = z.enum([
+  "prepared",
+  "completed",
+  "blocked",
+]);
+
+export const deliveryResultSchema = z.looseObject({
+  schemaVersion: z.literal(1),
+  channel: deliveryChannelSchema,
+  status: deliveryStatusSchema,
+  validatedHead: objectIdSchema,
+  integrationTargetBranch: z.string().min(1),
+  at: utcTimestampSchema,
+  reason: z.string().min(1).optional(),
+  integratedCommit: objectIdSchema.optional(),
+});
+
+export type DeliveryResult = z.infer<typeof deliveryResultSchema>;
+
 export const stateSnapshotSchema = z.looseObject({
   schemaVersion: z.literal(1),
   runId: runIdSchema,
@@ -192,6 +213,7 @@ export const stateSnapshotSchema = z.looseObject({
   fixReturnPhase: z.enum(["reviewing", "checking"]).optional(),
   createdAt: utcTimestampSchema,
   updatedAt: utcTimestampSchema,
+  integrationTargetBranch: z.string().min(1).optional(),
   git: gitStateSchema.optional(),
   workflowPackage: workflowPackageSchema.optional(),
   tickets: z.record(z.string().min(1), workflowTicketSchema).optional(),
@@ -212,6 +234,7 @@ export const stateSnapshotSchema = z.looseObject({
     })
     .optional(),
   validation: validationStateSchema.optional(),
+  delivery: deliveryResultSchema.optional(),
 });
 
 export const runEventSchema = z.looseObject({

@@ -150,6 +150,24 @@ async function runGit(
   }
 }
 
+async function currentBranch(repository: string): Promise<string> {
+  try {
+    return await runGit(repository, [
+      "symbolic-ref",
+      "--quiet",
+      "--short",
+      "HEAD",
+    ]);
+  } catch {
+    throw new FlowError(
+      "Target repository is in detached HEAD; a named Integration target branch is required",
+      4,
+      "DETACHED_HEAD",
+      { repository },
+    );
+  }
+}
+
 async function resolveCommit(
   repository: string,
   revision: string,
@@ -1683,6 +1701,7 @@ async function resolvePersistedIntent(
   options: PrepareWorktreeOptions,
 ): Promise<{
   runBase: string;
+  integrationTargetBranch?: string;
   featureBranch: string;
   featureWorktree: string;
 }> {
@@ -1725,6 +1744,9 @@ async function resolvePersistedIntent(
     }
     return {
       runBase: gitState.runBase,
+      ...(gitState.integrationTargetBranch === undefined
+        ? {}
+        : { integrationTargetBranch: gitState.integrationTargetBranch }),
       featureBranch: gitState.featureBranch,
       featureWorktree: gitState.featureWorktree,
     };
@@ -1737,6 +1759,9 @@ async function resolvePersistedIntent(
       4,
       "INVALID_PREPARATION_STATE",
     );
+  const integrationTargetBranch =
+    current.snapshot.integrationTargetBranch ??
+    (await currentBranch(repository));
   const runBase = await resolveCommit(
     repository,
     options.base ?? "HEAD",
@@ -1765,7 +1790,12 @@ async function resolvePersistedIntent(
       3,
       "FEATURE_BRANCH_ALREADY_EXISTS",
     );
-  return { runBase, featureBranch, featureWorktree };
+  return {
+    runBase,
+    integrationTargetBranch,
+    featureBranch,
+    featureWorktree,
+  };
 }
 
 export async function prepareWorktree(

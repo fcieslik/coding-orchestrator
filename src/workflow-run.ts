@@ -269,6 +269,28 @@ async function resolveRepository(repository?: string): Promise<string> {
   }
 }
 
+async function assertNamedIntegrationTarget(
+  repository: string,
+): Promise<string> {
+  try {
+    const result = await run(
+      "git",
+      ["symbolic-ref", "--quiet", "--short", "HEAD"],
+      {
+        cwd: repository,
+      },
+    );
+    return result.stdout.trim();
+  } catch {
+    throw new FlowError(
+      "Target repository is in detached HEAD; a named Integration target branch is required before creating a Workflow run",
+      4,
+      "DETACHED_HEAD",
+      { repository },
+    );
+  }
+}
+
 async function resolveSpecification(
   repository: string,
   specification: string,
@@ -740,6 +762,7 @@ async function createRunFiles(
   runId: string,
   specificationReference: string,
   timestamp: string,
+  integrationTargetBranch: string,
 ): Promise<void> {
   const snapshot = stateSnapshotSchema.parse({
     schemaVersion: 1,
@@ -747,6 +770,7 @@ async function createRunFiles(
     revision: 1,
     phase: "created",
     specification: specificationReference,
+    integrationTargetBranch,
     createdAt: timestamp,
     updatedAt: timestamp,
   });
@@ -786,6 +810,8 @@ export async function createRun(
     );
   }
   const repository = await resolveRepository(options.repository);
+  const integrationTargetBranch =
+    await assertNamedIntegrationTarget(repository);
   const specificationReference = await resolveSpecification(
     repository,
     options.specification,
@@ -810,6 +836,7 @@ export async function createRun(
         runId,
         specificationReference,
         timestamp,
+        integrationTargetBranch,
       );
       await rename(stagingDirectory, runDirectory);
       await syncDirectory(runsDirectory);
