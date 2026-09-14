@@ -21,7 +21,7 @@ A durable execution of one accepted specification, identified independently from
 _Avoid_: Agent run, session, task
 
 **Run phase**:
-The current lifecycle position of a Workflow run: `created`, `preparing`, `implementing`, `reviewing`, `checking`, `fixing`, `blocked`, `failed`, `cancelled`, or `completed`.
+The current lifecycle position of a Workflow run: `created`, `preparing`, `implementing`, `reviewing`, `checking`, `fixing`, `blocked`, `failed`, `cancelled`, or `completed`. In V1, `completed` means implementation complete; validation and delivery remain separate durable results.
 _Avoid_: Herdr state, agent status
 
 **State snapshot**:
@@ -59,6 +59,14 @@ _Avoid_: Integration target branch, task branch, primary branch
 **Integration target branch**:
 The user-owned local Git branch from which a Workflow run starts and which may receive the validated Feature branch through an explicit safe integration step.
 _Avoid_: Feature branch, primary checkout, Run base
+
+**Delivery channel**:
+The single user-selected way a validated Workflow run is handed off: a local fast-forward or a GitHub Pull Request. It is recorded durably and never implies automatic merge or cleanup.
+_Avoid_: Workflow step, validation, deployment
+
+**Delivery result**:
+The durable evidence and current handoff status for a validated Workflow run. It records `prepared`, `completed`, or `blocked`, the delivered commit, and channel-specific identifiers.
+_Avoid_: Validation result, Git checkpoint, Worker result
 
 **Feature worktree**:
 The isolated Git worktree containing a Workflow run's Feature branch, where delegated implementation occurs.

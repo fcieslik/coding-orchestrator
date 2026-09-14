@@ -154,14 +154,7 @@ workflow:
     join(toolDirectory, "gh-axi"),
     `#!/bin/sh
 echo "gh-axi $*" >> "$FAKE_GH_LOG"
-case "$1 $2" in
-  "--version ") echo 'gh-axi test' ;;
-  "auth status") exit 0 ;;
-  "pr list") if [ "$FAKE_AXI_UNSUPPORTED" = "yes" ]; then echo 'unsupported command' >&2; exit 1; fi; if [ "$FAKE_FAIL_LIST" = "yes" ]; then exit 1; fi; printf '%s\n' "$FAKE_PR_LIST" ;;
-  "pr create") echo '{"number":42,"url":"https://example.test/pr/42","state":"OPEN","mergedAt":null}' ;;
-  "pr checks") printf '%s\n' "$FAKE_CHECKS" ;;
-  *) echo "unsupported command: $*" >&2; exit 1 ;;
-esac
+exit 99
 `,
     { mode: 0o755 },
   );
@@ -173,8 +166,8 @@ echo "gh $*" >> "$FAKE_GH_LOG"
 case "$1 $2" in
   "--version ") echo 'gh test' ;;
   "auth status") exit 0 ;;
-  "pr list") printf '%s\n' "$FAKE_PR_LIST" ;;
-  "pr create") echo '{"number":42,"url":"https://example.test/pr/42","state":"OPEN","mergedAt":null}' ;;
+  "pr list") if [ "$FAKE_FAIL_LIST" = "yes" ]; then exit 1; fi; printf '%s\n' "$FAKE_PR_LIST" ;;
+  "pr create") echo 'https://example.test/pull/42' ;;
   "pr checks") printf '%s\n' "$FAKE_CHECKS" ;;
   *) exit 1 ;;
 esac
@@ -206,7 +199,6 @@ async function executePr(
         PATH: `${context.toolDirectory}:${process.env.PATH}`,
         FAKE_GH_LOG: context.commandLog,
         FAKE_FAIL_LIST: "",
-        FAKE_AXI_UNSUPPORTED: "",
         FAKE_PR_LIST: "[]",
         FAKE_CHECKS: '[{"name":"test","state":"SUCCESS","bucket":"pass"}]',
         ...environment,
@@ -227,7 +219,7 @@ test("flow pr pushes once, creates a Pull Request, and persists its checks obser
     remoteFeatureBranch: context.featureBranch,
     pullRequest: {
       number: 42,
-      url: "https://example.test/pr/42",
+      url: "https://example.test/pull/42",
       state: "open",
     },
     checks: "passed",
@@ -239,6 +231,15 @@ test("flow pr pushes once, creates a Pull Request, and persists its checks obser
     ]),
   ).toBe(context.featureHead);
   expect(await readFile(context.commandLog, "utf8")).toContain("pr create");
+  const commands = await readFile(context.commandLog, "utf8");
+  expect(commands).toContain("gh auth status");
+  expect(commands).not.toContain("gh-axi");
+  const createCommand = commands.slice(
+    commands.indexOf("gh pr create"),
+    commands.indexOf("gh pr checks"),
+  );
+  expect(createCommand).not.toContain("--json");
+  expect(commands).toContain("gh pr checks 42 --json name,state,bucket");
   expect(
     (await inspectRun(context.repository, context.runId)).snapshot.delivery,
   ).toMatchObject(report.delivery);
@@ -295,7 +296,7 @@ test("an existing open Pull Request is reused and failed checks remain a complet
   const context = await completedRunWithOrigin();
   const { stdout } = await executePr(context, {
     FAKE_PR_LIST:
-      '[{"number":9,"url":"https://example.test/pr/9","state":"OPEN","mergedAt":null}]',
+      '[{"number":9,"url":"https://example.test/pull/9","state":"OPEN","mergedAt":null}]',
     FAKE_CHECKS: '[{"name":"test","state":"FAILURE","bucket":"fail"}]',
   });
   expect(JSON.parse(stdout)).toMatchObject({
@@ -323,13 +324,13 @@ test("an interruption after push leaves prepared intent and a repeat creates onl
   ).toHaveLength(1);
 });
 
-test("an unsupported gh-axi operation falls back to authenticated official gh", async () => {
+test("GitHub delivery uses only the authenticated official gh CLI", async () => {
   const context = await completedRunWithOrigin();
-  const { stdout } = await executePr(context, { FAKE_AXI_UNSUPPORTED: "yes" });
+  const { stdout } = await executePr(context);
   expect(JSON.parse(stdout)).toMatchObject({ status: "completed" });
   const commands = await readFile(context.commandLog, "utf8");
-  expect(commands).toContain("gh-axi pr list");
   expect(commands).toContain("gh auth status");
   expect(commands).toContain("gh pr list");
-  expect(commands).toContain("gh-axi pr create");
+  expect(commands).toContain("gh pr create");
+  expect(commands).not.toContain("gh-axi");
 });

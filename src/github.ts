@@ -87,14 +87,15 @@ function refusal(
 
 function errorText(error: unknown): string {
   if (!error || typeof error !== "object") return String(error);
-  const value = error as { stderr?: unknown; message?: unknown };
-  return `${typeof value.stderr === "string" ? value.stderr : ""}\n${typeof value.message === "string" ? value.message : ""}`.trim();
-}
-
-function isUnsupported(error: unknown): boolean {
-  return /unsupported|unknown (command|flag)|not a gh command/i.test(
-    errorText(error),
-  );
+  const value = error as {
+    stdout?: unknown;
+    stderr?: unknown;
+    message?: unknown;
+  };
+  return [value.stdout, value.stderr, value.message]
+    .filter((part): part is string => typeof part === "string" && part !== "")
+    .join("\n")
+    .trim();
 }
 
 async function gitOutput(
@@ -142,12 +143,7 @@ async function commandAvailable(
   }
 }
 
-interface GitHubTool {
-  primary: "gh-axi" | "gh";
-  fallback?: "gh";
-}
-
-async function githubPreflight(repository: string): Promise<GitHubTool> {
+async function githubPreflight(repository: string): Promise<void> {
   try {
     await gitOutput(
       repository,
@@ -162,52 +158,20 @@ async function githubPreflight(repository: string): Promise<GitHubTool> {
       );
     throw error;
   }
-  const hasAxi = await commandAvailable("gh-axi", repository);
   const hasGh = await commandAvailable("gh", repository);
-  if (!hasAxi && !hasGh)
+  if (!hasGh)
     throw refusal(
-      "GitHub delivery requires user-installed gh-axi or gh; install one and authenticate it before retrying",
+      "GitHub delivery requires the official gh CLI; install and authenticate it before retrying",
       "GITHUB_TOOL_MISSING",
     );
-  const primary = hasAxi ? "gh-axi" : "gh";
   try {
-    await toolOutput(primary, repository, ["auth", "status"]);
+    await toolOutput("gh", repository, ["auth", "status"]);
   } catch (error) {
-    if (primary === "gh-axi" && hasGh && isUnsupported(error)) {
-      try {
-        await toolOutput("gh", repository, ["auth", "status"]);
-        return { primary, fallback: "gh" };
-      } catch (fallbackError) {
-        throw refusal(
-          "GitHub delivery requires an authenticated GitHub CLI session; run its auth status/login flow yourself and retry",
-          "GITHUB_AUTHENTICATION_FAILED",
-          { tool: "gh", error: errorText(fallbackError) },
-        );
-      }
-    }
     throw refusal(
       "GitHub delivery requires an authenticated GitHub CLI session; run its auth status/login flow yourself and retry",
       "GITHUB_AUTHENTICATION_FAILED",
-      { tool: primary, error: errorText(error) },
+      { tool: "gh", error: errorText(error) },
     );
-  }
-  return {
-    primary,
-    ...(primary === "gh-axi" && hasGh ? { fallback: "gh" } : {}),
-  };
-}
-
-async function githubOutput(
-  tool: GitHubTool,
-  repository: string,
-  args: string[],
-): Promise<string> {
-  try {
-    return await toolOutput(tool.primary, repository, args);
-  } catch (error) {
-    if (!tool.fallback || !isUnsupported(error)) throw error;
-    await toolOutput(tool.fallback, repository, ["auth", "status"]);
-    return toolOutput(tool.fallback, repository, args);
   }
 }
 
@@ -585,13 +549,12 @@ function pullRequestBody(
 }
 
 async function lookupPullRequests(
-  tool: GitHubTool,
   repository: string,
   featureBranch: string,
   base: string,
 ): Promise<PullRequestIdentity[]> {
   return parsePullRequests(
-    await githubOutput(tool, repository, [
+    await toolOutput("gh", repository, [
       "pr",
       "list",
       "--head",
@@ -607,54 +570,65 @@ async function lookupPullRequests(
 }
 
 async function createPullRequest(
-  tool: GitHubTool,
   repository: string,
   featureBranch: string,
   base: string,
   title: string,
   body: string,
 ): Promise<PullRequestIdentity> {
+  let output: string;
   try {
-    return parsePullRequest(
-      JSON.parse(
-        await githubOutput(tool, repository, [
-          "pr",
-          "create",
-          "--head",
-          featureBranch,
-          "--base",
-          base,
-          "--title",
-          title,
-          "--body",
-          body,
-          "--json",
-          "number,url,state,mergedAt",
-        ]),
-      ),
-    );
+    output = await toolOutput("gh", repository, [
+      "pr",
+      "create",
+      "--head",
+      featureBranch,
+      "--base",
+      base,
+      "--title",
+      title,
+      "--body",
+      body,
+    ]);
   } catch (error) {
     if (error instanceof FlowError) throw error;
+    throw refusal(
+      "Pull Request creation failed",
+      "PULL_REQUEST_CREATE_FAILED",
+      { tool: "gh", error: errorText(error) },
+    );
+  }
+  const urls = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^https?:\/\/\S+\/pull\/\d+\/?$/.test(line));
+  if (urls.length !== 1)
     throw refusal(
       "Pull Request creation returned ambiguous identity evidence",
       "PULL_REQUEST_AMBIGUOUS",
     );
-  }
+  const url = urls[0]!;
+  const number = Number(url.match(/\/pull\/(\d+)\/?$/)?.[1]);
+  if (!Number.isInteger(number) || number <= 0)
+    throw refusal(
+      "Pull Request creation returned ambiguous identity evidence",
+      "PULL_REQUEST_AMBIGUOUS",
+    );
+  return { number, url, state: "open" };
 }
 
 async function observeChecks(
-  tool: GitHubTool,
   repository: string,
   number: number,
 ): Promise<NonNullable<DeliveryResult["checks"]>> {
   try {
     return normalizeChecks(
-      await githubOutput(tool, repository, [
+      await toolOutput("gh", repository, [
         "pr",
         "checks",
         String(number),
         "--json",
-        "name,state,bucket,conclusion",
+        "name,state,bucket",
       ]),
     );
   } catch {
@@ -707,7 +681,7 @@ export async function preparePullRequest(
         "INTEGRATION_TARGET_BRANCH_MISSING",
       );
     const feature = await assertFeatureFacts(repository, state, validatedHead);
-    const tool = await githubPreflight(repository);
+    await githubPreflight(repository);
     const remoteHead = await remoteFeatureHead(
       repository,
       feature.featureBranch,
@@ -756,7 +730,6 @@ export async function preparePullRequest(
     let matches: PullRequestIdentity[];
     try {
       matches = await lookupPullRequests(
-        tool,
         repository,
         feature.featureBranch,
         base,
@@ -799,7 +772,6 @@ export async function preparePullRequest(
     const pullRequest =
       matches[0] ??
       (await createPullRequest(
-        tool,
         repository,
         feature.featureBranch,
         base,
@@ -820,7 +792,7 @@ export async function preparePullRequest(
       );
       return reportFrom(state);
     }
-    const checks = await observeChecks(tool, repository, pullRequest.number);
+    const checks = await observeChecks(repository, pullRequest.number);
     state = await publishDelivery(
       repository,
       state,

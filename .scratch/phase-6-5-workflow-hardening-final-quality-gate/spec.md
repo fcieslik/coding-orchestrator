@@ -1,6 +1,6 @@
 # Phase 6.5 — Workflow Hardening and Final Quality Gate
 
-Status: ready-for-agent
+Status: completed
 
 ## Problem Statement
 

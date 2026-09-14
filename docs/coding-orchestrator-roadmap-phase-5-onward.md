@@ -188,11 +188,15 @@ Inspiracją z `no-mistakes` jest wyłącznie pojedynczy, jawny quality gate prze
 
 - lokalne branche, commity, checkpointy i worktrees nadal obsługuje standardowy `git` oraz istniejący adapter `git worktree`;
 - zewnętrzne CLI do worktrees może zostać ocenione jako mały spike, ale nie staje się zależnością V1 bez wykazania, że usuwa realną złożoność i zachowuje wszystkie istniejące invarianty;
-- `gh-axi` nie służy do lokalnych operacji Git, branchy ani worktrees.
+- GitHub CLI nie służy do lokalnego zarządzania branchami ani worktrees.
 
 ## Exit gate
 
 Phase 6.5 jest zakończona, gdy każdy Worker otrzymuje kanoniczne safeguards, test renderera potwierdza ich obecność dla wspieranego agenta, pełny pipeline uruchamia się dopiero po ostatnim accepted tickecie, a końcowy wynik obejmuje wszystkie skonfigurowane kontrole bez zmiany Feature HEAD lub worktree.
+
+## Status
+
+**Zakończona 2026-09-09.** Automatyczne gate'y oraz ręczny test zainstalowanego skilla przeszły. Run `run_20260909T093920Z_64ec7b024428` uruchomił świeżego Codex Workera z kanonicznymi safeguards, zaakceptował commit `c01f98b98588925ac402058554e587566582b765`, a następnie zapisał pięć wyników `passed` bez zmiany Feature HEAD, Feature worktree ani primary checkout. Szczegółowe dowody znajdują się w [końcowym tickecie Phase 6.5](../.scratch/phase-6-5-workflow-hardening-final-quality-gate/issues/02-extend-and-pass-final-five-check-quality-gate.md).
 
 ---
 
@@ -202,17 +206,17 @@ Phase 6.5 jest zakończona, gdy każdy Worker otrzymuje kanoniczne safeguards, t
 
 Udowodnić, że cały V1 jest bezpiecznie wznawialny, nie raportuje fałszywego sukcesu i przekazuje zwalidowany wynik przez jeden jawnie wybrany kanał: lokalny fast-forward albo GitHub Pull Request.
 
-Recovery powstaje razem z operacjami w Phase 4–6. Phase 7 nie dodaje nowego workflow engine; testuje i domyka istniejące recovery paths.
+Recovery powstaje razem z operacjami w Phase 4–6. Phase 7 nie dodaje nowego workflow engine; testuje i domyka istniejące recovery paths. Dostawa jest addytywnym wynikiem zakończonego runu, a nie nowym silnikiem lifecycle.
 
 ## Scenariusze
 
-Zatrzymać Orchestrator podczas:
+Minimalny zakres POC obejmuje:
 
-- aktywnego Workera;
-- reconciliation po zakończeniu Workera;
-- przejścia pomiędzy ticketami;
-- deterministic project validation;
-- finalizacji całego runu.
+- restart Orchestratora pomiędzy ticketami i potwierdzenie, że accepted ticket nie jest wykonywany ponownie;
+- przerwanie przed finalizacją oraz bezpieczne, idempotentne ponowienie tej samej operacji;
+- odmowę integracji bez mutacji, gdy Integration target branch nie wskazuje już Run base.
+
+Pełna macierz przerwań podczas Workera, reconciliation i każdej komendy walidacyjnej pozostaje poza Phase 7; niższe warstwy zachowują własne focused recovery tests.
 
 Po restarcie świeży Orchestrator używa wyłącznie trwałych źródeł:
 
@@ -243,13 +247,16 @@ fast-forward Integration target branch
 
 Minimalny kontrakt V1:
 
-- przy tworzeniu nowego runu zapisać nazwę aktualnego lokalnego Integration target branch obok immutable Run base;
+- przy tworzeniu nowego runu wymagać checkoutowanego lokalnego brancha i zapisać jego nazwę jako Integration target branch obok immutable Run base; detached HEAD jest odrzucany przed utworzeniem runu;
 - `flow integrate <workflow-package>` rozwiązuje jedyny zakończony i zwalidowany run bez wymagania Run ID;
+- jeśli dla dokładnie aktualnego Feature HEAD istnieje już wynik walidacji `passed`, użyć go bez ponownego uruchamiania checks; brak aktualnego wyniku uruchamia walidację przed dostawą, a jej błąd zatrzymuje operację;
 - przed integracją potwierdzić, że primary checkout jest czysty, nadal ma checkoutowany zapisany Integration target branch, a jego HEAD nadal wskazuje Run base;
 - potwierdzić, że Feature branch wskazuje ostatni zwalidowany HEAD i jest bezpiecznym potomkiem Run base;
 - wykonać wyłącznie `git merge --ff-only` i zapisać zintegrowany commit jako trwały rezultat;
 - jeśli target branch ruszył do przodu, branche się rozeszły albo checkout jest brudny, zakończyć bez mutacji i przekazać użytkownikowi ręczny merge/rebase;
 - nie uruchamiać agenta, nie tworzyć automatycznego merge commita, nie rozwiązywać konfliktów i nie usuwać automatycznie Feature worktree ani brancha.
+
+Przerwaną integrację rozstrzyga porównanie target HEAD: `Run base` oznacza operację jeszcze niewykonaną, zwalidowany Feature HEAD oznacza integrację już wykonaną, a każda inna wartość kończy się jako `blocked`. Ponowienie zakończonej integracji zwraca ten sam Delivery result.
 
 To jest jawny krok publikacji zaakceptowanego wyniku, a nie część wykonania ticketu. Istniejące runy bez zapisanego Integration target branch nie są automatycznie integrowane.
 
@@ -257,23 +264,57 @@ To jest jawny krok publikacji zaakceptowanego wyniku, a nie część wykonania t
 
 GitHub handoff jest opcjonalną alternatywą dla lokalnego `flow integrate`, a nie drugim merge pathem wykonywanym w tym samym runie. Do momentu tego jawnego kroku cały standardowy workflow pozostaje lokalny i używa zwykłego `git`.
 
+- przed wyborem kanału wykonać read-only preflight; Delivery channel staje się trwały dopiero bezpośrednio przed pierwszą mutacją;
+- jeden run zapisuje dokładnie jeden jawnie wybrany Delivery channel: lokalny fast-forward albo GitHub Pull Request; ponowienie tej samej operacji jest idempotentne, a późniejsza zmiana kanału jest odrzucana;
+- użytkownik wybiera kanał naturalnym poleceniem do `$orchestrate`; bez jawnego wyboru skill pyta zamiast zgadywać, a komendy `flow` pozostają wewnętrznym mechanizmem skilla;
 - branch i commit przygotowuje istniejący lokalny workflow;
-- publikacja Feature branch używa zwykłego `git push` i wymaga jawnej zgody użytkownika;
-- dla obsługiwanych operacji GitHub Orchestrator preferuje zainstalowane przez użytkownika `gh-axi`, w szczególności do sprawdzenia repozytorium, utworzenia PR oraz odczytania jego checks;
-- `gh-axi` pozostaje agent-facing wrapperem oficjalnego `gh`: nie zarządza lokalnymi branchami lub worktrees i nie stanowi źródła uprawnień;
+- jawne polecenie „przygotuj PR” autoryzuje publikację Feature branch przez zwykły `git push`, utworzenie PR oraz odczyt checks; nie autoryzuje merge ani cleanupu;
+- push używa `origin`, istniejącej nazwy Feature branch i nigdy nie używa force; PR używa zapisanego Integration target branch jako base;
+- zdalny base może ruszyć po Run base; Orchestrator nie wykonuje rebase i jawnie raportuje, że lokalna walidacja dotyczy zwalidowanego Feature HEAD, a bieżącą integrację oceniają GitHub checks;
+- brak remote Feature branch pozwala na zwykły push, ten sam zdalny commit jest wynikiem idempotentnym, a inny commit pod tą samą nazwą blokuje operację bez force-push;
+- przed utworzeniem PR sprawdzić, czy PR dla tego head/base już istnieje, aby bezpieczne ponowienie nie tworzyło duplikatu;
+- tytuł PR pochodzi z tytułu `spec.md`, a deterministyczny krótki body zawiera Run ID, odniesienie do specyfikacji, accepted tickets, validated HEAD i wynik pięciu checks; nie kopiujemy całej specyfikacji ani transcriptów;
+- Orchestrator używa oficjalnego `gh` do sprawdzenia uwierzytelnienia, wyszukania lub utworzenia PR oraz jednorazowego odczytania checks;
+- `gh` nie zarządza lokalnymi branchami lub worktrees i nie stanowi źródła uprawnień;
 - jeżeli wymagana operacja lub flaga nie jest obsługiwana, Orchestrator może użyć oficjalnego `gh`, zachowując ten sam kontrakt uprawnień;
-- Orchestrator nie instaluje ani nie aktualizuje automatycznie `gh-axi` lub `gh`;
+- Orchestrator nie instaluje ani nie aktualizuje automatycznie `gh`;
+- brak narzędzia, uwierzytelnienia albo GitHub remote kończy preflight bez mutacji i podaje najmniejszą wymaganą czynność użytkownika; po pierwszej zewnętrznej mutacji niejednoznaczny wynik zapisuje zablokowany handoff do jawnego wznowienia;
 - Worker nie wykonuje żadnej z tych operacji; GitHub handoff należy wyłącznie do głównego Orchestratora;
-- V1 może utworzyć PR i raportować jego checks, ale nie merguje PR automatycznie.
+- V1 tworzy albo odnajduje PR, jednokrotnie odczytuje i zapisuje checks jako `passed`, `failed`, `pending` albo `unavailable`, ale nie czeka w pętli, nie naprawia i nie merguje PR automatycznie;
+- utworzony PR kończy handoff, natomiast stan checks pozostaje osobnym jawnie raportowanym wynikiem.
+
+Delivery result jest addytywnym rekordem `state.json` i zawiera kanał, status `prepared`, `completed` albo `blocked`, zwalidowany HEAD oraz target branch. Brak rekordu oznacza, że kanał nie został jeszcze wybrany. `prepared` jest zapisywany pod blokadą bezpośrednio przed pierwszą mutacją, dzięki czemu restart nie gubi zamiaru dostawy. Dla lokalnej integracji rekord zawiera integrated commit; dla GitHub zawiera remote branch, numer i URL PR oraz ostatni zaobserwowany stan checks. Phase 7 nie dodaje nowych głównych Run phases.
+
+Aktualny Delivery result należy do `state.json`, a istniejący `history.jsonl` zapisuje przejścia `prepared`, `completed` i `blocked`. Nie powstaje osobny `delivery.json` ani nowy log. Operacje walidacji i dostawy używają istniejącej blokady Workflow runu; konkurencyjny proces otrzymuje `WORKFLOW_STEP_IN_PROGRESS` i nie przejmuje operacji.
+
+Po udanej dostawie Orchestrator nie usuwa automatycznie Feature worktree ani Feature branch. Cleanup pozostaje jawną, późniejszą operacją użytkownika.
+
+Wewnętrzne operacje pozostają wyspecjalizowane i małe:
+
+```text
+flow integrate <workflow-package>
+flow pr <workflow-package>
+```
+
+Globalny `$orchestrate` wybiera jedną z nich z naturalnego polecenia użytkownika. Nie powstaje generyczny framework `deliver --channel`.
+
+`flow pr` jest właścicielem deterministycznego preflightu, `git push`, wywołań oficjalnego `gh`, wyszukania lub utworzenia PR, odczytu checks oraz zapisu stanu. Główny LLM rozpoznaje intencję, ale nie odtwarza tej procedury z pamięci rozmowy. Matching otwarty PR jest używany ponownie, zmergowany jest zapisywany jako zakończony z jawną informacją o zewnętrznym merge, a zamknięty bez merge lub więcej niż jeden matching PR kończy się jako `blocked`.
+
+## Validation failure limitation
+
+Delivery nie rozpoczyna się po nieudanej końcowej walidacji. Walidację można jawnie ponowić po naprawie środowiska bez zmiany Feature HEAD. Jeżeli naprawa wymaga zmiany kodu, V1 zachowuje Feature worktree i kończy automatyczny handoff; ręczna naprawa albo nowy Workflow package/run pozostają odpowiedzialnością użytkownika. Phase 7 nie dodaje Fixera, adopcji ręcznego commita ani ponownego otwierania zakończonej Ticket queue.
 
 ## Invariants
 
+- Run phase `completed` oznacza w V1 `implementation complete`; pełny wynik V1 wymaga dodatkowo aktualnej walidacji `passed` i Delivery result `completed`;
 - zaakceptowany ticket nie jest wykonywany ponownie;
 - aktywny agent nie jest duplikowany bez reconciliation;
 - owned panes i procesy są zamykane bez naruszania cudzych zasobów;
 - częściowy albo sprzeczny artifact nie daje statusu `passed`;
 - stan niejednoznaczny kończy się jako `blocked`, nigdy jako domniemany sukces;
 - resume prowadzi do tego samego końcowego wyniku co wykonanie bez restartu.
+
+Naturalne polecenie „zwaliduj i zintegruj lokalnie” albo „zwaliduj i przygotuj PR” uruchamia kolejno dwie trwałe operacje: walidację, jeśli nie istnieje aktualny wynik dla tego HEAD, a następnie wybrany handoff. Restart pomiędzy nimi wykorzystuje zapisany wynik walidacji i nie uruchamia checks ponownie.
 
 ## Final live gate
 
@@ -294,12 +335,28 @@ durable final result and artifacts
       ↓
 explicit delivery choice
       ├── safe fast-forward to local Integration target branch
-      └── git push + gh-axi PR/check handoff
+      └── git push + gh PR/check handoff
 ```
 
-Test musi obejmować co najmniej jeden kontrolowany restart, potwierdzić brak zduplikowanej pracy oraz udowodnić, że lokalna integracja aktualizuje niezmieniony Integration target branch, ale odmawia mutacji po jego rozjechaniu. Osobny manualny wariant GitHub potwierdza jawny push, utworzenie PR przez `gh-axi` i odczyt checks bez automatycznego merge.
+Minimalny live gate używa disposable repo i dwóch małych ticketów. Po pierwszym tickecie główny Orchestrator jest restartowany; drugi ticket musi użyć tego samego runu bez ponowienia pierwszego. Naturalne polecenie uruchamia walidację i lokalną integrację, po czym test potwierdza fast-forward, czysty checkout oraz idempotentne ponowienie. Osobny negatywny run potwierdza odmowę po przesunięciu target branch.
+
+Automatyczne testy obejmują lokalny happy path z idempotentnym powtórzeniem, parametryzowane odmowy dla niespełnionych warunków Git oraz GitHub adapter z fake `git`/`gh`. Osobny opcjonalny manualny wariant GitHub potwierdza jawny push, utworzenie PR przez oficjalne `gh` i odczyt checks bez automatycznego merge; nie jest wymagany do zamknięcia lokalnego V1.
 
 Po przejściu tego gate'u V1 jest gotowe do użycia na przygotowanych specach i ticketach.
+
+## Status
+
+**Zakończona 2026-09-10.** Pełne gate'y Development repository przeszły: 160 testów oraz build, lint, typecheck, format check, schema check, installer i porównanie Installed-skill snapshot. Lokalny run `run_20260910T200221Z_31ca2a6648d9` potwierdził restart pomiędzy dwoma ticketami, walidację dokładnego Feature HEAD, fast-forward bez merge commita oraz idempotentne ponowienie. Run `run_20260910T202830Z_ee0bb90d618f` bezpiecznie odmówił integracji po przesunięciu `master`, bez mutacji i cleanupu. Opcjonalny GitHub gate utworzył przez oficjalne `gh` [PR #1](https://github.com/fcieslik/coding-orchestrator-phase7-live/pull/1) i ponowił handoff bez duplikacji. Szczegółowe dowody znajdują się w [końcowym tickecie Phase 7](../.scratch/phase-7-end-to-end-reliability/issues/03-pass-the-phase-7-end-to-end-reliability-gate.md).
+
+---
+
+# Phase 8 — unresolved review findings and fresh Fixer
+
+Phase 8 extends the Worker result without changing the downstream review methodology. A completed Worker may return a clean review or bounded `review.status = attention` findings. The latter preserves a validated Candidate commit, records `reviewAttention` and `worker.review.attention` durably, closes the originating pane, and blocks the run while leaving the Ticket active. Legacy completed results without review data remain on the existing acceptance path. Fresh Fixer resolution is the following Phase 8 ticket.
+
+## Status
+
+**Zakończona 2026-09-14.** The result/state schemas, Worker contract, candidate validation, durable Review attention, restart-safe reporting, queue refusal, explicit user resolution, and one fresh bounded Fixer are in place. All 165 tests and the remaining Development gates passed. Live run `run_20260914T123825Z_85a138a1a717` preserved Candidate commit `397da994e0702701ed4ac7db52c08827924b0e42` across a main-Orchestrator restart, refused the next ticket, and accepted separate Fixer commit `1017a95366448d44ad88397248ee93ead3f86cfc`. Repeating the same resolution was an idempotent no-op. The primary checkout remained unchanged and every owned pane closed. The first Worker attempt stopped at Codex's hook-trust screen without Git effects; a subsequent safe retry produced the sole Candidate commit. Detailed evidence is recorded in the [Phase 8 gate ticket](../.scratch/phase-8-review-findings-and-fresh-fixer/issues/03-pass-the-phase-8-review-resolution-gate.md).
 
 ---
 
@@ -307,7 +364,7 @@ Po przejściu tego gate'u V1 jest gotowe do użycia na przygotowanych specach i 
 
 Następujące elementy są świadomie odłożone:
 
-- automatyczny Fixer oraz bounded fix/review loop z jawnym limitem prób i warunkiem stopu;
+- automatyczna wielokrokowa pętla fix/review; Phase 8 obsługuje wyłącznie jeden jawnie uruchomiony Fixer dla decyzji użytkownika;
 - automatyczne wykonanie całej Ticket queue;
 - acykliczny dependency DAG, `blocked by` i ready-ticket calculation;
 - równoległe wykonywanie ticketów;
@@ -320,6 +377,35 @@ Następujące elementy są świadomie odłożone:
 - visual regression baselines;
 - dowolne pluginy lub ogólny workflow DSL;
 - automatyczne odpowiadanie na blockery.
+- lepsza diagnostyka technicznych awarii Worker attempt, opisana poniżej.
+
+## Następne usprawnienie — diagnostyka awarii Workera
+
+Rozszerzyć istniejący model bez tworzenia osobnego systemu logów:
+
+- zapisać `execution.json` przed pierwszą operacją Herdr; jeśli sam zapis się nie
+  powiedzie, nie uruchamiać pane ani Workera;
+- rozszerzyć istniejące `diagnostics` o operację, komunikat, nullable exit code i
+  signal oraz końcowe 16 KiB każdego z `stdout` i `stderr`; wspólne `truncated`
+  informuje o skróceniu;
+- zachować główną awarię w `diagnostics`, a ewentualną wtórną awarię zamknięcia
+  pane w istniejącym `cleanup.error`;
+- Worker attempt otrzymuje `failed`, Workflow run otrzymuje `blocked`, a ticket
+  pozostaje niezaakceptowany;
+- istniejące `lastExecution` i zdarzenie `workflow.ticket.blocked` otrzymują
+  krótki `failureReason`; `lastExecution.path` nadal wskazuje pełny rekord;
+- komunikat CLI podaje ticket, operację, exit code, najwyżej 300 znaków z
+  pierwszej niepustej linii `stderr` oraz ścieżkę `execution.json`;
+- nie zapisywać pełnego promptu, environment variables, niesanitowanego argv ani
+  pełnego transcriptu. Nie dodawać redaktora sekretów do POC;
+- nie zmieniać reconciliation ani zasad retry: ponowienie pozostaje jawne;
+- zachować `schemaVersion: 1`, ponieważ nowe pola są opcjonalne.
+
+Minimalny gate obejmuje trzy regresje: błąd `herdr agent start` utrwalony w
+`execution.json`, krótki powód i odnośnik utrwalone w stanie/historii oraz zwięzły
+komunikat CLI bez pełnego logu. Review findings i Review attention pozostają
+osobnym wynikiem świadomie zakończonego Workera, a nie diagnostyką technicznej
+awarii.
 
 Jeżeli powstanie graf lub pętla naprawcza, każda naprawa i ponowne review muszą być osobnymi, numerowanymi jednostkami pracy z własnymi wejściami i artefaktami. Graf nie może zawierać self-edge ani krawędzi powrotnej do przodka; iterację reprezentuje się jako `review-1 → repair-1 → review-2`, a nie ukryty powrót do wcześniejszego węzła.
 

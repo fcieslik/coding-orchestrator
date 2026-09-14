@@ -5,6 +5,7 @@ A durable local workflow orchestrator built around Herdr, fresh coding agents, G
 ## Project documentation
 
 - Roadmap: `docs/coding-orchestrator-roadmap.md`
+- Target user flow: `docs/coding-orchestrator-flow.md`
 - Architecture and implementation handoff: `docs/coding-workflow-orchestrator-handoff-updated.md`
 - Domain context: `CONTEXT.md`
 - Architecture decisions: `docs/adr/`
