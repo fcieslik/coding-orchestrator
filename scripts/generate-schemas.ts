@@ -13,6 +13,7 @@ const documents = new Map([
   ["orchestration-config.schema.json", schemas.orchestrationConfig],
   ["execution-record.schema.json", schemas.executionRecord],
   ["worker-result.schema.json", schemas.workerResult],
+  ["fixer-result.schema.json", schemas.fixerResult],
   ["validation-result.schema.json", schemas.validationResult],
 ]);
 const checkOnly = process.argv.includes("--check");

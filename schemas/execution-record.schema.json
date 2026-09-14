@@ -40,7 +40,10 @@
     },
     "role": {
       "type": "string",
-      "const": "worker"
+      "enum": [
+        "worker",
+        "fixer"
+      ]
     },
     "agentProfile": {
       "type": "string",
@@ -52,7 +55,7 @@
     },
     "skill": {
       "type": "string",
-      "const": "implement"
+      "minLength": 1
     },
     "ticket": {
       "type": "object",
@@ -101,6 +104,10 @@
           "minLength": 1
         },
         "output": {
+          "type": "string",
+          "minLength": 1
+        },
+        "brief": {
           "type": "string",
           "minLength": 1
         }

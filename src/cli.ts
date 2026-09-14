@@ -135,7 +135,7 @@ try {
     }
   } else if (argument === "orchestrate" && arguments_.includes("--help")) {
     console.log(
-      "Usage: flow orchestrate <workflow-package> <ticket-id> [--repo <path>] [--new-run] [--json]",
+      "Usage: flow orchestrate <workflow-package> <ticket-id> [--repo <path>] [--resolution <decision>] [--new-run] [--json]",
     );
     console.log(
       "Execute one explicit ticket from a local spec.md + issues/*.md Workflow package.",
@@ -144,7 +144,13 @@ try {
     const values = new Map<string, string>();
     const flags = new Set<string>();
     const positional: string[] = [];
-    const valueOptions = new Set(["--repo", "--package", "--ticket"]);
+    const valueOptions = new Set([
+      "--repo",
+      "--package",
+      "--ticket",
+      "--resolution",
+      "--resolve",
+    ]);
     for (let index = 1; index < arguments_.length; index += 1) {
       const token = arguments_[index];
       if (!token) continue;
@@ -168,30 +174,38 @@ try {
     const ticketId = values.get("--ticket") ?? positional[1];
     if (!packageReference || !ticketId || positional.length > 2)
       throw new FlowError(
-        "Usage: flow orchestrate <workflow-package> <ticket-id> [--repo <path>] [--new-run] [--json]",
+        "Usage: flow orchestrate <workflow-package> <ticket-id> [--repo <path>] [--resolution <decision>] [--new-run] [--json]",
         2,
       );
     const repository = values.get("--repo");
+    const resolution = values.get("--resolution") ?? values.get("--resolve");
     const report = await executeWorkflowStep({
       package: packageReference,
       ticket: ticketId,
       ...(flags.has("--new-run") ? { newRun: true } : {}),
       ...(repository === undefined ? {} : { repository }),
+      ...(resolution === undefined ? {} : { resolution }),
     });
     if (flags.has("--json")) console.log(JSON.stringify(report));
     else {
       console.log(`Workflow step: ${report.status}`);
       console.log(`Run: ${report.runId}`);
       console.log(`Ticket: ${report.ticketId}`);
-      if (report.status === "attention") {
+      if (report.status === "attention" || report.status === "blocked") {
         console.log(`Candidate Git commit: ${report.candidateCommit}`);
         console.log(
-          "Review attention: a decision is required before acceptance.",
+          report.status === "blocked"
+            ? `Fixer outcome: ${report.fixer.outcome}`
+            : "Review attention: a decision is required before acceptance.",
         );
         for (const finding of report.review.findings) {
           console.log(`[${finding.axis}] ${finding.summary}`);
           console.log(`Required decision: ${finding.requiredDecision}`);
         }
+        if (report.status === "blocked")
+          console.log(
+            `Next action: ${report.fixer.reason ?? "reconcile the existing Fixer attempt before trying again"}`,
+          );
       } else {
         console.log(`Accepted Git checkpoint: ${report.acceptedCommit}`);
         console.log(

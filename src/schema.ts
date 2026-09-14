@@ -159,6 +159,17 @@ const reviewAttentionSchema = z.looseObject({
   attemptId: z.string().min(1),
   candidateCommit: objectIdSchema,
   findings: z.array(reviewFindingSchema).min(1).max(5),
+  resolution: z.string().min(1).optional(),
+  fixerAttempt: z
+    .looseObject({
+      executionId: z.string().min(1),
+      attemptId: z.string().min(1),
+      path: z.string().min(1),
+      status: z.enum(["prepared", "running", "blocked", "failed", "accepted"]),
+      resolution: z.string().min(1),
+      acceptedCommit: objectIdSchema.optional(),
+    })
+    .optional(),
 });
 
 export const validationStatusSchema = z.enum(["passed", "failed"]);
@@ -301,6 +312,7 @@ const executionArtifactSchema = z.looseObject({
   input: z.string().min(1),
   record: z.string().min(1),
   output: z.string().min(1),
+  brief: z.string().min(1).optional(),
 });
 
 const executionTimestampSchema = z.looseObject({
@@ -331,10 +343,10 @@ export const executionRecordSchema = z.looseObject({
   attemptId: z.string().min(1),
   attempt: z.int().positive(),
   status: executionStatusSchema,
-  role: z.literal("worker"),
+  role: z.enum(["worker", "fixer"]),
   agentProfile: z.string().min(1),
   agentKind: z.literal("codex"),
-  skill: z.literal("implement"),
+  skill: z.string().min(1),
   ticket: z.looseObject({
     source: z.string().min(1),
     input: z.string().min(1),
@@ -422,6 +434,42 @@ export const workerResultSchema = z.discriminatedUnion("status", [
   }),
 ]);
 
+const fixerResultCommonSchema = z.looseObject({
+  schemaVersion: z.literal(1),
+  ticketId: z.string().min(1),
+  summary: z.string().min(1),
+});
+
+export const fixerResultSchema = z.discriminatedUnion("status", [
+  fixerResultCommonSchema.extend({
+    status: z.literal("completed"),
+    commit: objectIdSchema,
+  }),
+  fixerResultCommonSchema.extend({
+    status: z.literal("blocked"),
+    blocker: z
+      .looseObject({
+        type: z.string().min(1),
+        decision: z.string().min(1).optional(),
+        requiredDecision: z.string().min(1).optional(),
+        summary: z.string().min(1).optional(),
+      })
+      .refine(
+        (blocker) =>
+          blocker.decision !== undefined ||
+          blocker.requiredDecision !== undefined,
+        { message: "a smallest required decision is required" },
+      ),
+  }),
+  fixerResultCommonSchema.extend({
+    status: z.literal("failed"),
+    diagnostics: z.looseObject({
+      message: z.string().min(1),
+      command: z.string().optional(),
+    }),
+  }),
+]);
+
 export type StateSnapshot = z.infer<typeof stateSnapshotSchema>;
 
 export type ValidationStatus = z.infer<typeof validationStatusSchema>;
@@ -441,6 +489,8 @@ export type ExecutionRecord = z.infer<typeof executionRecordSchema>;
 export type WorkerResult = z.infer<typeof workerResultSchema>;
 export type WorkerReview = z.infer<typeof workerReviewSchema>;
 export type ReviewFinding = z.infer<typeof reviewFindingSchema>;
+export type FixerResult = z.infer<typeof fixerResultSchema>;
+export type ReviewAttention = z.infer<typeof reviewAttentionSchema>;
 
 function addCalendarAwareRunId(schema: z.core.JSONSchema.BaseSchema): void {
   const document = schema as z.core.JSONSchema.BaseSchema & {
@@ -477,6 +527,9 @@ export function generateJsonSchemas() {
   const workerResult = z.toJSONSchema(workerResultSchema, {
     target: "draft-2020-12",
   });
+  const fixerResult = z.toJSONSchema(fixerResultSchema, {
+    target: "draft-2020-12",
+  });
   const validationResult = z.toJSONSchema(validationResultSchema, {
     target: "draft-2020-12",
   });
@@ -488,6 +541,7 @@ export function generateJsonSchemas() {
     orchestrationConfig,
     executionRecord,
     workerResult,
+    fixerResult,
     validationResult,
   };
 }

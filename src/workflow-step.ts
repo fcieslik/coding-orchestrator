@@ -17,6 +17,7 @@ import {
   retryWorker,
   type WorkerExecutionReport,
 } from "./worker-execution.js";
+import { executeFixer, type FixerExecutionReport } from "./fixer-execution.js";
 import {
   FlowError,
   createRun,
@@ -71,6 +72,8 @@ export interface WorkflowStepOptions {
   adapter?: HerdrAdapter;
   /** Explicitly create a new run instead of reusing a terminal matching run. */
   newRun?: boolean;
+  /** Explicit user decision for a durable Review attention handoff. */
+  resolution?: string;
 }
 
 interface WorkflowStepReportCommon {
@@ -79,6 +82,7 @@ interface WorkflowStepReportCommon {
   nextTicket?: string;
   snapshot: StateSnapshot;
   execution?: WorkerExecutionReport;
+  fixer?: FixerExecutionReport;
   /** Phase 6 deterministic validation is intentionally outside this step. */
   phase6?: "not-run";
 }
@@ -92,6 +96,12 @@ export type WorkflowStepReport =
       status: "attention";
       candidateCommit: string;
       review: Extract<WorkerReview, { status: "attention" }>;
+    })
+  | (WorkflowStepReportCommon & {
+      status: "blocked";
+      candidateCommit: string;
+      review: Extract<WorkerReview, { status: "attention" }>;
+      fixer: FixerExecutionReport;
     });
 
 function invalid(
@@ -518,16 +528,84 @@ export async function executeWorkflowStep(
         "WORKFLOW_BLOCKED",
         { activeTicket: state.reviewAttention.ticketId },
       );
-    return {
-      status: "attention",
+    const review = {
+      status: "attention" as const,
+      findings: state.reviewAttention.findings,
+    };
+    if (options.resolution === undefined) {
+      return {
+        status: "attention",
+        runId: state.runId,
+        ticketId: options.ticket,
+        candidateCommit: state.reviewAttention.candidateCommit,
+        review,
+        snapshot: state,
+      };
+    }
+    const fixer = await executeFixer({
+      repository,
       runId: state.runId,
       ticketId: options.ticket,
-      candidateCommit: state.reviewAttention.candidateCommit,
-      review: {
-        status: "attention",
-        findings: state.reviewAttention.findings,
+      ticketInput: selected.input,
+      specification,
+      resolution: options.resolution,
+      ...(options.dependencies === undefined
+        ? {}
+        : { dependencies: options.dependencies }),
+      ...(options.adapter === undefined ? {} : { adapter: options.adapter }),
+    });
+    if (fixer.status !== "accepted")
+      return {
+        status: "blocked",
+        runId: state.runId,
+        ticketId: options.ticket,
+        candidateCommit: state.reviewAttention.candidateCommit,
+        review,
+        fixer,
+        snapshot: fixer.snapshot,
+      };
+    const fixerState = workflowState(fixer.snapshot);
+    const remaining = Object.entries(fixerState.tickets ?? {}).filter(
+      ([id, ticket]) => id !== options.ticket && ticket.status === "pending",
+    );
+    const completed = remaining.length === 0;
+    const finalized = await mutateRun(
+      {
+        repository,
+        runId: fixerState.runId,
+        event: "checkpoint",
+        preserveLifecycle: true,
+        historyEventType: "workflow.ticket.accepted",
+        data: {
+          ticketId: options.ticket,
+          acceptedCommit: fixer.acceptedCommit,
+        },
+        updateSnapshot: () => ({
+          phase: completed ? "completed" : "implementing",
+          reviewAttention: undefined,
+          tickets: {
+            ...(fixerState.tickets ?? {}),
+            [options.ticket]: {
+              ...selected,
+              status: "accepted",
+              commit: fixer.acceptedCommit,
+            },
+          },
+        }),
       },
-      snapshot: state,
+      options.dependencies,
+    );
+    const finalState = workflowState(finalized.snapshot);
+    const next = nextPending(finalState);
+    return {
+      status: "accepted",
+      runId: state.runId,
+      ticketId: options.ticket,
+      acceptedCommit: fixer.acceptedCommit!,
+      snapshot: finalState,
+      fixer,
+      ...(next === undefined ? {} : { nextTicket: next }),
+      ...(next === undefined ? { phase6: "not-run" as const } : {}),
     };
   }
   if (resumingBlockedTicket) {

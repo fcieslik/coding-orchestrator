@@ -120,6 +120,12 @@ _Avoid_: Transcript, hidden reasoning, severity taxonomy
 A later fresh execution that may resolve Review attention after an explicit user decision. It is distinct from the originating Worker attempt.
 _Avoid_: Worker attempt, automatic review loop
 
+The first implementation permits one Fixer attempt per Review attention state.
+Its bounded Fix brief is an internal artifact, not a new Ticket or plan. A
+successful Fixer preserves the candidate commit in ancestry and adds a separate
+accepted correction commit; a blocked or failed attempt remains durable without
+an automatic retry.
+
 **Execution record**:
 The Orchestrator-owned durable record of one Worker attempt, including its logical invocation, owned Herdr identity, lifecycle observations, and artifact references.
 _Avoid_: Worker result, State snapshot, terminal transcript

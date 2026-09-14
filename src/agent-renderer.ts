@@ -12,6 +12,7 @@ export {
   renderWorkerPrompt,
   validateLogicalWorkerExecution,
 } from "./worker.js";
+export { launchSkillAwareFixer, renderFixerPrompt } from "./fixer.js";
 export type {
   LaunchedWorker,
   LaunchWorkerOptions,
@@ -19,3 +20,9 @@ export type {
   RenderedWorkerPrompt,
   WorkerAgentKind,
 } from "./worker.js";
+export type {
+  LaunchedFixer,
+  LaunchFixerOptions,
+  LogicalFixerExecution,
+  RenderedFixerPrompt,
+} from "./fixer.js";

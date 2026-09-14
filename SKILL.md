@@ -26,6 +26,15 @@ Repeat an accepted ticket only as an idempotent no-op. Repeat the same blocked t
 
 If a Worker returns `completed` with `review.status = attention`, report the candidate commit and every bounded finding with its smallest required decision. The run is durably blocked with Review attention, the ticket remains active and later tickets remain unavailable; do not treat the candidate as an accepted checkpoint. The original Worker pane is closed and is never reopened. A clean review or a legacy completed result without `review` follows the existing acceptance path. Findings do not create tickets or plans; a scope-expanding concern requires separate work prepared by the user.
 
+When the user supplies an explicit resolution for that attention, pass it with the
+same natural-language `$orchestrate` request as `--resolution <decision>` to the
+bundled helper. The helper revalidates the candidate and launches exactly one
+fresh bounded Fixer in the existing Feature worktree. The Fixer must preserve the
+candidate commit, create a separate correction commit, and publish structured
+evidence. A valid correction is accepted only after independent Git validation;
+blocked, failed, malformed, or drifted Fixer evidence remains durable and never
+starts a second Fixer.
+
 ## Package validation
 
 When the user asks to validate a completed Workflow package, invoke the deterministic helper operation once:
