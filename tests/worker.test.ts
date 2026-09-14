@@ -64,10 +64,12 @@ test("renderers keep logical execution distinct and use exact agent syntax", () 
       "- The assigned ticket input is immutable; do not modify it.",
       "- Global Orchestrator workflow state is read-only.",
       "- Write exactly one JSON object using the camelCase fields in one of the following shapes; do not use snake_case aliases.",
-      '- Completed: {"schemaVersion":1,"ticketId":"T01","status":"completed","commit":"<full commit SHA>","summary":"<concise summary>","commands":[{"command":"git status --short","status":"passed","exitCode":0}]}',
+      '- Completed: {"schemaVersion":1,"ticketId":"T01","status":"completed","commit":"<full commit SHA>","summary":"<concise summary>","commands":[{"command":"git status --short","status":"passed","exitCode":0}],"review":{"status":"clean","findings":[]}}',
+      '- Completed with Review attention: {"schemaVersion":1,"ticketId":"T01","status":"completed","commit":"<full candidate commit SHA>","summary":"<concise summary>","commands":[{"command":"git status --short","status":"passed","exitCode":0}],"review":{"status":"attention","findings":[{"axis":"standards","summary":"<concise unresolved finding>","evidence":"<optional evidence or reference>","requiredDecision":"<smallest required decision>"}]}}',
       '- Blocked: {"schemaVersion":1,"ticketId":"T01","status":"blocked","summary":"<concise summary>","blocker":{"type":"<type>","requiredDecision":"<smallest required decision>"}}',
       '- Failed: {"schemaVersion":1,"ticketId":"T01","status":"failed","summary":"<concise summary>","diagnostics":{"message":"<failure message>"}}',
       "- Publish the result atomically by writing a temporary file in the output directory, then renaming it to the result path.",
+      "- Fix clear review findings that stay within the assigned ticket before committing. If a Standards or Spec finding requires a decision or scope expansion, preserve the implementation commit and return completed with Review attention; do not guess, ignore it, or expand the ticket. If it is outside this ticket or specification, tell the user to prepare separate work.",
       "- On a product, architecture, security, destructive-operation, credential, or human-decision blocker, do not guess. Write a blocked result with the smallest required decision, then stop.",
       "- On technical failure, write a failed result with relevant diagnostics, then stop.",
       "",
@@ -126,6 +128,7 @@ test("every supported Agent prompt embeds the complete canonical safeguards", ()
       "Write the structured execution result to:",
     );
     expect(rendered.prompt).toContain("- Blocked:");
+    expect(rendered.prompt).toContain("Completed with Review attention:");
     expect(rendered.prompt).not.toMatch(
       /inspect|testing|self-review|repository methodology/i,
     );

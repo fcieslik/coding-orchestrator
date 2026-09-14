@@ -188,6 +188,83 @@
         "additionalProperties": {}
       }
     },
+    "reviewAttention": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "const": "attention"
+        },
+        "ticketId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "executionId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attemptId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "candidateCommit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40,64}$"
+        },
+        "findings": {
+          "minItems": 1,
+          "maxItems": 5,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "axis": {
+                "type": "string",
+                "enum": [
+                  "standards",
+                  "spec"
+                ]
+              },
+              "summary": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              },
+              "evidence": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4000
+              },
+              "reference": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1000
+              },
+              "requiredDecision": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              }
+            },
+            "required": [
+              "axis",
+              "summary",
+              "requiredDecision"
+            ],
+            "additionalProperties": {}
+          }
+        }
+      },
+      "required": [
+        "status",
+        "ticketId",
+        "executionId",
+        "attemptId",
+        "candidateCommit",
+        "findings"
+      ],
+      "additionalProperties": {}
+    },
     "activeExecution": {
       "type": "object",
       "properties": {

@@ -183,12 +183,23 @@ try {
       console.log(`Workflow step: ${report.status}`);
       console.log(`Run: ${report.runId}`);
       console.log(`Ticket: ${report.ticketId}`);
-      console.log(`Accepted Git checkpoint: ${report.acceptedCommit}`);
-      console.log(
-        `Next ticket: ${report.nextTicket ?? "none (implementation complete)"}`,
-      );
-      if (report.snapshot.phase === "completed")
-        console.log("Phase 6 deterministic validation has not run.");
+      if (report.status === "attention") {
+        console.log(`Candidate Git commit: ${report.candidateCommit}`);
+        console.log(
+          "Review attention: a decision is required before acceptance.",
+        );
+        for (const finding of report.review.findings) {
+          console.log(`[${finding.axis}] ${finding.summary}`);
+          console.log(`Required decision: ${finding.requiredDecision}`);
+        }
+      } else {
+        console.log(`Accepted Git checkpoint: ${report.acceptedCommit}`);
+        console.log(
+          `Next ticket: ${report.nextTicket ?? "none (implementation complete)"}`,
+        );
+        if (report.snapshot.phase === "completed")
+          console.log("Phase 6 deterministic validation has not run.");
+      }
     }
   } else if (argument === "validate" && arguments_.includes("--help")) {
     console.log(
@@ -440,7 +451,18 @@ try {
       console.log(`Ticket: ${report.ticketId}`);
       console.log(`Attempt: ${report.attemptId}`);
       console.log(`Execution: ${report.executionId}`);
-      console.log(`Accepted Git checkpoint: ${report.acceptedCommit}`);
+      console.log(
+        `${report.status === "attention" ? "Candidate Git commit" : "Accepted Git checkpoint"}: ${report.status === "attention" ? report.candidateCommit : report.acceptedCommit}`,
+      );
+      if (report.status === "attention") {
+        console.log(
+          "Review attention: a decision is required before acceptance.",
+        );
+        for (const finding of report.review.findings) {
+          console.log(`[${finding.axis}] ${finding.summary}`);
+          console.log(`Required decision: ${finding.requiredDecision}`);
+        }
+      }
       console.log(`Execution record: ${report.artifacts.record}`);
       console.log(`Worker result: ${report.artifacts.output}`);
     }
@@ -487,6 +509,17 @@ try {
       console.log(`Ticket: ${report.ticketId}`);
       console.log(`Attempt: ${report.attemptId}`);
       if (report.executionId) console.log(`Execution: ${report.executionId}`);
+      if (report.candidateCommit)
+        console.log(`Candidate commit: ${report.candidateCommit}`);
+      if (report.review) {
+        console.log(
+          "Review attention: a decision is required before acceptance.",
+        );
+        for (const finding of report.review.findings) {
+          console.log(`[${finding.axis}] ${finding.summary}`);
+          console.log(`Required decision: ${finding.requiredDecision}`);
+        }
+      }
       console.log(`Result evidence: ${report.evidence.result}`);
       if (report.evidence.currentHead)
         console.log(`Current HEAD: ${report.evidence.currentHead}`);
@@ -555,7 +588,9 @@ try {
       console.log(`Ticket: ${report.ticketId}`);
       console.log(`Attempt: ${report.attemptId}`);
       console.log(`Execution: ${report.executionId}`);
-      console.log(`Accepted Git checkpoint: ${report.acceptedCommit}`);
+      console.log(
+        `${report.status === "attention" ? "Candidate Git commit" : "Accepted Git checkpoint"}: ${report.status === "attention" ? report.candidateCommit : report.acceptedCommit}`,
+      );
       console.log(`Execution record: ${report.artifacts.record}`);
       console.log(`Worker result: ${report.artifacts.output}`);
     }
@@ -598,6 +633,15 @@ try {
         console.log(`Worktree: ${snapshot.git.worktreeStatus}`);
         if (snapshot.git.validatedHead)
           console.log(`Validated HEAD: ${snapshot.git.validatedHead}`);
+      }
+      if (snapshot.reviewAttention) {
+        console.log(
+          `Review attention: candidate ${snapshot.reviewAttention.candidateCommit} requires a decision for ticket ${snapshot.reviewAttention.ticketId}`,
+        );
+        for (const finding of snapshot.reviewAttention.findings) {
+          console.log(`[${finding.axis}] ${finding.summary}`);
+          console.log(`Required decision: ${finding.requiredDecision}`);
+        }
       }
       console.log(
         `History: ${operationalHistoryMetadata.synchronized ? "synchronized" : `interrupted audit (${audit.warning})`}`,

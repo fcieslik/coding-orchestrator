@@ -104,9 +104,29 @@ _Avoid_: Mutable source specification, Ticket input snapshot
 The structured, worker-owned outcome artifact for one Worker attempt. It is evidence consumed by the Orchestrator, not workflow truth by itself.
 _Avoid_: State snapshot, Git checkpoint, terminal output
 
+**Review attention**:
+A durable Workflow state indicating that a technically completed Worker produced a candidate commit with unresolved Standards or Spec findings requiring an explicit decision before the ticket can be accepted.
+_Avoid_: Accepted ticket, ordinary transport failure, independent Reviewer stage
+
+**Candidate commit**:
+The clean, validated Worker commit preserved in Git while Review attention is unresolved. It is not yet the ticket's Git checkpoint.
+_Avoid_: Accepted commit, Run base
+
+**Review finding**:
+A bounded structured Standards or Spec concern containing a concise summary and the smallest required decision, with optional evidence or reference.
+_Avoid_: Transcript, hidden reasoning, severity taxonomy
+
+**Fixer attempt**:
+A later fresh execution that may resolve Review attention after an explicit user decision. It is distinct from the originating Worker attempt.
+_Avoid_: Worker attempt, automatic review loop
+
 **Execution record**:
 The Orchestrator-owned durable record of one Worker attempt, including its logical invocation, owned Herdr identity, lifecycle observations, and artifact references.
 _Avoid_: Worker result, State snapshot, terminal transcript
+
+**Attempt failure diagnostic**:
+The bounded, structured technical reason why a Worker attempt could not complete its orchestration contract. It belongs to the Execution record and is distinct from review findings reported by a completed Worker.
+_Avoid_: Full transcript, review finding, Worker result
 
 **Active execution**:
 The Worker attempt currently associated with a Workflow run and requiring launch, observation, reconciliation, or finalization.

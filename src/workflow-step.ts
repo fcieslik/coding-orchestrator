@@ -24,7 +24,11 @@ import {
   mutateRun,
   type RunDependencies,
 } from "./workflow-run.js";
-import { runIdSchema, type StateSnapshot } from "./schema.js";
+import {
+  runIdSchema,
+  type StateSnapshot,
+  type WorkerReview,
+} from "./schema.js";
 
 const terminalPhases = new Set(["failed", "cancelled", "completed"]);
 
@@ -69,17 +73,26 @@ export interface WorkflowStepOptions {
   newRun?: boolean;
 }
 
-export interface WorkflowStepReport {
-  status: "accepted" | "noop";
+interface WorkflowStepReportCommon {
   runId: string;
   ticketId: string;
-  acceptedCommit: string;
   nextTicket?: string;
   snapshot: StateSnapshot;
   execution?: WorkerExecutionReport;
   /** Phase 6 deterministic validation is intentionally outside this step. */
   phase6?: "not-run";
 }
+
+export type WorkflowStepReport =
+  | (WorkflowStepReportCommon & {
+      status: "accepted" | "noop";
+      acceptedCommit: string;
+    })
+  | (WorkflowStepReportCommon & {
+      status: "attention";
+      candidateCommit: string;
+      review: Extract<WorkerReview, { status: "attention" }>;
+    });
 
 function invalid(
   message: string,
@@ -494,6 +507,29 @@ export async function executeWorkflowStep(
     state.phase === "blocked" &&
     selected.status === "active" &&
     activeTicket === options.ticket;
+  if (state.reviewAttention !== undefined) {
+    if (
+      state.reviewAttention.ticketId !== options.ticket ||
+      selected.status !== "active"
+    )
+      throw new FlowError(
+        `Workflow run ${state.runId} contains Review attention for ${state.reviewAttention.ticketId}; later tickets are unavailable`,
+        4,
+        "WORKFLOW_BLOCKED",
+        { activeTicket: state.reviewAttention.ticketId },
+      );
+    return {
+      status: "attention",
+      runId: state.runId,
+      ticketId: options.ticket,
+      candidateCommit: state.reviewAttention.candidateCommit,
+      review: {
+        status: "attention",
+        findings: state.reviewAttention.findings,
+      },
+      snapshot: state,
+    };
+  }
   if (resumingBlockedTicket) {
     const execution = await retryWorker({
       repository,
@@ -504,6 +540,16 @@ export async function executeWorkflowStep(
         : { dependencies: options.dependencies }),
       ...(options.adapter === undefined ? {} : { adapter: options.adapter }),
     });
+    if (execution.status === "attention")
+      return {
+        status: "attention",
+        runId: state.runId,
+        ticketId: options.ticket,
+        candidateCommit: execution.candidateCommit,
+        review: execution.review,
+        snapshot: execution.snapshot,
+        execution,
+      };
     state = workflowState(execution.snapshot);
     const retryState = state;
     const remaining = Object.entries(state.tickets ?? {}).filter(
@@ -630,6 +676,16 @@ export async function executeWorkflowStep(
       ).catch(() => undefined);
     throw error;
   }
+  if (execution.status === "attention")
+    return {
+      status: "attention",
+      runId: state.runId,
+      ticketId: options.ticket,
+      candidateCommit: execution.candidateCommit,
+      review: execution.review,
+      snapshot: execution.snapshot,
+      execution,
+    };
   const remaining = Object.entries(state.tickets ?? {}).filter(
     ([id, ticket]) => id !== options.ticket && ticket.status === "pending",
   );

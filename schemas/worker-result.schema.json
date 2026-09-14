@@ -56,6 +56,122 @@
             ],
             "additionalProperties": {}
           }
+        },
+        "review": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "const": "clean"
+                },
+                "findings": {
+                  "maxItems": 0,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "axis": {
+                        "type": "string",
+                        "enum": [
+                          "standards",
+                          "spec"
+                        ]
+                      },
+                      "summary": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000
+                      },
+                      "evidence": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 4000
+                      },
+                      "reference": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000
+                      },
+                      "requiredDecision": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000
+                      }
+                    },
+                    "required": [
+                      "axis",
+                      "summary",
+                      "requiredDecision"
+                    ],
+                    "additionalProperties": {}
+                  }
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "additionalProperties": {}
+            },
+            {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "const": "attention"
+                },
+                "findings": {
+                  "minItems": 1,
+                  "maxItems": 5,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "axis": {
+                        "type": "string",
+                        "enum": [
+                          "standards",
+                          "spec"
+                        ]
+                      },
+                      "summary": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000
+                      },
+                      "evidence": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 4000
+                      },
+                      "reference": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1000
+                      },
+                      "requiredDecision": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000
+                      }
+                    },
+                    "required": [
+                      "axis",
+                      "summary",
+                      "requiredDecision"
+                    ],
+                    "additionalProperties": {}
+                  }
+                }
+              },
+              "required": [
+                "status",
+                "findings"
+              ],
+              "additionalProperties": {}
+            }
+          ]
         }
       },
       "required": [

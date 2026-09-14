@@ -168,6 +168,207 @@ else process.exit(2);
   );
 });
 
+test("flow orchestrate persists Worker Review attention without accepting or advancing the queue", async () => {
+  const repository = await createCommittedTargetRepository();
+  await writeWorkflowPackage(repository, ["01-review", "02-later"]);
+  const fakeDirectory = await temporaryDirectory();
+  const fake = join(fakeDirectory, "herdr");
+  const state = join(fakeDirectory, "state.json");
+  const launches = join(fakeDirectory, "launches.log");
+  const closes = join(fakeDirectory, "closes.log");
+  await writeFile(
+    fake,
+    `#!/usr/bin/env node
+import { appendFileSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+const args = process.argv.slice(2);
+if (args[0] === "--version") console.log("fake-herdr 1.0.0");
+else if (args[0] === "pane" && args[1] === "split") console.log(JSON.stringify({result:{pane:{pane_id:"fake:worker"}}}));
+else if (args[0] === "agent" && args[1] === "start") {
+  const child = args.slice(args.indexOf("--") + 1);
+  writeFileSync(process.env.FAKE_STATE, JSON.stringify({worktree: child[child.indexOf("-C") + 1]}));
+  appendFileSync(process.env.FAKE_LAUNCHES, args[2] + "\\n");
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"idle"}}}));
+} else if (args[0] === "agent" && args[1] === "prompt") {
+  const current = JSON.parse(readFileSync(process.env.FAKE_STATE, "utf8"));
+  const prompt = args[3];
+  const ticket = prompt.match(/- Ticket: ([^\\n]+)/)[1];
+  const resultPath = prompt.match(/Write the structured execution result to: "([^"]+)"/)[1];
+  writeFileSync(current.worktree + "/candidate.txt", "candidate\\n");
+  execFileSync("git", ["-C", current.worktree, "add", "candidate.txt"]);
+  execFileSync("git", ["-C", current.worktree, "commit", "--quiet", "-m", "candidate implementation"]);
+  const commit = execFileSync("git", ["-C", current.worktree, "rev-parse", "HEAD"], {encoding:"utf8"}).trim();
+  writeFileSync(resultPath + ".tmp", JSON.stringify({schemaVersion:1,ticketId:ticket,status:"completed",summary:"Implementation exists; review decision required.",commit,commands:[],review:{status:"attention",findings:[{axis:"spec",summary:"The empty-state behavior is unspecified.",evidence:"candidate.txt",requiredDecision:"Choose the empty-state behavior for this ticket."}]}}));
+  renameSync(resultPath + ".tmp", resultPath);
+  console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"done"}}}));
+} else if (args[0] === "agent" && args[1] === "read") process.stdout.write("candidate worker done\\n");
+else if (args[0] === "pane" && args[1] === "close") { appendFileSync(process.env.FAKE_CLOSES, "fake:worker\\n"); console.log("{}"); }
+else process.exit(2);
+`,
+    "utf8",
+  );
+  await chmod(fake, 0o755);
+  const environment = {
+    ...process.env,
+    HERDR_ENV: "1",
+    HERDR_PANE_ID: "caller",
+    HERDR_BIN_PATH: fake,
+    FAKE_STATE: state,
+    FAKE_LAUNCHES: launches,
+    FAKE_CLOSES: closes,
+  };
+  const initialHead = await gitOutput(repository, ["rev-parse", "HEAD"]);
+  const first = JSON.parse(
+    (
+      await run(
+        executable,
+        ["orchestrate", "feature", "01-review", "--repo", repository, "--json"],
+        { cwd: repository, env: environment },
+      )
+    ).stdout,
+  ) as {
+    runId: string;
+    status: string;
+    candidateCommit: string;
+    review: { status: string; findings: Array<{ requiredDecision: string }> };
+    execution: { executionId: string };
+    snapshot: {
+      phase: string;
+      interruptedPhase?: string;
+      git: { validatedHead?: string; featureWorktree: string };
+      tickets: Record<string, { status: string; commit?: string }>;
+      reviewAttention?: {
+        candidateCommit: string;
+        executionId: string;
+        attemptId: string;
+        findings: Array<{ requiredDecision: string }>;
+      };
+    };
+  };
+  expect(first).toMatchObject({
+    status: "attention",
+    review: {
+      status: "attention",
+      findings: [
+        {
+          requiredDecision: "Choose the empty-state behavior for this ticket.",
+        },
+      ],
+    },
+    snapshot: {
+      phase: "blocked",
+      interruptedPhase: "implementing",
+      tickets: {
+        "01-review": { status: "active" },
+        "02-later": { status: "pending" },
+      },
+      reviewAttention: {
+        candidateCommit: first.candidateCommit,
+        findings: [
+          {
+            requiredDecision:
+              "Choose the empty-state behavior for this ticket.",
+          },
+        ],
+      },
+    },
+  });
+  expect(first.candidateCommit).not.toBe(first.snapshot.git.validatedHead);
+  expect(first.snapshot.reviewAttention?.executionId).toBe(
+    first.execution.executionId,
+  );
+  expect(first.snapshot.reviewAttention?.attemptId).toBe("attempt-01");
+  expect(await gitOutput(repository, ["rev-parse", "HEAD"])).toBe(initialHead);
+  expect((await readFile(closes, "utf8")).trim().split("\n")).toEqual([
+    "fake:worker",
+  ]);
+  expect((await readFile(launches, "utf8")).trim().split("\n")).toHaveLength(1);
+
+  const later = await run(
+    executable,
+    ["orchestrate", "feature", "02-later", "--repo", repository, "--json"],
+    { cwd: repository, env: environment },
+  ).then(
+    (result) => ({ code: 0, ...result }),
+    (error: unknown) => error as { code: number; stderr: string },
+  );
+  expect(later.code).toBe(4);
+  expect(later.stderr).toContain("WORKFLOW_BLOCKED");
+
+  const restarted = JSON.parse(
+    (
+      await run(
+        executable,
+        ["orchestrate", "feature", "01-review", "--repo", repository, "--json"],
+        { cwd: repository, env: environment },
+      )
+    ).stdout,
+  );
+  expect(restarted).toMatchObject({
+    status: "attention",
+    runId: first.runId,
+    candidateCommit: first.candidateCommit,
+    review: first.review,
+    snapshot: {
+      phase: "blocked",
+      reviewAttention: first.snapshot.reviewAttention,
+    },
+  });
+  expect((await readFile(launches, "utf8")).trim().split("\n")).toHaveLength(1);
+
+  const reconciledInvocation = await run(
+    executable,
+    [
+      "worker",
+      "reconcile",
+      "--repo",
+      repository,
+      "--run",
+      first.runId,
+      "--attempt",
+      "attempt-01",
+      "--json",
+    ],
+    { cwd: repository, env: environment },
+  ).then(
+    (result) => ({ code: 0, ...result }),
+    (error: unknown) => error as { code: number; stdout: string },
+  );
+  expect(reconciledInvocation.code).toBe(4);
+  const reconciled = JSON.parse(reconciledInvocation.stdout);
+  expect(reconciled).toMatchObject({
+    status: "attention",
+    outcome: "review-attention",
+    code: "WORKER_REVIEW_ATTENTION",
+    candidateCommit: first.candidateCommit,
+    review: first.review,
+    snapshot: {
+      phase: "blocked",
+      reviewAttention: first.snapshot.reviewAttention,
+    },
+  });
+  expect(
+    JSON.parse(await readFile(reconciled.artifacts.record, "utf8")),
+  ).toMatchObject({
+    status: "blocked",
+    cleanup: { status: "closed" },
+  });
+  const history = (
+    await run(executable, [
+      "history",
+      "--repo",
+      repository,
+      "--run",
+      first.runId,
+      "--json",
+    ])
+  ).stdout;
+  expect(
+    JSON.parse(history).map((event: { type: string }) => event.type),
+  ).toContain("worker.review.attention");
+  expect(await gitOutput(repository, ["rev-parse", "HEAD"])).toBe(initialHead);
+}, 30_000);
+
 test("flow orchestrate retries a launch failure only after another explicit invocation", async () => {
   const repository = await createCommittedTargetRepository();
   const packageDirectory = join(repository, "feature");

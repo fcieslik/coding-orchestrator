@@ -24,6 +24,8 @@ Treat `flow orchestrate` as a long-running foreground operation. Invoke it once 
 
 Repeat an accepted ticket only as an idempotent no-op. Repeat the same blocked ticket only as an explicit resume request; never retry it autonomously, and never retry when reconciliation finds an unaccepted commit, dirty worktree, ambiguous artifacts, unsafe cleanup, or an exhausted attempt budget. A changed specification or ticket requires a new Workflow package and explicit new run. Do not implement the ticket in the Orchestrator context. Do not add unrestricted-access arguments; Worker permissions are owned by repository configuration and the agent adapter. Prompt settlement, result ingestion, checkpoint validation, retry reconciliation, and owned-pane cleanup are handled by the deterministic helper and must not be reimplemented in conversational instructions.
 
+If a Worker returns `completed` with `review.status = attention`, report the candidate commit and every bounded finding with its smallest required decision. The run is durably blocked with Review attention, the ticket remains active and later tickets remain unavailable; do not treat the candidate as an accepted checkpoint. The original Worker pane is closed and is never reopened. A clean review or a legacy completed result without `review` follows the existing acceptance path. Findings do not create tickets or plans; a scope-expanding concern requires separate work prepared by the user.
+
 ## Package validation
 
 When the user asks to validate a completed Workflow package, invoke the deterministic helper operation once:

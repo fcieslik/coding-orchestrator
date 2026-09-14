@@ -133,6 +133,34 @@ const workflowTicketSchema = z.looseObject({
   commit: objectIdSchema.optional(),
 });
 
+const reviewFindingSchema = z.looseObject({
+  axis: z.enum(["standards", "spec"]),
+  summary: z.string().min(1).max(2_000),
+  evidence: z.string().min(1).max(4_000).optional(),
+  reference: z.string().min(1).max(1_000).optional(),
+  requiredDecision: z.string().min(1).max(2_000),
+});
+
+export const workerReviewSchema = z.discriminatedUnion("status", [
+  z.looseObject({
+    status: z.literal("clean"),
+    findings: z.array(reviewFindingSchema).max(0).optional(),
+  }),
+  z.looseObject({
+    status: z.literal("attention"),
+    findings: z.array(reviewFindingSchema).min(1).max(5),
+  }),
+]);
+
+const reviewAttentionSchema = z.looseObject({
+  status: z.literal("attention"),
+  ticketId: z.string().min(1),
+  executionId: z.string().min(1),
+  attemptId: z.string().min(1),
+  candidateCommit: objectIdSchema,
+  findings: z.array(reviewFindingSchema).min(1).max(5),
+});
+
 export const validationStatusSchema = z.enum(["passed", "failed"]);
 
 export const validationCheckStatusSchema = z.enum([
@@ -227,6 +255,7 @@ export const stateSnapshotSchema = z.looseObject({
   git: gitStateSchema.optional(),
   workflowPackage: workflowPackageSchema.optional(),
   tickets: z.record(z.string().min(1), workflowTicketSchema).optional(),
+  reviewAttention: reviewAttentionSchema.optional(),
   activeExecution: z
     .looseObject({
       executionId: z.string().min(1),
@@ -366,6 +395,7 @@ export const workerResultSchema = z.discriminatedUnion("status", [
     status: z.literal("completed"),
     commit: objectIdSchema,
     commands: z.array(workerCommandOutcomeSchema),
+    review: workerReviewSchema.optional(),
   }),
   workerResultCommonSchema.extend({
     status: z.literal("blocked"),
@@ -409,6 +439,8 @@ export type ValidationState = z.infer<typeof validationStateSchema>;
 export type RunEvent = z.infer<typeof runEventSchema>;
 export type ExecutionRecord = z.infer<typeof executionRecordSchema>;
 export type WorkerResult = z.infer<typeof workerResultSchema>;
+export type WorkerReview = z.infer<typeof workerReviewSchema>;
+export type ReviewFinding = z.infer<typeof reviewFindingSchema>;
 
 function addCalendarAwareRunId(schema: z.core.JSONSchema.BaseSchema): void {
   const document = schema as z.core.JSONSchema.BaseSchema & {

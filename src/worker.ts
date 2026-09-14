@@ -174,6 +174,28 @@ export function renderWorkerPrompt(
     commands: [
       { command: "git status --short", status: "passed", exitCode: 0 },
     ],
+    review: { status: "clean", findings: [] },
+  });
+  const attentionResult = JSON.stringify({
+    schemaVersion: 1,
+    ticketId: checked.ticketId,
+    status: "completed",
+    commit: "<full candidate commit SHA>",
+    summary: "<concise summary>",
+    commands: [
+      { command: "git status --short", status: "passed", exitCode: 0 },
+    ],
+    review: {
+      status: "attention",
+      findings: [
+        {
+          axis: "standards",
+          summary: "<concise unresolved finding>",
+          evidence: "<optional evidence or reference>",
+          requiredDecision: "<smallest required decision>",
+        },
+      ],
+    },
   });
   const blockedResult = JSON.stringify({
     schemaVersion: 1,
@@ -213,9 +235,11 @@ export function renderWorkerPrompt(
     "- Global Orchestrator workflow state is read-only.",
     "- Write exactly one JSON object using the camelCase fields in one of the following shapes; do not use snake_case aliases.",
     `- Completed: ${completedResult}`,
+    `- Completed with Review attention: ${attentionResult}`,
     `- Blocked: ${blockedResult}`,
     `- Failed: ${failedResult}`,
     "- Publish the result atomically by writing a temporary file in the output directory, then renaming it to the result path.",
+    "- Fix clear review findings that stay within the assigned ticket before committing. If a Standards or Spec finding requires a decision or scope expansion, preserve the implementation commit and return completed with Review attention; do not guess, ignore it, or expand the ticket. If it is outside this ticket or specification, tell the user to prepare separate work.",
     "- On a product, architecture, security, destructive-operation, credential, or human-decision blocker, do not guess. Write a blocked result with the smallest required decision, then stop.",
     "- On technical failure, write a failed result with relevant diagnostics, then stop.",
     "",

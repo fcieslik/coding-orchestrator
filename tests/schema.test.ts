@@ -184,6 +184,110 @@ test("execution and Worker result schemas keep their independent version-one con
   ).toThrow();
 });
 
+test("completed Worker results support clean and unresolved review outcomes", () => {
+  const commit = "c".repeat(40);
+  const clean = workerResultSchema.parse({
+    schemaVersion: 1,
+    ticketId: "03-ticket",
+    status: "completed",
+    summary: "done",
+    commit,
+    commands: [],
+    review: { status: "clean", findings: [] },
+  });
+  expect(clean).toMatchObject({ review: { status: "clean", findings: [] } });
+
+  const attention = workerResultSchema.parse({
+    schemaVersion: 1,
+    ticketId: "03-ticket",
+    status: "completed",
+    summary: "implemented, but a decision is required",
+    commit,
+    commands: [],
+    review: {
+      status: "attention",
+      findings: [
+        {
+          axis: "standards",
+          summary: "The public helper duplicates an existing boundary.",
+          evidence: "src/helper.ts:12",
+          requiredDecision: "Choose whether to reuse the existing boundary.",
+        },
+        {
+          axis: "spec",
+          summary:
+            "The specification does not define the empty-state behavior.",
+          requiredDecision: "Choose the empty-state behavior for this ticket.",
+        },
+      ],
+    },
+  });
+  expect(attention).toMatchObject({
+    review: {
+      status: "attention",
+      findings: [{ axis: "standards" }, { axis: "spec" }],
+    },
+  });
+
+  // Existing completed results remain valid without review data.
+  expect(
+    workerResultSchema.parse({
+      schemaVersion: 1,
+      ticketId: "03-ticket",
+      status: "completed",
+      summary: "legacy result",
+      commit,
+      commands: [],
+    }),
+  ).not.toHaveProperty("review");
+
+  expect(() =>
+    workerResultSchema.parse({
+      schemaVersion: 1,
+      ticketId: "03-ticket",
+      status: "completed",
+      summary: "missing decision",
+      commit,
+      commands: [],
+      review: {
+        status: "attention",
+        findings: [{ axis: "standards", summary: "Needs a decision." }],
+      },
+    }),
+  ).toThrow();
+  expect(() =>
+    workerResultSchema.parse({
+      schemaVersion: 1,
+      ticketId: "03-ticket",
+      status: "completed",
+      summary: "invalid review",
+      commit,
+      commands: [],
+      review: { status: "clean", findings: [{ axis: "spec" }] },
+    }),
+  ).toThrow();
+  expect(() =>
+    workerResultSchema.parse({
+      schemaVersion: 1,
+      ticketId: "03-ticket",
+      status: "completed",
+      summary: "invalid axis",
+      commit,
+      commands: [],
+      review: {
+        status: "attention",
+        findings: [
+          {
+            axis: "security",
+            summary: "Needs a decision.",
+            requiredDecision: "Choose.",
+          },
+        ],
+      },
+    }),
+  ).toThrow();
+});
+
 test("orchestration configuration validates worker contract and bounds", () => {
   expect(
     orchestrationConfigSchema.parse({

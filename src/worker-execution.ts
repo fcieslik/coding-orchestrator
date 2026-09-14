@@ -35,6 +35,7 @@ import {
   type ExecutionRecord,
   type StateSnapshot,
   type WorkerResult,
+  type WorkerReview,
 } from "./schema.js";
 import {
   acquireRunLock,
@@ -75,8 +76,7 @@ export interface ExecuteWorkerOptions {
   forceNewAttempt?: boolean;
 }
 
-export interface WorkerExecutionReport {
-  status: "accepted";
+interface WorkerExecutionReportCommon {
   executionId: string;
   runId: string;
   ticketId: string;
@@ -88,10 +88,24 @@ export interface WorkerExecutionReport {
     record: string;
     output: string;
   };
-  previousValidatedHead: string;
-  acceptedCommit: string;
   snapshot: StateSnapshot;
 }
+
+export type WorkerExecutionReport =
+  | (WorkerExecutionReportCommon & {
+      status: "accepted";
+      result: Extract<WorkerResult, { status: "completed" }>;
+      previousValidatedHead: string;
+      acceptedCommit: string;
+    })
+  | (WorkerExecutionReportCommon & {
+      status: "attention";
+      result: Extract<WorkerResult, { status: "completed" }> & {
+        review: Extract<WorkerReview, { status: "attention" }>;
+      };
+      candidateCommit: string;
+      review: Extract<WorkerReview, { status: "attention" }>;
+    });
 
 export interface ReconcileWorkerOptions {
   repository?: string;
@@ -115,10 +129,15 @@ export interface RetryWorkerOptions {
 }
 
 export interface WorkerReconciliationReport {
-  status: "accepted" | "blocked" | "failed";
-  outcome: "accepted" | "reconciliation-required" | "conclusive-failure";
+  status: "accepted" | "attention" | "blocked" | "failed";
+  outcome:
+    | "accepted"
+    | "review-attention"
+    | "reconciliation-required"
+    | "conclusive-failure";
   code:
     | "WORKER_ATTEMPT_ACCEPTED"
+    | "WORKER_REVIEW_ATTENTION"
     | "WORKER_RECONCILIATION_REQUIRED"
     | "WORKER_EXECUTION_FAILED";
   exitCode: 0 | 1 | 4;
@@ -127,6 +146,8 @@ export interface WorkerReconciliationReport {
   attemptId: string;
   executionId?: string;
   result?: WorkerResult;
+  candidateCommit?: string;
+  review?: Extract<WorkerReview, { status: "attention" }>;
   reason?: string;
   evidence: {
     result: "completed" | "blocked" | "failed" | "missing" | "invalid";
@@ -1219,6 +1240,8 @@ function reportFor(
   extras: {
     executionId?: string;
     result?: WorkerResult;
+    candidateCommit?: string;
+    review?: Extract<WorkerReview, { status: "attention" }>;
     reason?: string;
     retry?: WorkerReconciliationReport["retry"];
   } = {},
@@ -1226,18 +1249,22 @@ function reportFor(
   const outcome =
     status === "accepted"
       ? "accepted"
-      : status === "failed"
-        ? "conclusive-failure"
-        : "reconciliation-required";
+      : status === "attention"
+        ? "review-attention"
+        : status === "failed"
+          ? "conclusive-failure"
+          : "reconciliation-required";
   return {
     status,
     outcome,
     code:
       status === "accepted"
         ? "WORKER_ATTEMPT_ACCEPTED"
-        : status === "failed"
-          ? "WORKER_EXECUTION_FAILED"
-          : "WORKER_RECONCILIATION_REQUIRED",
+        : status === "attention"
+          ? "WORKER_REVIEW_ATTENTION"
+          : status === "failed"
+            ? "WORKER_EXECUTION_FAILED"
+            : "WORKER_RECONCILIATION_REQUIRED",
     exitCode: status === "accepted" ? 0 : status === "failed" ? 1 : 4,
     runId: run.snapshot.runId,
     ticketId,
@@ -1246,6 +1273,10 @@ function reportFor(
       ? {}
       : { executionId: extras.executionId }),
     ...(extras.result === undefined ? {} : { result: extras.result }),
+    ...(extras.candidateCommit === undefined
+      ? {}
+      : { candidateCommit: extras.candidateCommit }),
+    ...(extras.review === undefined ? {} : { review: extras.review }),
     ...(extras.reason === undefined ? {} : { reason: extras.reason }),
     ...(extras.retry === undefined ? {} : { retry: extras.retry }),
     evidence,
@@ -1362,6 +1393,74 @@ async function updateAttemptOutcome(
       return inspectRun(repository, runId);
     throw error;
   });
+}
+
+type ReviewAttention = Extract<WorkerReview, { status: "attention" }>;
+type CompletedReviewAttentionResult = Extract<
+  WorkerResult,
+  { status: "completed" }
+> & { review: ReviewAttention };
+
+async function persistReviewAttention(
+  repository: string,
+  runId: string,
+  execution: ExecutionRecord,
+  artifacts: AttemptArtifacts,
+  review: ReviewAttention,
+  candidateCommit: string,
+  dependencies: RunDependencies,
+): Promise<ReadRunResult> {
+  const current = await inspectRun(repository, runId);
+  const existing = current.snapshot.reviewAttention;
+  if (existing !== undefined) {
+    if (
+      current.snapshot.phase === "blocked" &&
+      existing.ticketId === execution.ticketId &&
+      existing.executionId === execution.executionId &&
+      existing.attemptId === execution.attemptId &&
+      existing.candidateCommit === candidateCommit &&
+      stableJson(existing.findings) === stableJson(review.findings)
+    )
+      return current;
+    throw executionError(
+      "Workflow run already contains different Review attention evidence",
+      "UNTRUSTED_ARTIFACT",
+      4,
+    );
+  }
+  return mutateRun(
+    {
+      repository,
+      runId,
+      event: "block",
+      historyEventType: "worker.review.attention",
+      data: {
+        executionId: execution.executionId,
+        ticketId: execution.ticketId,
+        attemptId: execution.attemptId,
+        candidateCommit,
+        findings: review.findings,
+      },
+      updateSnapshot: () => ({
+        reviewAttention: {
+          status: "attention" as const,
+          ticketId: execution.ticketId,
+          executionId: execution.executionId,
+          attemptId: execution.attemptId,
+          candidateCommit,
+          findings: review.findings,
+        },
+        lastExecution: executionReference(
+          execution.executionId,
+          execution.ticketId,
+          execution.attemptId,
+          artifacts.record,
+        ),
+        activeExecution: undefined,
+      }),
+    },
+    dependencies,
+  );
 }
 
 async function reconcileWorkerBody(
@@ -1589,11 +1688,56 @@ async function reconcileWorkerBody(
     (reason !== undefined && evidence.result !== "missing") ||
     gitFailure !== undefined;
   const completedResult = result?.status === "completed" ? result : undefined;
+  const attentionReview =
+    completedResult?.review?.status === "attention"
+      ? completedResult.review
+      : undefined;
   const completedMatchesGit =
     completedResult !== undefined &&
     currentHead === completedResult.commit &&
     clean === true &&
     !gitFailure;
+
+  if (
+    completedMatchesGit &&
+    attentionReview &&
+    !invalidEvidence &&
+    !cleanupFailed
+  ) {
+    const attentionRecord = {
+      ...reconciledRecord!,
+      status: "blocked" as const,
+      timestamps: {
+        ...reconciledRecord!.timestamps,
+        finalizedAt: new Date().toISOString(),
+      },
+    };
+    await writeExecution(artifacts.record, attentionRecord);
+    const attentionRun = await persistReviewAttention(
+      repository,
+      options.runId,
+      attentionRecord,
+      artifacts,
+      attentionReview,
+      completedResult.commit,
+      options.dependencies ?? {},
+    );
+    return reportFor(
+      "attention",
+      attentionRun,
+      ticketId,
+      attemptId,
+      artifacts,
+      evidence,
+      cleanup,
+      {
+        executionId: attentionRecord.executionId,
+        result: completedResult,
+        candidateCommit: completedResult.commit,
+        review: attentionReview,
+      },
+    );
+  }
 
   if (
     record?.status === "accepted" &&
@@ -2078,6 +2222,39 @@ export async function executeWorker(
       execution,
       attempt!.artifacts,
     );
+
+    if (workerResult.review?.status === "attention") {
+      execution = {
+        ...execution,
+        status: "blocked",
+        timestamps: {
+          ...execution.timestamps,
+          finalizedAt: new Date().toISOString(),
+        },
+      };
+      await writeExecution(attempt.artifacts.record, execution);
+      const attentionRun = await persistReviewAttention(
+        repository,
+        options.runId,
+        execution as ExecutionRecord,
+        attempt.artifacts,
+        workerResult.review,
+        workerResult.commit,
+        dependencies,
+      );
+      return {
+        status: "attention",
+        executionId: execution.executionId,
+        runId: options.runId,
+        ticketId: ticket.id,
+        attemptId: attempt.id,
+        result: workerResult as CompletedReviewAttentionResult,
+        artifacts: execution.artifacts,
+        candidateCommit: workerResult.commit,
+        review: workerResult.review,
+        snapshot: attentionRun.snapshot,
+      };
+    }
 
     const accepted = await validateCheckpoint({
       repository,
