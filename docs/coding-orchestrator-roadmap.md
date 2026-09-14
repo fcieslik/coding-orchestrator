@@ -27,6 +27,12 @@ Skills definiują engineering methodology. Orchestrator definiuje workflow seman
 
 > Orchestrator nie reimplementuje metodologii należącej do downstream engineering skills. Worker i reviewer prompts są skill-aware wrappers, nie samodzielnymi metodologiami.
 
+## Zasada zamykania faz
+
+Każda faza rozwoju wymaga na końcu co najmniej jednego minimalnego testu live na rzeczywistym wspieranym runtime i disposable repozytorium lub innym bezpiecznym środowisku testowym. Test ma potwierdzić najważniejszy nowy przepływ fazy przez publiczny interfejs użytkownika. Same testy automatyczne nie wystarczają do oznaczenia fazy jako zakończonej.
+
+Zakres live gate pozostaje proporcjonalny do zmiany: ma sprawdzać jedną reprezentatywną ścieżkę, a nie powtarzać całej automatycznej macierzy testów. Wynik, istotne identyfikatory i zauważone ograniczenia należy zapisać w końcowym tickecie fazy albo jej sekcji `Status`.
+
 ---
 
 # 1. Scope pierwszego MVP

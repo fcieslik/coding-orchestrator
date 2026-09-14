@@ -6,6 +6,8 @@ Zasada dla V1:
 
 > Gotowy spec i gotowe tickety są wykonywane sekwencyjnie, a wynik jest akceptowany na podstawie Git, ustrukturyzowanych rezultatów i deterministycznych dowodów.
 
+Każdą fazę zamyka co najmniej jeden minimalny test live zgodny z [zasadą zamykania faz](coding-orchestrator-roadmap.md#zasada-zamykania-faz). Testy automatyczne pozostają wymagane, ale same nie wystarczają do oznaczenia fazy jako zakończonej.
+
 ---
 
 # Phase 5 — user-driven ticket steps
