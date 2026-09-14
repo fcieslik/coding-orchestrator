@@ -26,6 +26,8 @@ Repeat an accepted ticket only as an idempotent no-op. Repeat the same blocked t
 
 If a Worker returns `completed` with `review.status = attention`, report the candidate commit and every bounded finding with its smallest required decision. The run is durably blocked with Review attention, the ticket remains active and later tickets remain unavailable; do not treat the candidate as an accepted checkpoint. The original Worker pane is closed and is never reopened. A clean review or a legacy completed result without `review` follows the existing acceptance path. Findings do not create tickets or plans; a scope-expanding concern requires separate work prepared by the user.
 
+If Worker execution fails technically, report the ticket as blocked and name the failed operation, process exit code when available, one short non-empty stderr line when available, and the durable Execution-record path. The attempt is failed and the ticket remains unaccepted. Treat this as technical failure evidence, not Review attention; retry only after the user's explicit retry request.
+
 When the user supplies an explicit resolution for that attention, pass it with the
 same natural-language `$orchestrate` request as `--resolution <decision>` to the
 bundled helper. The helper revalidates the candidate and launches exactly one

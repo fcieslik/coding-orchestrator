@@ -469,6 +469,146 @@ else process.exit(2);
   );
 });
 
+test("flow preserves bounded Herdr startup diagnostics and blocks the ticket", async () => {
+  const repository = await createCommittedTargetRepository();
+  await writeWorkflowPackage(repository, ["01-first"]);
+  const fakeDirectory = await temporaryDirectory();
+  const fake = join(fakeDirectory, "herdr");
+  const started = join(fakeDirectory, "started");
+  const prompted = join(fakeDirectory, "prompted");
+  await writeFile(
+    fake,
+    `#!/usr/bin/env node
+import { appendFileSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+if (args[0] === "--version") console.log("fake-herdr 1.0.0");
+else if (args[0] === "pane" && args[1] === "split") console.log(JSON.stringify({result:{pane:{pane_id:"fake:worker"}}}));
+else if (args[0] === "agent" && args[1] === "start") {
+  writeFileSync(process.env.FAKE_STARTED, "started\\n");
+  process.stdout.write("startup stdout\\n" + "o".repeat(17000));
+  process.stderr.write("first\\tstartup\\terror\\n" + "e".repeat(17000));
+  process.exit(23);
+} else if (args[0] === "agent" && args[1] === "prompt") appendFileSync(process.env.FAKE_PROMPTED, "prompted\\n");
+else if (args[0] === "pane" && args[1] === "close") console.log("{}");
+else process.exit(2);
+`,
+    "utf8",
+  );
+  await chmod(fake, 0o755);
+
+  const result = await run(
+    executable,
+    ["orchestrate", "feature", "01-first", "--repo", repository],
+    {
+      cwd: repository,
+      env: {
+        ...process.env,
+        HERDR_ENV: "1",
+        HERDR_PANE_ID: "caller",
+        HERDR_BIN_PATH: fake,
+        FAKE_STARTED: started,
+        FAKE_PROMPTED: prompted,
+      },
+    },
+  ).then(
+    (value) => ({ ...value, code: 0 }),
+    (error: unknown) =>
+      error as { stdout: string; stderr: string; code: number },
+  );
+  expect(result.code).toBe(1);
+  expect(result.stdout).toBe("");
+  expect(result.stderr).toContain("Ticket 01-first blocked");
+  expect(result.stderr).toContain("agent start failed");
+  expect(result.stderr).toContain("Exit code: 23");
+  expect(result.stderr).toContain("stderr: first startup error");
+  expect(result.stderr).not.toContain("startup stdout");
+  expect(result.stderr).not.toContain("eeeeeeeeeeee");
+  await expect(readFile(prompted, "utf8")).rejects.toMatchObject({
+    code: "ENOENT",
+  });
+  await expect(readFile(started, "utf8")).resolves.toBe("started\n");
+
+  const [runId] = await readdir(join(repository, ".orchestrator", "runs"));
+  expect(runId).toBeDefined();
+  const recordPath = join(
+    repository,
+    ".orchestrator",
+    "runs",
+    runId!,
+    "workers",
+    "01-first",
+    "attempt-01",
+    "execution.json",
+  );
+  const persistedRecordPath = await realpath(recordPath);
+  expect(result.stderr).toContain(persistedRecordPath);
+  const record = JSON.parse(await readFile(recordPath, "utf8")) as {
+    status: string;
+    diagnostics: {
+      operation: string;
+      message: string;
+      exitCode?: number;
+      stdout?: string;
+      stderr?: string;
+      truncated: boolean;
+    };
+    cleanup?: { status: string; error?: string };
+  };
+  expect(record).toMatchObject({
+    status: "failed",
+    diagnostics: {
+      operation: "agent start",
+      message: "Herdr agent start exited with 23",
+      exitCode: 23,
+      truncated: true,
+    },
+    cleanup: { status: "closed" },
+  });
+  expect(Buffer.byteLength(record.diagnostics.stdout ?? "", "utf8")).toBe(
+    16 * 1024,
+  );
+  expect(Buffer.byteLength(record.diagnostics.stderr ?? "", "utf8")).toBe(
+    16 * 1024,
+  );
+  expect(record.diagnostics.stdout).toMatch(/o+$/);
+  expect(record.diagnostics.stderr).toMatch(/e+$/);
+  expect(JSON.stringify(record)).not.toContain("--pane");
+
+  const state = JSON.parse(
+    await readFile(
+      join(repository, ".orchestrator", "runs", runId!, "state.json"),
+      "utf8",
+    ),
+  ) as {
+    phase: string;
+    tickets: Record<string, { status: string }>;
+    lastExecution: { path: string; failureReason: string };
+  };
+  expect(state).toMatchObject({
+    phase: "blocked",
+    tickets: { "01-first": { status: "active" } },
+    lastExecution: { path: persistedRecordPath },
+  });
+
+  const history = (
+    await readFile(
+      join(repository, ".orchestrator", "runs", runId!, "history.jsonl"),
+      "utf8",
+    )
+  )
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line)) as Array<{
+    type: string;
+    data: { failureReason?: string };
+  }>;
+  const blocked = history.at(-1);
+  expect(blocked).toMatchObject({
+    type: "workflow.ticket.blocked",
+    data: { failureReason: state.lastExecution.failureReason },
+  });
+}, 30_000);
+
 test("flow orchestrate resumes a two-ticket queue across processes", async () => {
   const repository = await createCommittedTargetRepository();
   const packageDirectory = join(repository, "feature");

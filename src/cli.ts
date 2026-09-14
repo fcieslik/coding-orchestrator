@@ -84,6 +84,32 @@ function parseOptions(
   return { values, flags };
 }
 
+function humanWorkerFailure(error: FlowError): boolean {
+  const details = error.details?.workerFailure;
+  if (!details || typeof details !== "object" || Array.isArray(details))
+    return false;
+  const failure = details as Record<string, unknown>;
+  if (
+    typeof failure.ticketId !== "string" ||
+    typeof failure.operation !== "string" ||
+    typeof failure.message !== "string" ||
+    typeof failure.executionPath !== "string"
+  )
+    return false;
+  console.error(
+    `Ticket ${failure.ticketId} blocked: ${failure.operation} failed.`,
+  );
+  console.error(`Reason: ${failure.message}`);
+  if (typeof failure.exitCode === "number")
+    console.error(`Exit code: ${failure.exitCode}`);
+  if (typeof failure.signal === "string")
+    console.error(`Signal: ${failure.signal}`);
+  if (typeof failure.stderrFirstLine === "string" && failure.stderrFirstLine)
+    console.error(`stderr: ${failure.stderrFirstLine.slice(0, 300)}`);
+  console.error(`Execution record: ${failure.executionPath}`);
+  return true;
+}
+
 try {
   if (
     arguments_.length === 0 ||
@@ -885,13 +911,13 @@ try {
   }
 } catch (error) {
   if (error instanceof FlowError) {
-    console.error(
+    if (
       structuredRequest ||
-        setupStructuredRequest ||
-        workflowStepStructuredRequest
-        ? JSON.stringify(error.toStructuredError())
-        : error.message,
-    );
+      setupStructuredRequest ||
+      workflowStepStructuredRequest
+    )
+      console.error(JSON.stringify(error.toStructuredError()));
+    else if (!humanWorkerFailure(error)) console.error(error.message);
     process.exitCode = error.exitCode;
   } else {
     throw error;

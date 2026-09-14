@@ -200,6 +200,8 @@ Orchestrator:
 | Błąd techniczny                        | Próba Workera raportuje `failed`, a run zostaje zablokowany bez checkpointu.                    |
 | Niejednoznaczny stan lub side effect   | Fail-closed; użytkownik otrzymuje najmniejszą potrzebną akcję naprawczą.                        |
 
+Przy technicznym błędzie CLI podaje ticket, nieudaną operację, opcjonalny exit code, krótki fragment `stderr` oraz ścieżkę do `execution.json`. Pełne strumienie nie są wypisywane; ograniczona diagnostyka pozostaje w tym rekordzie. Taki błąd nie jest Review attention i nie uruchamia automatycznego retry.
+
 ## 7. Użytkownik uruchamia kolejne tickety
 
 Dla następnego ticketu:

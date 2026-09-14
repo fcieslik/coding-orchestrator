@@ -246,8 +246,27 @@ interface ExecutionRecordData {
     status: "not-attempted" | "closed" | "failed";
     error?: string;
   };
-  diagnostics?: { output?: string; truncated?: boolean };
+  diagnostics?: {
+    operation?: string;
+    message?: string;
+    exitCode?: number | null;
+    signal?: string;
+    stdout?: string;
+    stderr?: string;
+    output?: string;
+    truncated?: boolean;
+  };
   ownership?: { token: string; fingerprint: string };
+}
+
+interface FailureDiagnostic {
+  operation: string;
+  message: string;
+  exitCode?: number | null;
+  signal?: string;
+  stdout?: string;
+  stderr?: string;
+  truncated: boolean;
 }
 
 interface AttemptOwnership {
@@ -334,6 +353,109 @@ function boundedDiagnosticOutput(
     ),
     truncated,
   };
+}
+
+function singleLine(value: string, limit = 300): string {
+  return value.replace(/\s+/g, " ").trim().slice(0, limit);
+}
+
+function failureDiagnostic(error: unknown): FailureDiagnostic {
+  const details =
+    error instanceof FlowError ? (error.details ?? {}) : undefined;
+  const stdout =
+    typeof details?.stdout === "string"
+      ? boundedDiagnosticOutput(details.stdout).output
+      : undefined;
+  const stderr =
+    typeof details?.stderr === "string"
+      ? boundedDiagnosticOutput(details.stderr).output
+      : undefined;
+  const message = singleLine(
+    error instanceof Error ? error.message : String(error),
+    1_000,
+  );
+  return {
+    operation:
+      typeof details?.operation === "string" && details.operation.length > 0
+        ? details.operation
+        : "worker execution",
+    message,
+    ...(typeof details?.exitCode === "number"
+      ? { exitCode: details.exitCode }
+      : {}),
+    ...(typeof details?.signal === "string" && details.signal.length > 0
+      ? { signal: details.signal }
+      : {}),
+    ...(stdout === undefined ? {} : { stdout }),
+    ...(stderr === undefined ? {} : { stderr }),
+    truncated:
+      details?.stdoutTruncated === true ||
+      details?.stderrTruncated === true ||
+      (typeof details?.stdout === "string" &&
+        Buffer.byteLength(details.stdout, "utf8") > maxDiagnosticBytes) ||
+      (typeof details?.stderr === "string" &&
+        Buffer.byteLength(details.stderr, "utf8") > maxDiagnosticBytes),
+  };
+}
+
+function failureReason(diagnostic: FailureDiagnostic): string {
+  return singleLine(`${diagnostic.operation}: ${diagnostic.message}`);
+}
+
+function workerFailureDetails(
+  ticketId: string,
+  recordPath: string,
+  diagnostic: FailureDiagnostic,
+  error: unknown,
+): Record<string, unknown> {
+  const details = error instanceof FlowError ? (error.details ?? {}) : {};
+  const stderrFirstLine =
+    typeof details.stderrFirstLine === "string"
+      ? singleLine(details.stderrFirstLine)
+      : diagnostic.stderr === undefined
+        ? undefined
+        : diagnostic.stderr
+            .split(/\r?\n/)
+            .map((line) => singleLine(line))
+            .find((line) => line.length > 0);
+  return {
+    ticketId,
+    executionPath: recordPath,
+    operation: diagnostic.operation,
+    message: diagnostic.message,
+    failureReason: failureReason(diagnostic),
+    ...(diagnostic.exitCode === undefined
+      ? {}
+      : { exitCode: diagnostic.exitCode }),
+    ...(diagnostic.signal === undefined ? {} : { signal: diagnostic.signal }),
+    ...(stderrFirstLine === undefined ? {} : { stderrFirstLine }),
+  };
+}
+
+function enrichWorkerFailure(
+  error: unknown,
+  ticketId: string,
+  recordPath: string,
+  diagnostic: FailureDiagnostic,
+): FlowError {
+  if (error instanceof FlowError)
+    return new FlowError(error.message, error.exitCode, error.code, {
+      ...(error.details ?? {}),
+      workerFailure: workerFailureDetails(
+        ticketId,
+        recordPath,
+        diagnostic,
+        error,
+      ),
+    });
+  return new FlowError(diagnostic.message, 1, "WORKER_EXECUTION_FAILED", {
+    workerFailure: workerFailureDetails(
+      ticketId,
+      recordPath,
+      diagnostic,
+      error,
+    ),
+  });
 }
 
 async function writeOwnership(path: string, ownership: AttemptOwnership) {
@@ -762,8 +884,17 @@ function executionReference(
   ticketId: string,
   attemptId: string,
   recordPath: string,
+  failureReasonValue?: string,
 ) {
-  return { executionId, ticketId, attemptId, path: recordPath };
+  return {
+    executionId,
+    ticketId,
+    attemptId,
+    path: recordPath,
+    ...(failureReasonValue === undefined
+      ? {}
+      : { failureReason: failureReasonValue }),
+  };
 }
 
 async function assertReadyRun(
@@ -856,38 +987,92 @@ async function recordFailure(
   record: ExecutionRecordData,
   error: unknown,
   dependencies: RunDependencies,
-): Promise<void> {
-  const failure = error instanceof Error ? error.message : String(error);
+): Promise<FailureDiagnostic> {
+  const diagnostic = failureDiagnostic(error);
+  const reason = failureReason(diagnostic);
   const failed = {
     ...record,
     status: "failed" as const,
+    diagnostics: diagnostic,
     timestamps: {
       ...record.timestamps,
       finalizedAt: new Date().toISOString(),
     },
   };
   await writeExecution(recordPath, failed).catch(() => undefined);
-  await mutateExecutionState(
-    repository,
-    runId,
-    "worker.attempt.failed",
-    {
-      executionId: record.executionId,
-      ticketId: record.ticketId,
-      attemptId: record.attemptId,
-      error: failure,
-    },
-    () => ({
+  const current = await inspectRun(repository, runId).catch(() => undefined);
+  if (current === undefined) return diagnostic;
+  const lock = await acquireRunLock(repository, runId, dependencies).catch(
+    () => undefined,
+  );
+  if (lock === undefined) return diagnostic;
+  const updateFailureSnapshot = (snapshot: StateSnapshot) => {
+    const tickets = snapshot.tickets;
+    return {
+      ...(tickets?.[record.ticketId] === undefined
+        ? {}
+        : {
+            tickets: {
+              ...tickets,
+              [record.ticketId]: {
+                ...tickets[record.ticketId],
+                status: "active" as const,
+              },
+            },
+          }),
       lastExecution: executionReference(
         record.executionId,
         record.ticketId,
         record.attemptId,
         recordPath,
+        reason,
       ),
       activeExecution: undefined,
-    }),
-    dependencies,
-  ).catch(() => undefined);
+    };
+  };
+  try {
+    const failedRun = await mutateRun(
+      {
+        repository,
+        runId,
+        event: "checkpoint",
+        preserveLifecycle: true,
+        historyEventType: "worker.attempt.failed",
+        data: {
+          executionId: record.executionId,
+          ticketId: record.ticketId,
+          attemptId: record.attemptId,
+          failureReason: reason,
+        },
+        updateSnapshot: updateFailureSnapshot,
+        lock,
+      },
+      dependencies,
+    );
+    await mutateRun(
+      {
+        repository,
+        runId,
+        event: failedRun.snapshot.phase === "blocked" ? "checkpoint" : "block",
+        preserveLifecycle: failedRun.snapshot.phase === "blocked",
+        historyEventType: "workflow.ticket.blocked",
+        data: {
+          executionId: record.executionId,
+          ticketId: record.ticketId,
+          attemptId: record.attemptId,
+          failureReason: reason,
+        },
+        updateSnapshot: updateFailureSnapshot,
+        lock,
+      },
+      dependencies,
+    );
+  } catch {
+    // The failed Execution record remains the source of evidence if state publication is interrupted.
+  } finally {
+    await releaseRunLock(lock).catch(() => undefined);
+  }
+  return diagnostic;
 }
 
 function attemptNumber(attemptId: string): number {
@@ -1382,6 +1567,7 @@ async function updateAttemptOutcome(
                 ticketId,
                 attemptId,
                 recordPath,
+                singleLine(reason),
               ),
             }),
         activeExecution: undefined,
@@ -2077,12 +2263,6 @@ export async function executeWorker(
 
   const callerPaneId =
     process.env.HERDR_PANE_ID ?? process.env.HERDR_ACTIVE_PANE_ID;
-  if (!callerPaneId)
-    throw executionError(
-      "Worker execution requires a genuine Herdr-managed caller pane (HERDR_PANE_ID)",
-      "HERDR_CONTEXT_REQUIRED",
-      3,
-    );
   const agentName = normalizeAgentName(
     `${ticket.id}-${attempt!.id}-${options.runId}`,
   );
@@ -2090,6 +2270,12 @@ export async function executeWorker(
   let handle: HerdrExecutionHandle | undefined;
   const attemptClaim = await acquireAttemptClaim(attempt!.artifacts.claim);
   try {
+    if (!callerPaneId)
+      throw executionError(
+        "Worker execution requires a genuine Herdr-managed caller pane (HERDR_PANE_ID)",
+        "HERDR_CONTEXT_REQUIRED",
+        3,
+      );
     const version = await adapter.version();
     execution = {
       ...execution!,
@@ -2305,6 +2491,31 @@ export async function executeWorker(
       snapshot: accepted.snapshot,
     };
   } catch (error) {
+    const details = error instanceof FlowError ? (error.details ?? {}) : {};
+    const paneId =
+      typeof details.paneId === "string" ? details.paneId : undefined;
+    if (paneId !== undefined && callerPaneId !== undefined) {
+      execution.herdr = {
+        ...(execution.herdr ?? {
+          callerPaneId,
+          agentName,
+        }),
+        callerPaneId,
+        paneId,
+        agentName,
+      };
+      if (details.cleanupStatus === "failed") {
+        execution.cleanup = {
+          status: "failed",
+          error:
+            typeof details.cleanupError === "string"
+              ? details.cleanupError
+              : "Herdr pane cleanup failed",
+        };
+      } else if (details.cleanupStatus === "closed") {
+        execution.cleanup = { status: "closed" };
+      }
+    }
     if (handle && !execution!.cleanup) {
       try {
         await adapter.close(handle);
@@ -2319,7 +2530,7 @@ export async function executeWorker(
         };
       }
     }
-    await recordFailure(
+    const diagnostic = await recordFailure(
       repository,
       options.runId,
       attempt!.artifacts.record,
@@ -2327,7 +2538,12 @@ export async function executeWorker(
       error,
       dependencies,
     );
-    throw error;
+    throw enrichWorkerFailure(
+      error,
+      ticket.id,
+      attempt!.artifacts.record,
+      diagnostic,
+    );
   } finally {
     await releaseAttemptClaim(attempt!.artifacts.claim, attemptClaim);
   }

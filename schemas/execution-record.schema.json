@@ -264,6 +264,36 @@
     "diagnostics": {
       "type": "object",
       "properties": {
+        "operation": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "exitCode": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "signal": {
+          "type": "string",
+          "minLength": 1
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        },
         "output": {
           "type": "string"
         },

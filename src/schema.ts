@@ -281,6 +281,7 @@ export const stateSnapshotSchema = z.looseObject({
       ticketId: z.string().min(1),
       attemptId: z.string().min(1),
       path: z.string().min(1),
+      failureReason: z.string().min(1).max(300).optional(),
     })
     .optional(),
   validation: validationStateSchema.optional(),
@@ -377,6 +378,12 @@ export const executionRecordSchema = z.looseObject({
     .optional(),
   diagnostics: z
     .looseObject({
+      operation: z.string().min(1).optional(),
+      message: z.string().min(1).optional(),
+      exitCode: z.int().nullable().optional(),
+      signal: z.string().min(1).optional(),
+      stdout: z.string().optional(),
+      stderr: z.string().optional(),
       output: z.string().optional(),
       truncated: z.boolean().optional(),
     })

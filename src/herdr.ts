@@ -120,7 +120,14 @@ export interface HerdrSmokeReport {
 function bounded(value: string, limit: number): string {
   if (Buffer.byteLength(value, "utf8") <= limit) return value;
   const bytes = Buffer.from(value, "utf8");
-  return `…${bytes.subarray(Math.max(0, bytes.length - limit + 3)).toString("utf8")}`;
+  return bytes.subarray(Math.max(0, bytes.length - limit)).toString("utf8");
+}
+
+function firstNonEmptyLine(value: string): string | undefined {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(/\s+/g, " "))
+    .find((line) => line.length > 0);
 }
 
 const defaultRunner: HerdrCommandRunner = async (
@@ -224,6 +231,17 @@ function invocationError(
       operation,
       exitCode: result.exitCode,
       stderr: bounded(result.stderr, maxDiagnosticBytes),
+      stdout: bounded(result.stdout, maxDiagnosticBytes),
+      stderrTruncated:
+        Buffer.byteLength(result.stderr, "utf8") > maxDiagnosticBytes,
+      stdoutTruncated:
+        Buffer.byteLength(result.stdout, "utf8") > maxDiagnosticBytes,
+      ...(firstNonEmptyLine(result.stderr) === undefined
+        ? {}
+        : {
+            stderrFirstLine: firstNonEmptyLine(result.stderr)!.slice(0, 300),
+          }),
+      ...(result.signal === undefined ? {} : { signal: result.signal }),
       ...(transport === undefined ? {} : { transport }),
       arguments: safeArguments(args),
     },
@@ -514,12 +532,31 @@ export class HerdrAdapter {
     try {
       await this.start(handle, startupTimeoutMs);
     } catch (error) {
-      try {
-        await this.close(handle);
-      } catch {
-        // Preserve the startup failure; callers still have the owned handle.
-      }
-      throw error;
+      const cleanupFailure = await this.close(handle).catch(
+        (cleanupError: unknown) => cleanupError,
+      );
+      const primary =
+        error instanceof FlowError
+          ? error
+          : new FlowError(
+              error instanceof Error ? error.message : String(error),
+              1,
+              "HERDR_INVOCATION_ERROR",
+            );
+      throw new FlowError(primary.message, primary.exitCode, primary.code, {
+        ...(primary.details ?? {}),
+        paneId: handle.paneId,
+        agentName: handle.agentName,
+        ...(cleanupFailure === undefined
+          ? { cleanupStatus: "closed" }
+          : {
+              cleanupStatus: "failed",
+              cleanupError:
+                cleanupFailure instanceof Error
+                  ? cleanupFailure.message
+                  : String(cleanupFailure),
+            }),
+      });
     }
     return handle;
   }
