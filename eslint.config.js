@@ -7,4 +7,17 @@ export default tseslint.config(
   },
   eslint.configs.recommended,
   tseslint.configs.recommended,
+  {
+    files: ["plugins/**/*.mjs"],
+    languageOptions: {
+      globals: {
+        clearInterval: "readonly",
+        process: "readonly",
+        setInterval: "readonly",
+      },
+    },
+    rules: {
+      "no-control-regex": "off",
+    },
+  },
 );

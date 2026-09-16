@@ -1,0 +1,14 @@
+id = "coding-orchestrator.status"
+name = "Coding Workflow Status"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Read-only status board for a Coding Workflow Orchestrator run"
+platforms = ["linux", "macos", "windows"]
+
+[[panes]]
+id = "status"
+title = "Coding Workflow Status"
+placement = "popup"
+width = "80%"
+height = 28
+command = ["node", "status.mjs"]
