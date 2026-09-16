@@ -379,18 +379,19 @@ Następujące elementy są świadomie odłożone:
 - visual regression baselines;
 - dowolne pluginy lub ogólny workflow DSL;
 - automatyczne odpowiadanie na blockery.
-- lepsza diagnostyka technicznych awarii Worker attempt, opisana poniżej.
 
-## Następne usprawnienie — diagnostyka awarii Workera
+## Phase 9 — diagnostyka awarii Workera
 
-Rozszerzyć istniejący model bez tworzenia osobnego systemu logów:
+**Zakończona 2026-09-14.** Execution record is now persisted before the first Herdr operation and retains bounded technical failure evidence. A failed Worker attempt blocks the run without accepting the ticket, while the CLI reports the failed operation, available process outcome, a short stderr excerpt, and the durable record path. All 166 automated tests and the remaining Development gates passed. Live run `run_20260914T133659Z_abc670766af9` proved the behavior with a controlled `agent start` exit `23`: the pane closed, no checkpoint or marker was created, and the clean Feature worktree remained at base commit `db04fd9a21432965e3e2e4655b31774f6d0e1d51`. Detailed evidence is recorded in the [Phase 9 ticket](../.scratch/phase-9-bounded-worker-failure-diagnostics/issues/01-preserve-and-report-bounded-worker-failure-diagnostics.md#gate-evidence).
 
-- zapisać `execution.json` przed pierwszą operacją Herdr; jeśli sam zapis się nie
-  powiedzie, nie uruchamiać pane ani Workera;
-- rozszerzyć istniejące `diagnostics` o operację, komunikat, nullable exit code i
+Zaimplementowany model nie tworzy osobnego systemu logów:
+
+- zapisuje `execution.json` przed pierwszą operacją Herdr; jeśli sam zapis się
+  nie powiedzie, nie uruchamia pane ani Workera;
+- rozszerza istniejące `diagnostics` o operację, komunikat, nullable exit code i
   signal oraz końcowe 16 KiB każdego z `stdout` i `stderr`; wspólne `truncated`
   informuje o skróceniu;
-- zachować główną awarię w `diagnostics`, a ewentualną wtórną awarię zamknięcia
+- zachowuje główną awarię w `diagnostics`, a ewentualną wtórną awarię zamknięcia
   pane w istniejącym `cleanup.error`;
 - Worker attempt otrzymuje `failed`, Workflow run otrzymuje `blocked`, a ticket
   pozostaje niezaakceptowany;
@@ -398,12 +399,12 @@ Rozszerzyć istniejący model bez tworzenia osobnego systemu logów:
   krótki `failureReason`; `lastExecution.path` nadal wskazuje pełny rekord;
 - komunikat CLI podaje ticket, operację, exit code, najwyżej 300 znaków z
   pierwszej niepustej linii `stderr` oraz ścieżkę `execution.json`;
-- nie zapisywać pełnego promptu, environment variables, niesanitowanego argv ani
-  pełnego transcriptu. Nie dodawać redaktora sekretów do POC;
-- nie zmieniać reconciliation ani zasad retry: ponowienie pozostaje jawne;
-- zachować `schemaVersion: 1`, ponieważ nowe pola są opcjonalne.
+- nie zapisuje pełnego promptu, environment variables, niesanitowanego argv ani
+  pełnego transcriptu i nie dodaje redaktora sekretów do POC;
+- nie zmienia reconciliation ani zasad retry: ponowienie pozostaje jawne;
+- zachowuje `schemaVersion: 1`, ponieważ nowe pola są opcjonalne.
 
-Minimalny gate obejmuje trzy regresje: błąd `herdr agent start` utrwalony w
+Minimalny gate potwierdził trzy regresje: błąd `herdr agent start` utrwalony w
 `execution.json`, krótki powód i odnośnik utrwalone w stanie/historii oraz zwięzły
 komunikat CLI bez pełnego logu. Review findings i Review attention pozostają
 osobnym wynikiem świadomie zakończonego Workera, a nie diagnostyką technicznej

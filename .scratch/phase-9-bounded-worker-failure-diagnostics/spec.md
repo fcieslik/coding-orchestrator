@@ -1,6 +1,6 @@
 # Phase 9 — bounded Worker failure diagnostics
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ## Problem Statement
 
@@ -93,3 +93,7 @@ The CLI reports that the ticket was blocked because a named operation failed, in
 - The most important early-failure scenario is `herdr agent start` returning before a complete owned-agent handle exists. The prewritten Execution record supplies the durable anchor even when no successful launch callback occurs.
 - “Worker attempt failed” and “Workflow run blocked” are deliberately different statements: the first describes a technical execution outcome, while the second says that user-controlled workflow progression has stopped safely.
 - Better diagnostics should shorten the user's path to the next action; they must not make terminal output a second workflow protocol.
+
+## Completion evidence
+
+Completed on 2026-09-14. All 166 automated tests and the lint, typecheck, format, schema, and build gates passed. Live run `run_20260914T133659Z_abc670766af9` then proved a controlled real-Herdr `agent start` failure is persisted in the Execution record, reported concisely to the user, blocks the run without accepting the ticket, and closes the owned pane. Detailed evidence is recorded in the [Phase 9 ticket](issues/01-preserve-and-report-bounded-worker-failure-diagnostics.md#gate-evidence).
