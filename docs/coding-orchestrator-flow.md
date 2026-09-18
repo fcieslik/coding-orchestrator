@@ -146,9 +146,26 @@ Agent renderer potrafi zmienić logiczne `implement` na składnię danego agenta
 | ----------- | ----------------------- |
 | Codex       | `$implement <ticket>`   |
 | Claude Code | `/implement <ticket>`   |
-| Pi          | `/implement <ticket>`   |
+| Pi          | `/skill:implement <ticket>` |
 
 Prompt zawiera tylko przydział pracy, kontekst i Orchestration contract. Nie powiela metodologii należącej do `$implement`.
+
+Agent profile selection lives in the Target repository's `.orchestrator/config.yaml`. The profile can provide only the small set of per-run overrides that the adapter needs; agent-native configuration remains the default:
+
+```yaml
+agents:
+  pi-openai:
+    kind: pi
+    provider: openai
+    model: gpt-5.6-luna
+
+roles:
+  worker:
+    agent: pi-openai
+    skill: implement
+```
+
+When `provider` or `model` is absent, Pi or Claude Code uses its own native configuration. The Orchestrator does not install or synchronize downstream skills between agent-specific skill directories.
 
 > [!IMPORTANT]
 > Live Worker V1 obsługuje obecnie wyłącznie profil Codex. Renderowanie składni Claude Code i Pi jest przygotowane i testowane, ale adapter uruchamiający te agent profiles nie został jeszcze zaimplementowany.

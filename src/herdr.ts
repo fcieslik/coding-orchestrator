@@ -12,6 +12,7 @@ const defaultSettlementTimeoutMs = 120_000;
 const defaultReadTimeoutMs = 30_000;
 const defaultCloseTimeoutMs = 30_000;
 const maxDiagnosticBytes = 16_384;
+const agentStartupPollDelayMs = 100;
 
 export type HerdrLifecycleState =
   "working" | "idle" | "done" | "blocked" | "unknown";
@@ -171,6 +172,22 @@ function protocolError(operation: string, message: string): FlowError {
     1,
     "HERDR_PROTOCOL_ERROR",
     { operation, message },
+  );
+}
+
+function isTransientAgentStartupError(error: unknown): boolean {
+  if (!(error instanceof FlowError) || error.code !== "HERDR_INVOCATION_ERROR")
+    return false;
+  const stderr = error.details?.stderr;
+  return typeof stderr === "string" && stderr.includes("agent_not_ready");
+}
+
+function isPendingAgentLookup(error: unknown): boolean {
+  if (!(error instanceof FlowError) || error.code !== "HERDR_INVOCATION_ERROR")
+    return false;
+  const stderr = error.details?.stderr;
+  return (
+    typeof stderr === "string" && /agent_not_found|agent_not_ready/.test(stderr)
   );
 }
 
@@ -430,22 +447,68 @@ export class HerdrAdapter {
     const childArguments = validateChildAgentArguments(
       handle.childArguments ?? [],
     );
-    const result = await this.invoke(
-      "agent start",
-      [
-        "agent",
-        "start",
-        handle.agentName,
-        "--kind",
-        handle.agentKind,
-        "--pane",
-        handle.paneId,
-        "--timeout",
-        String(timeoutMs),
-        ...(childArguments.length > 0 ? ["--", ...childArguments] : []),
-      ],
-      timeoutMs,
-    );
+    const args = [
+      "agent",
+      "start",
+      handle.agentName,
+      "--kind",
+      handle.agentKind,
+      "--pane",
+      handle.paneId,
+      "--timeout",
+      String(timeoutMs),
+      ...(childArguments.length > 0 ? ["--", ...childArguments] : []),
+    ];
+    const startedAt = Date.now();
+    let result: HerdrCommandResult;
+    try {
+      result = await this.invoke("agent start", args, timeoutMs);
+    } catch (error) {
+      if (!isTransientAgentStartupError(error)) throw error;
+      let lastObservedState: HerdrObservedState | undefined;
+      while (Date.now() - startedAt < timeoutMs) {
+        const remaining = timeoutMs - (Date.now() - startedAt);
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(agentStartupPollDelayMs, remaining)),
+        );
+        let observed: HerdrCommandResult;
+        try {
+          observed = await this.invoke(
+            "agent get",
+            ["agent", "get", handle.paneId],
+            Math.max(1, timeoutMs - (Date.now() - startedAt)),
+          );
+        } catch (lookupError) {
+          if (isPendingAgentLookup(lookupError)) continue;
+          throw lookupError;
+        }
+        const parsed = parseJson("agent get", observed.stdout);
+        const observedName = stringField(
+          parsed,
+          ["result", "agent", "name"],
+          ["result", "agent", "agent_name"],
+        );
+        const observedPane = stringField(
+          parsed,
+          ["result", "agent", "pane_id"],
+          ["result", "agent", "paneId"],
+        );
+        if (observedName !== handle.agentName || observedPane !== handle.paneId)
+          throw protocolError("agent get", "returned an unexpected agent");
+        const observedState = lifecycleField(parsed);
+        if (observedState === "idle" || observedState === "done")
+          return observedState;
+        lastObservedState = observedState;
+      }
+      if (lastObservedState === "blocked")
+        throw new FlowError(
+          "Herdr agent remained blocked during startup",
+          1,
+          "HERDR_STARTUP_BLOCKED",
+          { operation: "agent start", paneId: handle.paneId },
+        );
+      throw error;
+    }
     const parsed = parseJson("agent start", result.stdout);
     const returnedName = stringField(
       parsed,

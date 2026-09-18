@@ -96,3 +96,29 @@ dopiero potem kolejka, DAG i YAML
 Największy stosunek wartości do kosztu mają teraz: diagnostyka, cleanup i prostszy UX. Scheduler, DAG i DSL zostawiłbym zdecydowanie na później.
 
 Aktualna lista odłożonych elementów znajduje się w roadmapie od Phase 5 (docs/coding-orchestrator-roadmap-phase-5-onward.md).
+
+16. czasami status orchestratora wymaga recznego usuwania run bo cos sie zepsuło, cos nie uruchomiło
+    trzeba przygotowac instrukcje lub skrypty jak to naprawic, tak zeby orchestrator lub inny główny agent (nie worker!) mogli to naprawiac!
+
+• Mogę utworzyć nowy pakiet/run, ale jest ważna konsekwencja:
+
+- main jest obecnie na 5f3610b — nie zawiera implementacji ticketów 02/03/04.
+- Implementacja znajduje się tylko w starym worktree:
+  - ticket 02: 84fbeec
+  - ticket 03: 5109fe3
+  - ticket 04: 77ee146
+  - korekta dokumentacji: 7c95fa5
+
+- Stary run jest zablokowany, więc orchestrator nie może użyć tych commitów jako
+  zaakceptowanego checkpointu.
+
+Nowy run z main oznaczałby ponowne wykonanie ticketów 02 → 03 → 04.
+
+Wybierz proszę:
+
+1. Utworzyć nowy pakiet/run i powtórzyć implementację 02–04 od aktualnego main —
+   bezpieczna ścieżka orchestratora.
+
+2. Ręcznie zintegrować istniejący branch orchestrator/
+   run_20260918T075945Z_4d5a3899f2e0 z main — szybciej, ale omija zablokowaną
+   akceptację orchestratora.

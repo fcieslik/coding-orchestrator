@@ -286,6 +286,32 @@ test.each([
   );
 });
 
+test("uses the plugin pane cwd when Herdr omits JSON context", async () => {
+  const repository = await targetRepository();
+  await createWorkflowStatus(repository);
+  const result = await invokePlugin(repository, {
+    HERDR_PLUGIN_CONTEXT_JSON: "",
+  });
+
+  expect(result.stdout).toContain("Package: feature/status-ui");
+  expect(result.stdout).toContain("Read-only panel. Press q or Esc to close.");
+});
+
+test("resolves Herdr's flat plugin context shape", async () => {
+  const repository = await targetRepository();
+  await createWorkflowStatus(repository);
+  const result = await invokePlugin(repository, {
+    HERDR_PLUGIN_CONTEXT_JSON: JSON.stringify({
+      workspace_id: "workspace:test",
+      workspace_cwd: repository,
+      focused_pane_id: "w:test:p1",
+      focused_pane_cwd: repository,
+    }),
+  });
+
+  expect(result.stdout).toContain("Package: feature/status-ui");
+});
+
 test("reports ambiguous public run selection without guessing", async () => {
   const repository = await targetRepository();
   await createWorkflowStatusWithId(

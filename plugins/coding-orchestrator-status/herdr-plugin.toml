@@ -8,7 +8,5 @@ platforms = ["linux", "macos", "windows"]
 [[panes]]
 id = "status"
 title = "Coding Workflow Status"
-placement = "popup"
-width = "80%"
-height = 28
-command = ["node", "status.mjs"]
+placement = "split"
+command = ["node", "--input-type=module", "-e", "import(process.env.HERDR_PLUGIN_ROOT + '/status.mjs')"]

@@ -72,6 +72,146 @@ test("agent prompt reads the Herdr 0.8.2 agent_status field", async () => {
   ).resolves.toBe("done");
 });
 
+test("agent startup observes Herdr's transient not-ready response", async () => {
+  let starts = 0;
+  let observations = 0;
+  const runner: HerdrCommandRunner = async (_executable, args) => {
+    if (args[0] === "agent" && args[1] === "start") {
+      starts += 1;
+      return {
+        stdout: "",
+        stderr:
+          '{"error":{"code":"agent_not_ready","message":"agent is blocked during startup"}}',
+        exitCode: 1,
+      };
+    }
+    if (args[0] === "agent" && args[1] === "get") {
+      observations += 1;
+      return {
+        stdout: JSON.stringify({
+          result: {
+            agent: {
+              agent: "codex",
+              name: "startup-retry",
+              pane_id: "w1:p2",
+              agent_status: observations === 1 ? "blocked" : "idle",
+            },
+          },
+        }),
+        stderr: "",
+        exitCode: 0,
+      };
+    }
+    throw new Error(`unexpected args: ${args.join(" ")}`);
+  };
+  const adapter = new HerdrAdapter({ runner });
+
+  await expect(
+    adapter.start(
+      {
+        paneId: "w1:p2",
+        agentName: "startup-retry",
+        agentKind: "codex",
+        cwd: "/target",
+      },
+      500,
+    ),
+  ).resolves.toBe("idle");
+  expect(starts).toBe(1);
+  expect(observations).toBe(2);
+});
+
+test("agent startup observes a spawned agent after not-ready instead of starting it twice", async () => {
+  let starts = 0;
+  const runner: HerdrCommandRunner = async (_executable, args) => {
+    if (args[0] === "agent" && args[1] === "start") {
+      starts += 1;
+      return {
+        stdout: "",
+        stderr:
+          starts === 1
+            ? '{"error":{"code":"agent_not_ready","message":"agent is blocked during startup"}}'
+            : '{"error":{"code":"agent_name_taken","message":"agent name startup-observe is already used"}}',
+        exitCode: 1,
+      };
+    }
+    if (args[0] === "agent" && args[1] === "get")
+      return {
+        stdout: JSON.stringify({
+          result: {
+            agent: {
+              agent: "codex",
+              name: "startup-observe",
+              pane_id: "w1:p2",
+              agent_status: "idle",
+            },
+          },
+        }),
+        stderr: "",
+        exitCode: 0,
+      };
+    throw new Error(`unexpected args: ${args.join(" ")}`);
+  };
+  const adapter = new HerdrAdapter({ runner });
+
+  await expect(
+    adapter.start(
+      {
+        paneId: "w1:p2",
+        agentName: "startup-observe",
+        agentKind: "codex",
+        cwd: "/target",
+      },
+      500,
+    ),
+  ).resolves.toBe("idle");
+  expect(starts).toBe(1);
+});
+
+test("agent startup reports a persistently blocked owned agent without restarting it", async () => {
+  let starts = 0;
+  const runner: HerdrCommandRunner = async (_executable, args) => {
+    if (args[0] === "agent" && args[1] === "start") {
+      starts += 1;
+      return {
+        stdout: "",
+        stderr: '{"error":{"code":"agent_not_ready"}}',
+        exitCode: 1,
+      };
+    }
+    if (args[0] === "agent" && args[1] === "get")
+      return {
+        stdout: JSON.stringify({
+          result: {
+            agent: {
+              agent: "codex",
+              name: "startup-blocked",
+              pane_id: "w1:p2",
+              agent_status: "blocked",
+            },
+          },
+        }),
+        stderr: "",
+        exitCode: 0,
+      };
+    throw new Error(`unexpected args: ${args.join(" ")}`);
+  };
+  const adapter = new HerdrAdapter({ runner });
+
+  await expect(
+    adapter.start(
+      {
+        paneId: "w1:p2",
+        agentName: "startup-blocked",
+        agentKind: "codex",
+        cwd: "/target",
+      },
+      250,
+    ),
+  ).rejects.toMatchObject({ code: "HERDR_STARTUP_BLOCKED" });
+  expect(starts).toBe(1);
+});
+
 test("agent read returns the Herdr CLI text response", async () => {
   const runner: HerdrCommandRunner = async () => ({
     stdout: "HERDR_PHASE3_SMOKE_OK\n/target\n",

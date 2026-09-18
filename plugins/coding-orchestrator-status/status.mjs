@@ -73,6 +73,7 @@ function contextWorkspace(context) {
 function contextWorkspaceId(context) {
   return (
     stringValue(process.env.HERDR_WORKSPACE_ID) ??
+    stringValue(context?.workspace_id) ??
     stringValue(contextWorkspace(context)?.workspace_id) ??
     stringValue(contextWorkspace(context)?.id)
   );
@@ -97,6 +98,8 @@ function contextRepository(context) {
     worktree?.repository_path,
     context?.repository,
     context?.repository_path,
+    context?.workspace_repository,
+    context?.workspace_repository_path,
   ]
     .map(pathCandidate)
     .filter((value) => value !== undefined);
@@ -104,7 +107,14 @@ function contextRepository(context) {
   if (uniqueExplicitPaths.length > 1) return undefined;
   if (uniqueExplicitPaths.length === 1) return uniqueExplicitPaths[0];
 
-  const workspacePaths = [workspace?.cwd, workspace?.path, workspace?.root]
+  const workspacePaths = [
+    workspace?.cwd,
+    workspace?.path,
+    workspace?.root,
+    context?.workspace_cwd,
+    context?.workspace_path,
+    context?.workspace_root,
+  ]
     .map(pathCandidate)
     .filter((value) => value !== undefined);
   const uniqueWorkspacePaths = [...new Set(workspacePaths)];
@@ -118,7 +128,12 @@ function contextRepository(context) {
   if (uniqueWorktreePaths.length > 1) return undefined;
   if (uniqueWorktreePaths.length === 1) return uniqueWorktreePaths[0];
 
-  const panePaths = [focusedPane?.cwd, focusedPane?.path]
+  const panePaths = [
+    focusedPane?.cwd,
+    focusedPane?.path,
+    context?.focused_pane_cwd,
+    context?.focused_pane_path,
+  ]
     .map(pathCandidate)
     .filter((value) => value !== undefined);
   const uniquePanePaths = [...new Set(panePaths)];
@@ -172,7 +187,11 @@ function structuredError(result) {
 
 async function readStatus() {
   const context = contextObject();
-  const repository = contextRepository(context);
+  // Herdr 0.8.2 does not inject HERDR_PLUGIN_CONTEXT_JSON into plugin panes.
+  // The pane cwd is the explicit Target context supplied when opening the pane.
+  const repository = context
+    ? contextRepository(context)
+    : pathCandidate(process.cwd());
   const workspaceId = contextWorkspaceId(context);
   if (!repository) {
     return {

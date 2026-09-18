@@ -81,7 +81,7 @@ The workflow responsibility assigned to one agent execution: `worker`, `reviewer
 _Avoid_: Agent, skill
 
 **Agent profile**:
-The configured agent executable and launch settings used to perform an Execution role.
+The configured agent kind, executable, and minimal launch settings used to perform an Execution role. Provider, model, trust, and session choices remain the selected agent's own configuration.
 _Avoid_: Execution role, downstream engineering skill
 
 **Downstream engineering skill**:

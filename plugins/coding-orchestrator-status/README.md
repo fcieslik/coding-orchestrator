@@ -1,8 +1,9 @@
 # Coding Workflow Status Herdr plugin
 
 This is a local, read-only Herdr plugin for the Coding Workflow Orchestrator. It
-opens one terminal popup, reads the public `flow status --json` contract, and
-refreshes the display about once per second while the popup is open. It does
+opens one terminal pane beside the current pane, reads the public
+`flow status --json` contract, and refreshes the display about once per second
+while the status pane is open. It does
 not read `.orchestrator/runs` itself and has no workflow mutation commands.
 
 ## Link and open
@@ -13,7 +14,7 @@ directory from the development checkout:
 ```sh
 pnpm build
 herdr plugin link /path/to/coding-orchestrator/plugins/coding-orchestrator-status
-herdr plugin pane open --plugin coding-orchestrator.status --entrypoint status --placement popup
+herdr plugin pane open --plugin coding-orchestrator.status --entrypoint status --placement split
 ```
 
 The pane uses the repository associated with the Herdr invocation context. It
@@ -51,7 +52,7 @@ metadata rejection or missing Herdr CLI never affects the Workflow run.
 
 ## Close and troubleshoot
 
-Press `q` or `Esc` in the popup, or close the containing Herdr pane. Closing the
+Press `q` or `Esc` in the status pane, or close that pane. Closing the
 panel only stops its refresh loop; it does not close agents or alter workflow or
 Git state.
 

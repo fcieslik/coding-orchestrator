@@ -92,3 +92,13 @@ Worker and reviewer prompts are skill-aware wrappers, not standalone engineering
 Agent-specific skill syntax belongs to the agent renderer, not workflow semantics. For Codex, render a logical skill name as `$skill-name`; state and workflow logic retain the logical name only.
 
 Herdr transports an already-rendered prompt unchanged. It launches, prompts, waits for, reads, and closes agent processes without constructing or interpreting skill, ticket, review, or result semantics.
+
+## Optional Herdr status pane
+
+The separate, read-only `coding-orchestrator.status` plugin displays the current Workflow run in a persistent split pane. Neither `$orchestrate` nor `flow orchestrate` opens it automatically. When the user wants the display, open it from a Herdr shell pane in the Target repository after the plugin has been linked and enabled:
+
+```sh
+herdr plugin pane open --plugin coding-orchestrator.status --entrypoint status --placement split --cwd "$PWD"
+```
+
+The pane refreshes while open; `q` or `Esc` closes it without changing the Workflow run or Worker. The local plugin package is at `plugins/coding-orchestrator-status` in the Development repository. Do not start or retry a Workflow step merely to display status.

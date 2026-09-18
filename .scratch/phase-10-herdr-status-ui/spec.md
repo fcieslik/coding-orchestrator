@@ -12,9 +12,9 @@ The user works inside Herdr and wants this information available there in a conc
 
 Provide a small local Herdr plugin that presents the current Coding Workflow Orchestrator status inside Herdr.
 
-The plugin exposes an on-demand terminal popup or overlay. It resolves the Target repository from the Herdr invocation context, queries the Orchestrator through its existing public status command, and renders a compact board containing the Workflow package, Workflow run, Run phase, ticket progress, current or next ticket, validation state, Delivery result, Review attention, and the latest bounded failure reason when present.
+The plugin exposes a persistent terminal pane beside the current pane. It resolves the Target repository from the Herdr invocation context, queries the Orchestrator through its existing public status command, and renders a compact board containing the Workflow package, Workflow run, Run phase, ticket progress, current or next ticket, validation state, Delivery result, Review attention, and the latest bounded failure reason when present.
 
-While the panel is open, it refreshes at a small fixed interval and publishes a compact subset of the same information as Herdr workspace metadata for display in the sidebar. The metadata expires after the reporter stops refreshing it, preventing stale status from appearing authoritative.
+While the pane is open, it refreshes at a small fixed interval and publishes a compact subset of the same information as Herdr workspace metadata for display in the sidebar. The metadata expires after the reporter stops refreshing it, preventing stale status from appearing authoritative.
 
 The plugin never mutates workflow state. Durable Orchestrator artifacts remain the only source of truth; the plugin is only a presentation layer.
 
@@ -46,7 +46,7 @@ The plugin never mutates workflow state. Durable Orchestrator artifacts remain t
 24. As a maintainer, I want workflow semantics to remain independent from the plugin, so that a missing or broken UI cannot block implementation.
 25. As a maintainer, I want one small terminal renderer instead of a frontend framework, so that the POC remains easy to understand and maintain.
 26. As a maintainer, I want one public integration seam for automated tests, so that behavior is verified without coupling tests to rendering helpers.
-27. As a maintainer, I want a real Herdr smoke test before declaring the feature complete, so that manifest linking, context resolution, popup rendering, and metadata reporting are proven together.
+27. As a maintainer, I want a real Herdr smoke test before declaring the feature complete, so that manifest linking, context resolution, pane rendering, and metadata reporting are proven together.
 
 ## Implementation Decisions
 
@@ -55,7 +55,7 @@ The plugin never mutates workflow state. Durable Orchestrator artifacts remain t
 - Use the existing public structured status command as the plugin's data source. Do not parse State snapshots, Execution records, validation results, or Operational history directly inside the plugin.
 - Resolve the Target repository from the Herdr plugin invocation context. Do not require the user to enter a repository path during ordinary use.
 - Follow existing run-selection semantics. If the public status command cannot resolve a run safely, render its concise error instead of selecting a run independently.
-- Declare one terminal pane entrypoint whose default presentation is a popup or overlay. Do not implement native non-terminal UI because Herdr plugin v1 does not provide that surface.
+- Declare one terminal pane entrypoint whose default presentation is a split beside the invoking pane. Do not implement native non-terminal UI because Herdr plugin v1 does not provide that surface.
 - Render a compact text board optimized for scanning rather than reproducing complete JSON. Show the package/run identity, phase, ticket progress, active or next ticket, validation, delivery, Review attention, and latest bounded failure reason only when those values exist.
 - Refresh the status at approximately one-second intervals only while the panel process is open. Do not introduce a persistent daemon, file watcher, background web server, or new event bus.
 - Publish compact workspace metadata from the same refresh loop for optional sidebar display. Use a small fixed token vocabulary for package, ticket, step, and progress.
@@ -64,7 +64,7 @@ The plugin never mutates workflow state. Durable Orchestrator artifacts remain t
 - Render semantic states consistently: pending work, active work, accepted work, Review attention, blocked technical execution, validation outcome, and Delivery outcome must remain distinct.
 - Prefer plain text and stable symbols that remain understandable without color. Color may enhance the display but cannot carry meaning by itself.
 - Bound all displayed diagnostic text. Show only the concise stored failure reason and artifact reference; never render full prompts, environment variables, unlimited process output, terminal transcripts, or hidden reasoning.
-- Provide an explicit close interaction and terminate cleanly when the containing popup or pane closes.
+- Provide an explicit close interaction and terminate cleanly when the status pane closes.
 - Keep plugin-owned settings minimal. The first version does not require a database, migrations, credentials, networking, or durable plugin state.
 - Package or link the plugin using Herdr's standard manifest workflow. Do not modify Herdr itself.
 - Keep the Installed skill and the status plugin independently usable: workflow commands work without the plugin, and the plugin reports a clear unavailable state when the Installed skill is missing.
@@ -81,7 +81,7 @@ The plugin never mutates workflow state. Durable Orchestrator artifacts remain t
 - Assert that metadata uses a TTL and that the plugin exits cleanly when the panel is closed.
 - Assert externally that viewing status does not change State snapshot revisions, Operational history, Git state, ticket state, validation results, or Delivery results.
 - Reuse the repository's existing temporary Git-repository and public CLI test patterns. Do not introduce a general terminal UI testing framework or a broad snapshot matrix.
-- After automated checks pass, perform one manual live smoke test in Herdr: link the local plugin, open it from a pane in a disposable Target repository, run one real ticket, observe the panel and sidebar before/during/after completion, close the panel, and verify the Workflow run is unchanged by inspection.
+- After automated checks pass, perform one manual live smoke test in Herdr: link the local plugin, open its split pane from a disposable Target repository, run one real ticket, observe the panel and sidebar before/during/after completion, close the panel, and verify the Workflow run is unchanged by inspection.
 
 ## Out of Scope
 
@@ -101,7 +101,7 @@ The plugin never mutates workflow state. Durable Orchestrator artifacts remain t
 ## Further Notes
 
 - Herdr plugins are executable workflow packages that can declare actions, event hooks, and terminal pane entrypoints. Herdr plugin v1 deliberately excludes native non-terminal plugin UI: [Herdr Plugins](https://herdr.dev/docs/plugins/).
-- Plugin panes may use popup, overlay, split, tab, or zoomed placement. Popup or overlay is appropriate for an on-demand status board: [Herdr Plugins — Panes](https://herdr.dev/docs/plugins/#panes).
+- Plugin panes may use popup, overlay, split, tab, or zoomed placement. Split keeps the status board visible beside the workflow terminal: [Herdr Plugins — Panes](https://herdr.dev/docs/plugins/#panes).
 - Herdr custom workspace metadata can expose compact tokens in configured sidebar rows. These values are presentation-only and support expiry: [Herdr Configuration — Sidebar row layouts](https://herdr.dev/docs/configuration/#sidebar-row-layouts).
 - Herdr startup hooks are one-shot initialization rather than supervised daemons. Limiting refresh to the open panel avoids inventing lifecycle management that Herdr plugin v1 does not provide: [Herdr Plugins — Startup hooks](https://herdr.dev/docs/plugins/#startup-hooks).
 - A future web dashboard should be reconsidered only when the product needs cross-repository aggregation, historical analytics, rich logs, remote access, or browser-based workflow controls.
