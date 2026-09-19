@@ -55,8 +55,27 @@ export const objectIdSchema = z.string().regex(/^[0-9a-f]{40,64}$/);
 
 export const gitWorktreeStatusSchema = z.enum(["planned", "ready", "removed"]);
 
+function isSafeAgentOverride(value: string): boolean {
+  if (!/^[A-Za-z0-9]/.test(value) || /\s/.test(value)) return false;
+  return [...value].every((character) => {
+    const codePoint = character.codePointAt(0)!;
+    return codePoint > 0x1f && codePoint !== 0x7f;
+  });
+}
+
+const agentOverrideSchema = z
+  .string()
+  .min(1)
+  .regex(/^[A-Za-z0-9][^\s]*$/)
+  .refine(isSafeAgentOverride, {
+    message:
+      "must be a single non-empty value without whitespace, control characters, or a leading dash",
+  });
+
 const agentProfileSchema = z.strictObject({
-  kind: z.literal("codex"),
+  kind: z.enum(["codex", "claude-code", "pi"]),
+  provider: agentOverrideSchema.optional(),
+  model: agentOverrideSchema.optional(),
 });
 
 const agentProfilesSchema = z

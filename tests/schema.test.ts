@@ -323,6 +323,58 @@ test("orchestration configuration validates worker contract and bounds", () => {
   ).toThrow();
 });
 
+test("orchestration configuration supports minimal native Agent profiles", () => {
+  const config = orchestrationConfigSchema.parse({
+    version: 1,
+    agents: {
+      codex: { kind: "codex" },
+      claude: { kind: "claude-code" },
+      "pi-openai": {
+        kind: "pi",
+        provider: "openai",
+        model: "gpt-5.6-luna",
+      },
+    },
+    roles: { worker: { agent: "pi-openai", skill: "implement" } },
+    workflow: { workerTimeoutSeconds: 1800, maxWorkerAttempts: 2 },
+  });
+
+  expect(config.agents).toEqual({
+    codex: { kind: "codex" },
+    claude: { kind: "claude-code" },
+    "pi-openai": {
+      kind: "pi",
+      provider: "openai",
+      model: "gpt-5.6-luna",
+    },
+  });
+});
+
+test("orchestration configuration rejects invalid Agent profile overrides", () => {
+  const base = {
+    version: 1,
+    agents: { pi: { kind: "pi" } },
+    roles: { worker: { agent: "pi", skill: "implement" } },
+    workflow: { workerTimeoutSeconds: 1800, maxWorkerAttempts: 2 },
+  };
+
+  for (const profile of [
+    { kind: "pi", provider: "" },
+    { kind: "pi", model: "model\nwith-newline" },
+    { kind: "pi", model: "--unsafe" },
+    { kind: "pi", provider: " openai" },
+    { kind: "pi", model: "gpt-5", unsupported: true },
+    { kind: "unknown" },
+  ]) {
+    expect(() =>
+      orchestrationConfigSchema.parse({
+        ...base,
+        agents: { pi: profile },
+      }),
+    ).toThrow();
+  }
+});
+
 test("orchestration configuration validates the optional five-check contract", () => {
   const base = {
     version: 1,
