@@ -17,6 +17,8 @@ const agentStartupPollDelayMs = 100;
 export type HerdrLifecycleState =
   "working" | "idle" | "done" | "blocked" | "unknown";
 
+export type HerdrAgentKind = "codex" | "claude" | "pi";
+
 export type HerdrTransportState =
   "settled" | "blocked" | "unknown" | "timed-out" | "disappeared";
 
@@ -39,7 +41,7 @@ export type HerdrCommandRunner = (
 export interface HerdrExecutionHandle {
   paneId: string;
   agentName: string;
-  agentKind: "codex";
+  agentKind: HerdrAgentKind;
   cwd: string;
   /** Arguments passed to the child agent after Herdr's `--` delimiter. */
   childArguments?: readonly string[];
@@ -55,7 +57,7 @@ export interface HerdrLaunchOptions {
   callerPaneId: string;
   cwd: string;
   agentName: string;
-  agentKind?: "codex";
+  agentKind?: HerdrAgentKind;
   startupTimeoutMs?: number;
   childArguments?: readonly string[];
 }
@@ -116,6 +118,10 @@ export interface HerdrSmokeReport {
     path: string;
     error: NonNullable<HerdrSmokeReport["error"]>;
   };
+}
+
+function isSupportedHerdrAgentKind(value: unknown): value is HerdrAgentKind {
+  return value === "codex" || value === "claude" || value === "pi";
 }
 
 function bounded(value: string, limit: number): string {
@@ -544,7 +550,7 @@ export class HerdrAdapter {
     callerPaneId: string,
     cwd: string,
     agentName: string,
-    agentKind?: "codex",
+    agentKind?: HerdrAgentKind,
     startupTimeoutMs?: number,
     childArguments?: readonly string[],
   ): Promise<HerdrExecutionHandle>;
@@ -552,7 +558,7 @@ export class HerdrAdapter {
     callerPaneOrOptions: string | HerdrLaunchOptions,
     cwdArgument?: string,
     agentNameArgument?: string,
-    agentKindArgument: "codex" = "codex",
+    agentKindArgument: HerdrAgentKind = "codex",
     startupTimeoutArgument = defaultStartupTimeoutMs,
     childArgumentsArgument: readonly string[] = [],
   ): Promise<HerdrExecutionHandle> {
@@ -574,6 +580,12 @@ export class HerdrAdapter {
         "INVALID_ARGUMENT",
       );
     const agentKind = options.agentKind ?? "codex";
+    if (!isSupportedHerdrAgentKind(agentKind))
+      throw new FlowError(
+        `Unsupported Herdr agent kind: ${String(agentKind)}`,
+        2,
+        "INVALID_ARGUMENT",
+      );
     const startupTimeoutMs =
       options.startupTimeoutMs ?? defaultStartupTimeoutMs;
     const childArguments = options.childArguments ?? [];

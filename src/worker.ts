@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import {
   HerdrAdapter,
   type HerdrCommandRunner,
+  type HerdrAgentKind,
   type HerdrExecutionHandle,
   type HerdrObservedState,
   validateChildAgentArguments,
@@ -19,6 +20,8 @@ export interface LogicalWorkerExecution {
   role: "worker";
   agentProfile: string;
   agentKind: WorkerAgentKind;
+  provider?: string;
+  model?: string;
   skill: string;
   input: string;
   specification?: string;
@@ -117,6 +120,10 @@ export function validateLogicalWorkerExecution(
     validatePath(execution.specification, "specification");
   validatePath(execution.worktree, "worktree");
   validatePath(execution.resultPath, "resultPath");
+  if (execution.provider !== undefined)
+    validateWorkerOverride(execution.provider, "provider");
+  if (execution.model !== undefined)
+    validateWorkerOverride(execution.model, "model");
   if (typeof execution.commitRequired !== "boolean")
     throw invalid("commitRequired must be boolean");
   return execution;
@@ -135,8 +142,39 @@ export function renderSkillInvocation(
   validatePath(input, "input");
   if (!isSupportedAgentKind(agentKind))
     throw invalid(`unsupported agent kind: ${agentKind}`);
-  const prefix = agentKind === "codex" ? "$" : "/";
-  return `${prefix}${skill} ${quotePromptPath(input)}`;
+  const command =
+    agentKind === "codex"
+      ? `$${skill}`
+      : agentKind === "pi"
+        ? `/skill:${skill}`
+        : `/${skill}`;
+  return `${command} ${quotePromptPath(input)}`;
+}
+
+export function herdrAgentKindForWorker(
+  agentKind: WorkerAgentKind,
+): HerdrAgentKind {
+  if (agentKind === "claude-code") return "claude";
+  return agentKind;
+}
+
+function validateWorkerOverride(value: string, label: string): string {
+  if (
+    value.length === 0 ||
+    !/^[A-Za-z0-9]/.test(value) ||
+    /\s/.test(value) ||
+    value.includes("\0") ||
+    /[\r\n]/.test(value) ||
+    [...value].some((character) => {
+      const codePoint = character.codePointAt(0)!;
+      return codePoint <= 0x1f || codePoint === 0x7f;
+    }) ||
+    value === "--"
+  )
+    throw invalid(`${label} must be a single safe child argument`, {
+      [label]: value,
+    });
+  return value;
 }
 
 function readWorkerSafeguards(): string {
@@ -272,7 +310,38 @@ export function codexWorkerArguments(
   ]);
 }
 
-/** Render and launch one fresh Codex worker through the opaque Herdr boundary. */
+export function workerAgentArguments(
+  execution: Pick<LogicalWorkerExecution, "agentKind" | "provider" | "model">,
+  worktree: string,
+  outputDirectory: string,
+): string[] {
+  validatePath(outputDirectory, "outputDirectory");
+  const provider =
+    execution.provider === undefined
+      ? undefined
+      : validateWorkerOverride(execution.provider, "provider");
+  const model =
+    execution.model === undefined
+      ? undefined
+      : validateWorkerOverride(execution.model, "model");
+
+  if (execution.agentKind === "codex")
+    return codexWorkerArguments(worktree, outputDirectory);
+
+  if (execution.agentKind === "claude-code")
+    return validateChildAgentArguments([
+      ...(model === undefined ? [] : ["--model", model]),
+      "--add-dir",
+      outputDirectory,
+    ]);
+
+  return validateChildAgentArguments([
+    ...(provider === undefined ? [] : ["--provider", provider]),
+    ...(model === undefined ? [] : ["--model", model]),
+  ]);
+}
+
+/** Render and launch one fresh Worker through the opaque Herdr boundary. */
 export async function launchSkillAwareWorker(
   options: LaunchWorkerOptions,
 ): Promise<LaunchedWorker> {
@@ -280,6 +349,8 @@ export async function launchSkillAwareWorker(
     role: options.role,
     agentProfile: options.agentProfile,
     agentKind: options.agentKind ?? "codex",
+    ...(options.provider === undefined ? {} : { provider: options.provider }),
+    ...(options.model === undefined ? {} : { model: options.model }),
     skill: options.skill,
     input: options.input,
     ...(options.specification === undefined
@@ -292,12 +363,6 @@ export async function launchSkillAwareWorker(
     commitRequired: options.commitRequired,
   };
   const checked = validateLogicalWorkerExecution(execution);
-  if (checked.agentKind !== "codex")
-    throw invalid("live Phase 4 workers support only the codex Agent profile");
-  if (checked.agentProfile !== "codex")
-    throw invalid(
-      "live Phase 4 workers require the configured codex Agent profile",
-    );
   if (!options.callerPaneId || !options.agentName)
     throw invalid("callerPaneId and agentName are required");
   const rendered = renderWorkerPrompt(checked);
@@ -324,9 +389,9 @@ export async function launchSkillAwareWorker(
     options.callerPaneId,
     checked.worktree,
     options.agentName,
-    "codex",
+    herdrAgentKindForWorker(checked.agentKind),
     options.startupTimeoutMs,
-    codexWorkerArguments(checked.worktree, outputDirectory),
+    workerAgentArguments(checked, checked.worktree, outputDirectory),
   );
   await options.onLaunched?.(handle);
   const startupState = await adapter.prompt(

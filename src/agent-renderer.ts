@@ -3,6 +3,7 @@ export {
   buildWorkerPrompt,
   codexWorkerArguments,
   createCodexLaunchArguments,
+  herdrAgentKindForWorker,
   launchSkillAwareWorker,
   launchWorker,
   quotePromptPath,
@@ -10,6 +11,7 @@ export {
   renderSkillInvocation,
   renderWorker,
   renderWorkerPrompt,
+  workerAgentArguments,
   validateLogicalWorkerExecution,
 } from "./worker.js";
 export { launchSkillAwareFixer, renderFixerPrompt } from "./fixer.js";

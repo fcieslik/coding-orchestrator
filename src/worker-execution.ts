@@ -27,7 +27,12 @@ import {
   type HerdrExecutionHandle,
   type HerdrObservedState,
 } from "./herdr.js";
-import { launchSkillAwareWorker, renderWorkerPrompt } from "./worker.js";
+import {
+  herdrAgentKindForWorker,
+  launchSkillAwareWorker,
+  renderWorkerPrompt,
+  type WorkerAgentKind,
+} from "./worker.js";
 import { readOrchestrationConfig } from "./setup.js";
 import {
   executionRecordSchema,
@@ -205,7 +210,7 @@ interface ExecutionRecordData {
     "prepared" | "running" | "reconciling" | "accepted" | "blocked" | "failed";
   role: "worker";
   agentProfile: string;
-  agentKind: "codex";
+  agentKind: WorkerAgentKind;
   skill: "implement";
   ticket: { source: string; input: string; hash: string };
   specification?: string;
@@ -1800,7 +1805,7 @@ async function reconcileWorkerBody(
     const handle: HerdrExecutionHandle = {
       paneId: reconciledRecord.herdr.paneId,
       agentName: reconciledRecord.herdr.agentName,
-      agentKind: "codex",
+      agentKind: herdrAgentKindForWorker(reconciledRecord.agentKind),
       cwd: reconciledRecord.worktree,
     };
     try {
@@ -2095,9 +2100,9 @@ export async function executeWorker(
   const worktree = await assertReadyRun(repository, run, options.runId);
   const { config } = await readOrchestrationConfig(repository);
   const profile = config.agents[config.roles.worker.agent];
-  if (!profile || profile.kind !== "codex")
+  if (!profile)
     throw executionError(
-      "Configured Worker Agent profile is not live Codex",
+      "Configured Worker Agent profile does not exist",
       "INVALID_CONFIGURATION",
       2,
     );
@@ -2176,7 +2181,7 @@ export async function executeWorker(
           status: "prepared",
           role: "worker",
           agentProfile: config.roles.worker.agent,
-          agentKind: "codex",
+          agentKind: profile.kind,
           skill: config.roles.worker.skill,
           ticket: {
             source: ticket.source,
@@ -2303,7 +2308,9 @@ export async function executeWorker(
     const launched = await launchSkillAwareWorker({
       role: "worker",
       agentProfile: config.roles.worker.agent,
-      agentKind: "codex",
+      agentKind: profile.kind,
+      ...(profile.provider === undefined ? {} : { provider: profile.provider }),
+      ...(profile.model === undefined ? {} : { model: profile.model }),
       skill: config.roles.worker.skill,
       input: attempt!.artifacts.input,
       ...(execution.specification === undefined

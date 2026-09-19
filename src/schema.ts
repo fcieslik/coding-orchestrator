@@ -365,7 +365,7 @@ export const executionRecordSchema = z.looseObject({
   status: executionStatusSchema,
   role: z.enum(["worker", "fixer"]),
   agentProfile: z.string().min(1),
-  agentKind: z.literal("codex"),
+  agentKind: z.enum(["codex", "claude-code", "pi"]),
   skill: z.string().min(1),
   ticket: z.looseObject({
     source: z.string().min(1),

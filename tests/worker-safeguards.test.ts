@@ -37,7 +37,7 @@ test("all supported Agent prompts preserve syntax and embed canonical safeguards
     });
 
     expect(rendered.skillInvocation).toBe(
-      `${agentKind === "codex" ? "$" : "/"}implement ${JSON.stringify(execution.input)}`,
+      `${agentKind === "codex" ? "$implement" : agentKind === "pi" ? "/skill:implement" : "/implement"} ${JSON.stringify(execution.input)}`,
     );
     expect(rendered.prompt).toContain(safeguards);
     for (const statement of [

@@ -11,7 +11,7 @@ import {
   renderWorkerPrompt,
   type LogicalWorkerExecution,
 } from "../src/worker.js";
-import type { HerdrCommandRunner } from "../src/herdr.js";
+import { HerdrAdapter, type HerdrCommandRunner } from "../src/herdr.js";
 import { workerResultSchema } from "../src/schema.js";
 import { stableJson } from "../src/worker-execution.js";
 
@@ -46,7 +46,7 @@ test("renderers keep logical execution distinct and use exact agent syntax", () 
     '/implement "/repo/.orchestrator/runs/run_1/workers/T01/attempt-01/input/ticket.md"',
   );
   expect(renderSkillInvocation("implement", execution.input, "pi")).toBe(
-    '/implement "/repo/.orchestrator/runs/run_1/workers/T01/attempt-01/input/ticket.md"',
+    '/skill:implement "/repo/.orchestrator/runs/run_1/workers/T01/attempt-01/input/ticket.md"',
   );
   const rendered = renderWorkerPrompt(execution);
   expect(rendered.prompt).toBe(
@@ -105,7 +105,7 @@ test("every supported Agent prompt embeds the complete canonical safeguards", ()
     });
 
     expect(rendered.skillInvocation).toBe(
-      `${agentKind === "codex" ? "$" : "/"}implement ${JSON.stringify(execution.input)}`,
+      `${agentKind === "codex" ? "$implement" : agentKind === "pi" ? "/skill:implement" : "/implement"} ${JSON.stringify(execution.input)}`,
     );
     expect(rendered.prompt).toContain(safeguards);
     expect(rendered.prompt).toContain("primary checkout");
@@ -233,6 +233,128 @@ test("codex launch forwards opaque prompt and isolated child argv", async () => 
   expect(start).not.toContain("workspace-write");
   expect(start).toContain("--approve-for-me");
 });
+
+test.each([
+  {
+    agentKind: "codex" as const,
+    herdrKind: "codex",
+    provider: undefined,
+    model: undefined,
+    childArguments: [
+      "-C",
+      execution.worktree,
+      "--add-dir",
+      "/repo/.orchestrator/runs/run_1/workers/T01/attempt-01/output",
+      "--approve-for-me",
+    ],
+  },
+  {
+    agentKind: "claude-code" as const,
+    herdrKind: "claude",
+    provider: "anthropic",
+    model: "claude-sonnet",
+    childArguments: [
+      "--model",
+      "claude-sonnet",
+      "--add-dir",
+      "/repo/.orchestrator/runs/run_1/workers/T01/attempt-01/output",
+    ],
+  },
+  {
+    agentKind: "pi" as const,
+    herdrKind: "pi",
+    provider: "openai",
+    model: "gpt-5.6-luna",
+    childArguments: ["--provider", "openai", "--model", "gpt-5.6-luna"],
+  },
+])(
+  "$agentKind uses one Herdr lifecycle with exact transport contract",
+  async ({ agentKind, herdrKind, provider, model, childArguments }) => {
+    const calls: string[][] = [];
+    const runner: HerdrCommandRunner = async (_executable, args) => {
+      calls.push([...args]);
+      if (args[0] === "pane" && args[1] === "split")
+        return {
+          stdout: JSON.stringify({ result: { pane: { pane_id: "p:worker" } } }),
+          stderr: "",
+          exitCode: 0,
+        };
+      if (args[0] === "agent" && args[1] === "start")
+        return {
+          stdout: JSON.stringify({
+            result: {
+              agent: {
+                name: "run-worker",
+                pane_id: "p:worker",
+                kind: herdrKind,
+              },
+            },
+          }),
+          stderr: "",
+          exitCode: 0,
+        };
+      if (args[0] === "agent" && args[1] === "prompt")
+        return {
+          stdout: JSON.stringify({
+            result: {
+              agent: {
+                name: "run-worker",
+                pane_id: "p:worker",
+                agent_status: "done",
+              },
+            },
+          }),
+          stderr: "",
+          exitCode: 0,
+        };
+      if (args[0] === "pane" && args[1] === "close")
+        return { stdout: "{}", stderr: "", exitCode: 0 };
+      throw new Error(`unexpected Herdr call: ${args.join(" ")}`);
+    };
+
+    const launched = await launchSkillAwareWorker({
+      ...execution,
+      agentKind,
+      agentProfile: agentKind,
+      ...(provider === undefined ? {} : { provider }),
+      ...(model === undefined ? {} : { model }),
+      callerPaneId: "p:caller",
+      agentName: "run-worker",
+      adapter: new HerdrAdapter({ runner }),
+      runner,
+    });
+    const start = calls.find(
+      (args) => args[0] === "agent" && args[1] === "start",
+    );
+    expect(start).toEqual([
+      "agent",
+      "start",
+      "run-worker",
+      "--kind",
+      herdrKind,
+      "--pane",
+      "p:worker",
+      "--timeout",
+      "30000",
+      "--",
+      ...childArguments,
+    ]);
+    const prompt = calls.find(
+      (args) => args[0] === "agent" && args[1] === "prompt",
+    );
+    expect(prompt?.[3]).toBe(launched.rendered.prompt);
+    expect(prompt?.[3]).toContain(launched.rendered.skillInvocation);
+    expect(launched.handle).toMatchObject({
+      paneId: "p:worker",
+      agentName: "run-worker",
+      agentKind: herdrKind,
+      cwd: execution.worktree,
+      childArguments,
+    });
+    await new HerdrAdapter({ runner }).close(launched.handle);
+    expect(calls.at(-1)).toEqual(["pane", "close", "p:worker"]);
+  },
+);
 
 test("ownership serialization is independent of nested object key order", () => {
   const first = {
