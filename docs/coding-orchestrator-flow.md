@@ -189,6 +189,16 @@ flow herdr smoke --agent claude
 
 Ten smoke sprawdza realny Herdr, start interaktywnego procesu, prompt settlement i zamknięcie wyłącznie własnego pane. Następnie należy uruchomić jeden ticket w disposable Target repository z profilem `claude-code`; ten krok potwierdza również uwierzytelnienie i dostępność natywnej umiejętności `/implement`. Brak binarnego Claude, credentials albo natywnej umiejętności jest problemem środowiska i nie powinien być dodawany do zwykłego CI.
 
+### Jawny live gate Pi
+
+Automatyczne testy nie wymagają Pi, Herdr ani credentials. Przed użyciem profilu Pi operator może wykonać jawny smoke Herdr w zarządzanym pane:
+
+```text
+flow herdr smoke --agent pi
+```
+
+Następnie należy uruchomić jeden ticket w disposable Target repository z profilem `pi`, opcjonalnie z `provider` i `model`; ten krok potwierdza uwierzytelnienie, dostępność natywnej umiejętności `/skill:implement` oraz akceptację skonfigurowanego modelu przez konto. Brak binarnego Pi, credentials, natywnej umiejętności albo dostępu do modelu jest problemem środowiska i nie powinien być dodawany do zwykłego CI.
+
 ## 5. Worker implementuje dokładnie jeden ticket
 
 Worker:

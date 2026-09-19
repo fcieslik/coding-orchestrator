@@ -230,6 +230,69 @@ workflow:
   ).toMatchObject({ agentKind: "claude-code" });
 });
 
+test("flow orchestrate executes a configured Pi Worker through the shared lifecycle", async () => {
+  const repository = await createCommittedTargetRepository();
+  await writeWorkflowPackage(repository, ["01-pi"]);
+  await mkdir(join(repository, ".orchestrator"), { recursive: true });
+  await writeFile(
+    join(repository, ".orchestrator", "config.yaml"),
+    `version: 1
+
+agents:
+  pi-worker:
+    kind: pi
+    provider: openai
+    model: gpt-5.6-luna
+
+roles:
+  worker:
+    agent: pi-worker
+    skill: implement
+
+workflow:
+  workerTimeoutSeconds: 1800
+  maxWorkerAttempts: 2
+`,
+    "utf8",
+  );
+  const worker = await writeFakeHerdrWorker();
+  const startArguments = join(worker.directory, "start-arguments.json");
+  const report = JSON.parse(
+    (
+      await run(
+        executable,
+        ["orchestrate", "feature", "01-pi", "--repo", repository, "--json"],
+        {
+          cwd: repository,
+          env: { ...worker.environment, FAKE_START_ARGS: startArguments },
+        },
+      )
+    ).stdout,
+  ) as {
+    status: string;
+    acceptedCommit: string;
+    execution: { artifacts: { input: string; record: string } };
+  };
+
+  expect(report.status).toBe("accepted");
+  expect(report.acceptedCommit).toMatch(/^[0-9a-f]{40}$/);
+  const start = JSON.parse(await readFile(startArguments, "utf8")) as string[];
+  const delimiter = start.indexOf("--");
+  expect(start.slice(0, delimiter)).toContain("pi");
+  expect(start.slice(delimiter + 1)).toEqual([
+    "--provider",
+    "openai",
+    "--model",
+    "gpt-5.6-luna",
+  ]);
+  expect(await readFile(report.execution.artifacts.input, "utf8")).toContain(
+    "pi",
+  );
+  expect(
+    JSON.parse(await readFile(report.execution.artifacts.record, "utf8")),
+  ).toMatchObject({ agentKind: "pi" });
+});
+
 test("flow orchestrate persists Worker Review attention without accepting or advancing the queue", async () => {
   const repository = await createCommittedTargetRepository();
   await writeWorkflowPackage(repository, ["01-review", "02-later"]);

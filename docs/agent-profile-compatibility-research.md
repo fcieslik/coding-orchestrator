@@ -65,3 +65,7 @@ The repository's native agent configuration should own provider/model/session ch
 ## Claude Code live gate
 
 The repository's explicit live gate is opt-in: first run `flow herdr smoke --agent claude` inside a Herdr pane, then execute one disposable Worker ticket with a `claude-code` profile. The first command verifies the real Herdr/Claude interactive lifecycle; the disposable Worker verifies authentication and that the native `/implement` skill is actually discoverable. Missing prerequisites are reported by the operator and are not part of ordinary CI.
+
+## Pi live gate
+
+The Pi gate is also opt-in: first run `flow herdr smoke --agent pi` inside a Herdr pane, then execute one disposable Worker ticket with a `pi` profile. The first command verifies the real Herdr/Pi interactive lifecycle; the disposable Worker verifies authentication, native `/skill:implement` discovery, and the configured provider/model when those overrides are present. Missing Pi, credentials, native skill, project trust, or model access are environment prerequisites and are not part of ordinary CI.

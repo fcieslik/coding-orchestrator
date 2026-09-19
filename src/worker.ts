@@ -331,10 +331,7 @@ export function workerAgentArguments(
   if (execution.agentKind === "claude-code")
     return claudeCodeWorkerArguments(outputDirectory, model);
 
-  return validateChildAgentArguments([
-    ...(provider === undefined ? [] : ["--provider", provider]),
-    ...(model === undefined ? [] : ["--model", model]),
-  ]);
+  return piWorkerArguments(outputDirectory, provider, model);
 }
 
 /** Keep Claude Code interactive and pass only the current launch's model override. */
@@ -349,6 +346,25 @@ export function claudeCodeWorkerArguments(
     ...(checkedModel === undefined ? [] : ["--model", checkedModel]),
     "--add-dir",
     outputDirectory,
+  ]);
+}
+
+/** Keep Pi interactive and pass only explicitly configured launch overrides. */
+export function piWorkerArguments(
+  outputDirectory: string,
+  provider?: string,
+  model?: string,
+): string[] {
+  validatePath(outputDirectory, "outputDirectory");
+  const checkedProvider =
+    provider === undefined
+      ? undefined
+      : validateWorkerOverride(provider, "provider");
+  const checkedModel =
+    model === undefined ? undefined : validateWorkerOverride(model, "model");
+  return validateChildAgentArguments([
+    ...(checkedProvider === undefined ? [] : ["--provider", checkedProvider]),
+    ...(checkedModel === undefined ? [] : ["--model", checkedModel]),
   ]);
 }
 

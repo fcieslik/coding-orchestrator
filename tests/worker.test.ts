@@ -8,6 +8,7 @@ import {
   claudeCodeWorkerArguments,
   codexWorkerArguments,
   launchSkillAwareWorker,
+  piWorkerArguments,
   renderSkillInvocation,
   renderWorkerPrompt,
   type LogicalWorkerExecution,
@@ -248,6 +249,19 @@ test("Claude Code keeps native configuration when no model override is set", () 
     "claude-sonnet",
     "--add-dir",
     outputDirectory,
+  ]);
+});
+
+test("Pi keeps native configuration unless provider or model is overridden", () => {
+  const outputDirectory =
+    "/repo/.orchestrator/runs/run_1/workers/T01/attempt-01/output";
+
+  expect(piWorkerArguments(outputDirectory)).toEqual([]);
+  expect(piWorkerArguments(outputDirectory, "openai", "gpt-5.6-luna")).toEqual([
+    "--provider",
+    "openai",
+    "--model",
+    "gpt-5.6-luna",
   ]);
 });
 
