@@ -63,7 +63,7 @@ export interface HerdrLaunchOptions {
 }
 
 export interface HerdrSmokeOptions {
-  agent: "codex";
+  agent: HerdrAgentKind;
   cwd?: string;
   environment?: NodeJS.ProcessEnv;
   executable?: string;
@@ -86,7 +86,7 @@ export interface HerdrSmokeReport {
   owned: {
     paneId?: string;
     agentName: string;
-    agentKind: "codex";
+    agentKind: HerdrAgentKind;
   };
   lifecycle?: {
     observed?: HerdrObservedState;
@@ -725,11 +725,21 @@ function now(): number {
   return Date.now();
 }
 
-function challengePrompt(nonce: string, cwd: string): string {
+function challengePrompt(
+  agent: HerdrAgentKind,
+  nonce: string,
+  cwd: string,
+): string {
+  const skillInvocation =
+    agent === "codex"
+      ? "$implement"
+      : agent === "claude"
+        ? "/implement"
+        : "/skill:implement";
   return [
     "Herdr smoke challenge.",
     `Nonce: ${nonce}`,
-    "Do not invoke the $implement skill.",
+    `Do not invoke the ${skillInvocation} skill.`,
     "Reply with the nonce and your current working directory.",
     `Expected working directory: ${cwd}`,
   ].join("\n");
@@ -877,7 +887,7 @@ export async function runHerdrSmoke(
       if (transportState(startupState) !== "settled")
         throw lifecycleFailure(startupState);
     }
-    const prompt = challengePrompt(nonce, cwd);
+    const prompt = challengePrompt(options.agent, nonce, cwd);
     operation = "agent prompt";
     const state = await timed("promptSettlement", () =>
       adapter.prompt(

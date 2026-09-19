@@ -61,3 +61,7 @@ The repository's native agent configuration should own provider/model/session ch
 - Documentation proves that the required CLI modes and flags exist; it does not prove that a particular account can authenticate or that every arbitrary model ID is enabled for that account.
 - A live Pi model listing could not be executed in this environment because Pi attempted to create lock files under `/Users/fc47/.pi/agent`, which is outside the writable workspace. This is an environment permission issue, not evidence that `gpt-5.6-luna` is unsupported.
 - Herdr 0.8.2 installed locally advertises `pi` and `claude` as supported agent kinds. The compatibility suite should still assert this transport mapping rather than relying on a generic executable string.
+
+## Claude Code live gate
+
+The repository's explicit live gate is opt-in: first run `flow herdr smoke --agent claude` inside a Herdr pane, then execute one disposable Worker ticket with a `claude-code` profile. The first command verifies the real Herdr/Claude interactive lifecycle; the disposable Worker verifies authentication and that the native `/implement` skill is actually discoverable. Missing prerequisites are reported by the operator and are not part of ordinary CI.

@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
 
 import {
+  claudeCodeWorkerArguments,
   codexWorkerArguments,
   launchSkillAwareWorker,
   renderSkillInvocation,
@@ -232,6 +233,22 @@ test("codex launch forwards opaque prompt and isolated child argv", async () => 
   expect(start).not.toContain("--sandbox");
   expect(start).not.toContain("workspace-write");
   expect(start).toContain("--approve-for-me");
+});
+
+test("Claude Code keeps native configuration when no model override is set", () => {
+  const outputDirectory =
+    "/repo/.orchestrator/runs/run_1/workers/T01/attempt-01/output";
+
+  expect(claudeCodeWorkerArguments(outputDirectory)).toEqual([
+    "--add-dir",
+    outputDirectory,
+  ]);
+  expect(claudeCodeWorkerArguments(outputDirectory, "claude-sonnet")).toEqual([
+    "--model",
+    "claude-sonnet",
+    "--add-dir",
+    outputDirectory,
+  ]);
 });
 
 test.each([

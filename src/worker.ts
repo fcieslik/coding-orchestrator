@@ -329,15 +329,26 @@ export function workerAgentArguments(
     return codexWorkerArguments(worktree, outputDirectory);
 
   if (execution.agentKind === "claude-code")
-    return validateChildAgentArguments([
-      ...(model === undefined ? [] : ["--model", model]),
-      "--add-dir",
-      outputDirectory,
-    ]);
+    return claudeCodeWorkerArguments(outputDirectory, model);
 
   return validateChildAgentArguments([
     ...(provider === undefined ? [] : ["--provider", provider]),
     ...(model === undefined ? [] : ["--model", model]),
+  ]);
+}
+
+/** Keep Claude Code interactive and pass only the current launch's model override. */
+export function claudeCodeWorkerArguments(
+  outputDirectory: string,
+  model?: string,
+): string[] {
+  validatePath(outputDirectory, "outputDirectory");
+  const checkedModel =
+    model === undefined ? undefined : validateWorkerOverride(model, "model");
+  return validateChildAgentArguments([
+    ...(checkedModel === undefined ? [] : ["--model", checkedModel]),
+    "--add-dir",
+    outputDirectory,
   ]);
 }
 

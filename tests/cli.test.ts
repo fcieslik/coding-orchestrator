@@ -168,6 +168,68 @@ else process.exit(2);
   );
 });
 
+test("flow orchestrate executes a configured Claude Code Worker through the shared lifecycle", async () => {
+  const repository = await createCommittedTargetRepository();
+  await writeWorkflowPackage(repository, ["01-claude"]);
+  await mkdir(join(repository, ".orchestrator"), { recursive: true });
+  await writeFile(
+    join(repository, ".orchestrator", "config.yaml"),
+    `version: 1
+
+agents:
+  claude-worker:
+    kind: claude-code
+    model: claude-sonnet
+
+roles:
+  worker:
+    agent: claude-worker
+    skill: implement
+
+workflow:
+  workerTimeoutSeconds: 1800
+  maxWorkerAttempts: 2
+`,
+    "utf8",
+  );
+  const worker = await writeFakeHerdrWorker();
+  const startArguments = join(worker.directory, "start-arguments.json");
+  const report = JSON.parse(
+    (
+      await run(
+        executable,
+        ["orchestrate", "feature", "01-claude", "--repo", repository, "--json"],
+        {
+          cwd: repository,
+          env: { ...worker.environment, FAKE_START_ARGS: startArguments },
+        },
+      )
+    ).stdout,
+  ) as {
+    status: string;
+    acceptedCommit: string;
+    execution: { artifacts: { input: string; record: string } };
+  };
+
+  expect(report.status).toBe("accepted");
+  expect(report.acceptedCommit).toMatch(/^[0-9a-f]{40}$/);
+  const start = JSON.parse(await readFile(startArguments, "utf8")) as string[];
+  const delimiter = start.indexOf("--");
+  expect(start.slice(0, delimiter)).toContain("claude");
+  expect(start.slice(delimiter + 1)).toEqual([
+    "--model",
+    "claude-sonnet",
+    "--add-dir",
+    expect.stringContaining("/output"),
+  ]);
+  expect(await readFile(report.execution.artifacts.input, "utf8")).toContain(
+    "claude",
+  );
+  expect(
+    JSON.parse(await readFile(report.execution.artifacts.record, "utf8")),
+  ).toMatchObject({ agentKind: "claude-code" });
+});
+
 test("flow orchestrate persists Worker Review attention without accepting or advancing the queue", async () => {
   const repository = await createCommittedTargetRepository();
   await writeWorkflowPackage(repository, ["01-review", "02-later"]);
@@ -3574,11 +3636,16 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, renameSync } from "node:fs";
 const args = process.argv.slice(2);
 if (args[0] === "--version") console.log("fake-herdr 1.0.0");
-else if (args[0] === "pane" && args[1] === "split") console.log(JSON.stringify({result:{pane:{pane_id:"fake:worker"}}}));
+else if (args[0] === "pane" && args[1] === "split") {
+  writeFileSync(process.env.FAKE_STATE, JSON.stringify({cwd: args[args.indexOf("--cwd") + 1]}));
+  console.log(JSON.stringify({result:{pane:{pane_id:"fake:worker"}}}));
+}
 else if (args[0] === "agent" && args[1] === "start") {
   const child = args.slice(args.indexOf("--") + 1);
-  const worktree = child[child.indexOf("-C") + 1];
-  writeFileSync(process.env.FAKE_STATE, JSON.stringify({worktree}));
+  const current = JSON.parse(readFileSync(process.env.FAKE_STATE, "utf8"));
+  const worktree = child.includes("-C") ? child[child.indexOf("-C") + 1] : current.cwd;
+  if (process.env.FAKE_START_ARGS) writeFileSync(process.env.FAKE_START_ARGS, JSON.stringify(args));
+  writeFileSync(process.env.FAKE_STATE, JSON.stringify({ ...current, worktree }));
   console.log(JSON.stringify({result:{agent:{name:args[2],pane_id:"fake:worker",agent_status:"idle"}}}));
 } else if (args[0] === "agent" && args[1] === "prompt") {
   const current = JSON.parse(readFileSync(process.env.FAKE_STATE, "utf8"));

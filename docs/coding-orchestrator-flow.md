@@ -79,7 +79,7 @@ Zanim rozpocznie się pierwszy Workflow run:
 1. Installed skill `orchestrate` jest zbudowany i zainstalowany.
 2. Target repository jest repozytorium Git z początkowym commitem.
 3. Repozytorium ma konfigurację Orchestratora albo pozwala utworzyć jej domyślną wersję przy pierwszym wywołaniu.
-4. Konfiguracja wskazuje Codex Agent profile Workera, downstream skill `implement`, timeout i końcowe komendy walidacyjne; domyślne komendy trzeba dopasować, jeśli Target repository nie używa pnpm.
+4. Konfiguracja wskazuje Agent profile Workera (`codex`, `claude-code` lub `pi`), downstream skill `implement`, timeout i końcowe komendy walidacyjne; domyślne komendy trzeba dopasować, jeśli Target repository nie używa pnpm.
 5. Specyfikacja i tickety są przygotowane jako lokalny Workflow package.
 
 Przykładowe wejście:
@@ -168,16 +168,26 @@ roles:
 When `provider` or `model` is absent, Pi or Claude Code uses its own native configuration. The Orchestrator does not install or synchronize downstream skills between agent-specific skill directories.
 
 > [!IMPORTANT]
-> Live Worker V1 obsługuje obecnie wyłącznie profil Codex. Renderowanie składni Claude Code i Pi jest przygotowane i testowane, ale adapter uruchamiający te agent profiles nie został jeszcze zaimplementowany.
+> Wybrany Agent musi mieć własną, natywnie wykrywalną umiejętność `implement`. Orchestrator jej nie kopiuje ani nie instaluje: Claude Code szuka jej w `.claude/skills/implement/SKILL.md`, a Pi w swojej natywnej lokalizacji skills.
 
 ## 4. Herdr uruchamia świeżego Workera
 
 1. Herdr tworzy nowe owned pane.
-2. Uruchamia świeży Agent profile z `cwd` ustawionym na Feature worktree.
+2. Uruchamia świeży Agent profile z `cwd` ustawionym na Feature worktree; `claude-code` jest transportowane do Herdr jako `claude`.
 3. Dostarcza już wyrenderowany prompt bez interpretowania jego semantyki.
 4. Orchestrator zachowuje ten sam foreground process i czeka na zakończenie.
 
 Każdy ticket otrzymuje świeżego Workera i świeży kontekst. Kolejny Worker widzi wcześniejsze zaakceptowane commity, ponieważ wszystkie tickety jednego runu pracują sekwencyjnie na tej samej Feature branch.
+
+### Jawny live gate Claude Code
+
+Automatyczne testy nie wymagają Claude Code, Herdr ani credentials. Przed użyciem profilu Claude Code operator może wykonać jawny smoke Herdr w zarządzanym pane:
+
+```text
+flow herdr smoke --agent claude
+```
+
+Ten smoke sprawdza realny Herdr, start interaktywnego procesu, prompt settlement i zamknięcie wyłącznie własnego pane. Następnie należy uruchomić jeden ticket w disposable Target repository z profilem `claude-code`; ten krok potwierdza również uwierzytelnienie i dostępność natywnej umiejętności `/implement`. Brak binarnego Claude, credentials albo natywnej umiejętności jest problemem środowiska i nie powinien być dodawany do zwykłego CI.
 
 ## 5. Worker implementuje dokładnie jeden ticket
 

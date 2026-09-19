@@ -845,10 +845,10 @@ try {
     arguments_.includes("--help")
   ) {
     console.log(
-      "Usage: flow herdr smoke --agent codex [--json] [--output <file>] [--keep-pane]",
+      "Usage: flow herdr smoke --agent <codex|claude|pi> [--json] [--output <file>] [--keep-pane]",
     );
     console.log(
-      "Launches Codex in a fresh Herdr sibling pane; requires a genuine managed caller and may incur normal agent usage.",
+      "Launches the selected Agent in a fresh Herdr sibling pane; requires a genuine managed caller and may incur normal agent usage.",
     );
     console.log(
       "--keep-pane retains only this invocation's pane for diagnostics and can never pass the complete gate.",
@@ -860,9 +860,9 @@ try {
       ["--json", "--keep-pane"],
     );
     const agent = values.get("--agent");
-    if (agent !== "codex") {
+    if (agent !== "codex" && agent !== "claude" && agent !== "pi") {
       throw new FlowError(
-        "Usage: flow herdr smoke --agent codex [--json] [--output <file>] [--keep-pane]",
+        "Usage: flow herdr smoke --agent <codex|claude|pi> [--json] [--output <file>] [--keep-pane]",
         2,
       );
     }
