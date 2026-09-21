@@ -162,6 +162,18 @@ _Avoid_: Worker finished, ticket file status
 The fail-closed comparison of an interrupted or ambiguous Worker attempt against its Execution record, Worker result, Git state, and owned Herdr identity before deciding whether it may be accepted or retried.
 _Avoid_: Automatic retry, terminal inspection
 
+**Run repair**:
+An explicit operation performed by the Orchestrator or another main agent to reconcile, accept a proven Git checkpoint, or cancel a stuck Workflow run after an interrupted or failed execution.
+_Avoid_: Worker result, direct state-file editing, run deletion
+
+**Repair evidence**:
+The durable execution, Git, worktree, and process observations required before a main agent changes Workflow state. Evidence can justify a checkpoint acceptance, but it never turns an unverified or ambiguous result into success.
+_Avoid_: Worker claim, terminal output, informal manual status change
+
+**Cancelled run**:
+A terminal Workflow run intentionally abandoned by a main agent after recovery cannot safely continue. Its state, history, worktree, and artifacts remain available for diagnosis or a later explicit new run.
+_Avoid_: Failed run, deleted run, accepted ticket
+
 **Agent renderer**:
 The adapter that converts a Skill invocation into the invocation syntax understood by an Agent profile.
 _Avoid_: Workflow engine, Herdr adapter
@@ -169,3 +181,19 @@ _Avoid_: Workflow engine, Herdr adapter
 **Herdr feasibility gate**:
 A live validation that proves the Orchestrator can control one fresh coding-agent lifecycle through Herdr before worker workflow semantics are built on top of it.
 _Avoid_: Unit test suite, ticket completion check
+
+**Browser verification POC**:
+A local proof-of-concept browser-control capability used by a coding agent to verify a deployed application's observable user flow. It uses the user's existing Chrome profile and is not production-isolated.
+_Avoid_: E2E suite, deployment checker
+
+**Verification scenario**:
+A target-repository-owned, explicitly named description of an allowed browser journey, its non-secret test data, allowed origins and mutations, and the observable assertions that prove it passed.
+_Avoid_: Free-form browser task, site-specific script
+
+**Browser verification skill**:
+An agent-native workflow and thin runner that invokes a pinned upstream Jev revision to execute a Verification scenario. It supplies no browser-control engine of its own.
+_Avoid_: Fork of Jev, E2E framework
+
+**Opt-in external smoke scenario**:
+A manually invoked Verification scenario against an authenticated third-party service that may disclose its visible page text to the configured model providers. It is never part of the automatic POC test suite.
+_Avoid_: Default fixture, production deployment verification

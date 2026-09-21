@@ -122,3 +122,36 @@ Wybierz proszę:
 2. Ręcznie zintegrować istniejący branch orchestrator/
    run_20260918T075945Z_4d5a3899f2e0 z main — szybciej, ale omija zablokowaną
    akceptację orchestratora.
+
+--
+• active dotyczy starego runu orchestratora, nie aktualnego stanu kodu.
+
+Po ręcznej integracji:
+
+- kod ticketu 04 jest już na main,
+- commit 7c95fa5 zawiera implementację,
+- ale stary run nie otrzymał formalnego accepted,
+- dlatego panel nadal pokazuje ticket 04 jako active.
+
+Mam trzy możliwości:
+
+1. Zostawić stary run jako historycznie zablokowany
+   Najbezpieczniejsze. Po git push origin main sprawdzamy live deployment. Po
+   sukcesie oznaczamy ticket 04 jako resolved w pliku ticketu. Panel starego
+   runu nadal będzie pokazywał blocked/active.
+
+2. Utworzyć nowy run tylko do formalnego potwierdzenia ticketu 04
+   Wymagałby nowego pakietu i nowej immutable snapshot. To porządkowałoby status
+   orchestratora, ale generuje dodatkową procedurę mimo że kod już jest na main.
+
+3. Usunąć lub ręcznie zmienić rekord starego runu
+   Nie rekomenduję — niszczy wiarygodność historii workflow i nie jest
+   obsługiwanym sposobem aktualizacji statusu.
+
+Rekomenduję opcję 1:
+
+git push origin main
+
+Następnie sprawdzamy GitHub Actions i /prod/health. Jeśli deployment przejdzie,
+aktualizujemy ticket 04 na resolved; stary panel traktujemy jako archiwalny
+zapis nieudanego runu.
